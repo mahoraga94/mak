@@ -253,8 +253,25 @@ struct LirFunction {
 }
 
 #[derive(Clone, Debug)]
+struct PointerInfo {
+    /// Representation of one indexed element.
+    elem_rep: Rep,
+    /// C spelling of that element type (without the trailing `*`).
+    elem_ctype: String,
+    /// If the element is itself a pointer, its pointed-to shape.
+    nested: Option<Box<PointerInfo>>,
+}
+
+#[derive(Clone, Debug)]
 enum Binding {
-    Value { code: String, rep: Rep },
+    Value {
+        code: String,
+        rep: Rep,
+        /// Known pointed-to C type and recursively known pointer shape.  `Rep`
+        /// intentionally stays coarse for ABI compatibility; this metadata is
+        /// only used by indexing and pointer offsets.
+        ptr_info: Option<PointerInfo>,
+    },
     Function { id: usize },
 }
 
@@ -2410,6 +2427,18 @@ impl Analyzer {
                     self.constrain_expr_rep(l, &truth, env, current);
                     self.constrain_expr_rep(r, &truth, env, current);
                     Rep::I32
+                } else if matches!(op, BinOp::Add)
+                    && ((is_data_pointer_rep(&a) && (b.is_integer() || matches!(b, Rep::Unknown)))
+                        || ((a.is_integer() || matches!(a, Rep::Unknown)) && is_data_pointer_rep(&b)))
+                {
+                    if is_data_pointer_rep(&a) { a } else { b }
+                } else if matches!(op, BinOp::Sub)
+                    && is_data_pointer_rep(&a)
+                    && (b.is_integer() || matches!(b, Rep::Unknown))
+                {
+                    a
+                } else if matches!(op, BinOp::Sub) && is_data_pointer_rep(&a) && is_data_pointer_rep(&b) {
+                    Rep::I64
                 } else {
                     let both_numeric =
                         (a.is_integer() || a.is_float()) && (b.is_integer() || b.is_float());
@@ -2456,6 +2485,19 @@ impl Analyzer {
         current: usize,
     ) -> Rep {
         let (base_fun, flat_args) = Self::flatten_application(fun, args);
+        if matches!(&base_fun.kind, ExprKind::Var(n) if n == "$mak.index") {
+            if flat_args.len() != 2 {
+                return Rep::Unknown;
+            }
+            let base_rep = self.infer_expr(flat_args[0], env, current);
+            let _index_rep = self.infer_expr(flat_args[1], env, current);
+            if !is_data_pointer_rep(&base_rep) && !matches!(base_rep, Rep::Unknown) {
+                return Rep::Unknown;
+            }
+            return pointer_info_of_expr(flat_args[0], self, None)
+                .map(|info| info.elem_rep)
+                .unwrap_or(Rep::Unknown);
+        }
         let mut ars = Vec::with_capacity(flat_args.len());
         for a in &flat_args {
             ars.push(self.infer_expr(a, env, current));
@@ -2667,6 +2709,13 @@ impl Analyzer {
             }
             ExprKind::Fn { .. } => true,
             ExprKind::App { fun, args } => {
+                let (base, flat_args) = Analyzer::flatten_application(fun, args);
+                if matches!(&base.kind, ExprKind::Var(n) if n == "$mak.index") {
+                    // An index reads through a pointer.  Treat it conservatively
+                    // as non-pure because foreign code can mutate that memory.
+                    let _ = flat_args;
+                    return false;
+                }
                 let fp = match &fun.kind {
                     ExprKind::Var(n) => {
                         if let Some(id) = self.external_by_name.get(n) {
@@ -2744,6 +2793,7 @@ impl<'a> Lowerer<'a> {
                 Binding::Value {
                     code: format!("c{}", i),
                     rep: info.capture_reps[i].clone(),
+                    ptr_info: None,
                 },
             );
         }
@@ -2753,6 +2803,7 @@ impl<'a> Lowerer<'a> {
                 Binding::Value {
                     code: format!("a{}", i),
                     rep: info.param_reps[i].clone(),
+                    ptr_info: None,
                 },
             );
         }
@@ -2813,6 +2864,53 @@ impl<'a> Lowerer<'a> {
         LirFunction { info, body: ir }
     }
 
+    fn direct_index_expr(
+        &mut self,
+        base: &Expr,
+        index: &Expr,
+        env: &HashMap<String, Binding>,
+        current: Option<usize>,
+    ) -> Result<(String, Rep), String> {
+        let (base_code, base_rep) = self.direct_ast_expr(base, env, current)?;
+        if !is_data_pointer_rep(&base_rep) && !matches!(base_rep, Rep::Unknown) {
+            return Err(format!(
+                "cannot index a non-pointer value of representation {}",
+                rep_debug(&base_rep)
+            ));
+        }
+        let (index_code, index_rep) = self.direct_ast_expr(index, env, current)?;
+        if !index_rep.is_integer() && !matches!(index_rep, Rep::Unknown) {
+            return Err(format!(
+                "an index must be an integer, got {}",
+                rep_debug(&index_rep)
+            ));
+        }
+
+        // MAK ADT values are represented as pointers to their generated C
+        // structs.  Index an ADT pointer as an array of those structs and keep
+        // the result in the existing ADT pointer representation.
+        if let Rep::Adt(name) = &base_rep {
+            let cty = format!("struct mak_{}", mangle_ident(name));
+            let code = format!(
+                "(&((({} *)(uintptr_t)({}))[ (intptr_t)({})]))",
+                cty, base_code, index_code
+            );
+            return Ok((code, base_rep));
+        }
+
+        // A declared T* uses T-sized indexing.  An untyped `ptr` is deliberately
+        // byte-addressed; this is portable even though Rep::Ptr itself is opaque.
+        let (elem_ctype, elem_rep) = match pointer_info_of_expr(base, self.a, Some(env)) {
+            Some(info) => (info.elem_ctype, info.elem_rep),
+            None => ("uint8_t".to_string(), Rep::U8),
+        };
+        let code = format!(
+            "(*(({} *)(uintptr_t)({}) + (intptr_t)({})))",
+            elem_ctype, base_code, index_code
+        );
+        Ok((code, elem_rep))
+    }
+
     fn direct_ast_expr(
         &mut self,
         e: &Expr,
@@ -2826,7 +2924,7 @@ impl<'a> Lowerer<'a> {
             ExprKind::Var(n) => {
                 if let Some(b) = env.get(n) {
                     return Ok(match b {
-                        Binding::Value { code, rep } => (code.clone(), rep.clone()),
+                        Binding::Value { code, rep, .. } => (code.clone(), rep.clone()),
                         Binding::Function { id } => {
                             (self.a.functions[*id].c_name.clone(), Rep::Function(*id))
                         }
@@ -2882,6 +2980,7 @@ impl<'a> Lowerer<'a> {
                     Binding::Value {
                         code: code.clone(),
                         rep: vr.clone(),
+                        ptr_info: pointer_info_of_expr(value, self.a, Some(env)),
                     },
                 );
                 let (bc, br) = self.direct_ast_expr(body, &next, current)?;
@@ -2922,6 +3021,12 @@ impl<'a> Lowerer<'a> {
             }
             ExprKind::App { fun, args } => {
                 let (base, all_args) = Analyzer::flatten_application(fun, args);
+                if matches!(&base.kind, ExprKind::Var(n) if n == "$mak.index") {
+                    if all_args.len() != 2 {
+                        return Err(format!("index intrinsic expects 2 arguments, got {}", all_args.len()));
+                    }
+                    return self.direct_index_expr(all_args[0], all_args[1], env, current);
+                }
                 let mut ac = Vec::with_capacity(all_args.len());
                 let mut ars = Vec::with_capacity(all_args.len());
                 for arg in &all_args {
@@ -3113,6 +3218,52 @@ impl<'a> Lowerer<'a> {
                 let (lc, lr) = self.direct_ast_expr(l, env, current)?;
                 let (rc, rr) = self.direct_ast_expr(r, env, current)?;
                 let lir_op = bin_lir(*op);
+
+                let lptr = is_data_pointer_rep(&lr);
+                let rptr = is_data_pointer_rep(&rr);
+                let loff = lr.is_integer() || matches!(lr, Rep::Unknown);
+                let roff = rr.is_integer() || matches!(rr, Rep::Unknown);
+                if matches!(op, BinOp::Add) && ((lptr && roff) || (loff && rptr)) {
+                    let (ptr_code, ptr_rep, off_code, ptr_expr) = if lptr {
+                        (lc.as_str(), lr.clone(), rc.as_str(), l.as_ref())
+                    } else {
+                        (rc.as_str(), rr.clone(), lc.as_str(), r.as_ref())
+                    };
+                    let elem_ctype = pointer_element_ctype(ptr_expr, self.a, Some(env), &ptr_rep);
+                    let out_type = ptr_rep.ctype(&self.a.functions);
+                    let code = format!(
+                        "(({})((({} *)(uintptr_t)({})) + (intptr_t)({})))",
+                        out_type, elem_ctype, ptr_code, off_code
+                    );
+                    return Ok((code, ptr_rep));
+                }
+                if matches!(op, BinOp::Sub) && lptr && roff {
+                    let elem_ctype = pointer_element_ctype(l, self.a, Some(env), &lr);
+                    let out_type = lr.ctype(&self.a.functions);
+                    let code = format!(
+                        "(({})((({} *)(uintptr_t)({})) - (intptr_t)({})))",
+                        out_type, elem_ctype, lc, rc
+                    );
+                    return Ok((code, lr));
+                }
+                if matches!(op, BinOp::Sub) && lptr && rptr {
+                    let elem_ctype = pointer_element_ctype(l, self.a, Some(env), &lr);
+                    if pointer_info_of_expr(l, self.a, Some(env)).is_some()
+                        || matches!(lr, Rep::Adt(_))
+                    {
+                        let code = format!(
+                            "((int64_t)((({} *)(uintptr_t)({})) - (({} *)(uintptr_t)({}))))",
+                            elem_ctype, lc, elem_ctype, rc
+                        );
+                        return Ok((code, Rep::I64));
+                    }
+                    let code = format!(
+                        "((int64_t)((intptr_t)(uintptr_t)({}) - (intptr_t)(uintptr_t)({})))",
+                        lc, rc
+                    );
+                    return Ok((code, Rep::I64));
+                }
+
                 let arithmetic = matches!(
                     lir_op,
                     BinOpLir::Add
@@ -3335,6 +3486,7 @@ impl<'a> Lowerer<'a> {
                     Binding::Value {
                         code: value.to_string(),
                         rep: value_rep.clone(),
+                        ptr_info: None,
                     },
                 );
                 Ok(("1".into(), next))
@@ -3462,6 +3614,7 @@ impl<'a> Lowerer<'a> {
                                 Binding::Value {
                                     code: c_i128(*v as i128),
                                     rep: integer_literal_rep(*v),
+                                    ptr_info: None,
                                 },
                             );
                             return self.direct_ast_expr(&arm.body, &next, current);
@@ -3488,6 +3641,7 @@ impl<'a> Lowerer<'a> {
                                 Binding::Value {
                                     code: c_string(s),
                                     rep: Rep::Str,
+                                    ptr_info: None,
                                 },
                             );
                             return self.direct_ast_expr(&arm.body, &next, current);
@@ -3658,7 +3812,7 @@ impl<'a> Lowerer<'a> {
             ExprKind::Var(n) => {
                 if let Some(b) = env.get(n) {
                     return match b {
-                        Binding::Value { code, rep } => LirExpr::Var(code.clone(), rep.clone()),
+                        Binding::Value { code, rep, .. } => LirExpr::Var(code.clone(), rep.clone()),
                         Binding::Function { id } => LirExpr::FnRef(*id),
                     };
                 }
@@ -3862,11 +4016,15 @@ impl<'a> Lowerer<'a> {
                 let v = self.lower_expr(value, env, current);
                 let rep = lir_rep(&v);
                 let code = self.fresh_local(name);
+                // Compute metadata before mutably inserting into `env`; this
+                // avoids overlapping immutable/mutable borrows of the map.
+                let ptr_info = pointer_info_of_expr(value, self.a, Some(env));
                 let old = env.insert(
                     name.clone(),
                     Binding::Value {
                         code: code.clone(),
                         rep: rep.clone(),
+                        ptr_info,
                     },
                 );
                 let b = self.lower_expr(body, env, current);
@@ -4023,6 +4181,30 @@ impl<'a> Lowerer<'a> {
                 let right = self.lower_expr(r, env, current);
                 let lr = lir_rep(&left);
                 let rr = lir_rep(&right);
+
+                // Pointer arithmetic must be recognized in the primary LIR
+                // lowering path, not only by the direct-AST fallback below.
+                // Reusing the direct expression emitter here keeps pointer
+                // scaling/type metadata consistent for `p + n`, `n + p`,
+                // `p - n`, and `end - start` without changing ordinary numeric
+                // binary expressions.
+                let left_is_ptr = is_data_pointer_rep(&lr);
+                let right_is_ptr = is_data_pointer_rep(&rr);
+                let left_is_offset = lr.is_integer() || matches!(lr, Rep::Unknown);
+                let right_is_offset = rr.is_integer() || matches!(rr, Rep::Unknown);
+                let pointer_arithmetic =
+                    (matches!(op, BinOp::Add)
+                        && ((left_is_ptr && right_is_offset)
+                            || (left_is_offset && right_is_ptr)))
+                    || (matches!(op, BinOp::Sub)
+                        && left_is_ptr
+                        && (right_is_offset || right_is_ptr));
+                if pointer_arithmetic {
+                    if let Ok((code, rep)) = self.direct_ast_expr(e, env, current) {
+                        return LirExpr::DirectC { code, rep };
+                    }
+                }
+
                 let comparison = matches!(
                     op,
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
@@ -4131,6 +4313,23 @@ impl<'a> Lowerer<'a> {
     ) -> LirExpr {
         let (base_fun, flat_args) = Analyzer::flatten_application(fun, args);
 
+        // Array/pointer indexing is a parser intrinsic, not a user-visible
+        // function.  Keep it out of ordinary call resolution and lowering.
+        if matches!(&base_fun.kind, ExprKind::Var(n) if n == "$mak.index") {
+            if flat_args.len() != 2 {
+                self.a.note_recovery(current, fun, "LIR", format!("index intrinsic expects 2 arguments, got {}", flat_args.len()));
+                return runtime_recovery_lir(Rep::Unknown, "malformed index intrinsic", &self.a.functions);
+            }
+            let index_env = (*env).clone();
+            return match self.direct_index_expr(flat_args[0], flat_args[1], &index_env, current) {
+                Ok((code, rep)) => LirExpr::DirectC { code, rep },
+                Err(reason) => {
+                    self.a.note_recovery(current, fun, "index", reason);
+                    runtime_recovery_lir(Rep::Unknown, "invalid index expression", &self.a.functions)
+                }
+            };
+        }
+
         // β-reduce an immediate lambda literal.
         if let ExprKind::Fn { params, body } = &base_fun.kind {
             if params.len() == flat_args.len() {
@@ -4162,7 +4361,7 @@ impl<'a> Lowerer<'a> {
                     };
                 }
             }
-            if let Some(Binding::Value { code, rep }) = env.get(n).cloned() {
+            if let Some(Binding::Value { code, rep, .. }) = env.get(n).cloned() {
                 match &rep {
                     Rep::Function(id)
                         if *id < self.a.functions.len()
@@ -4512,6 +4711,7 @@ impl<'a> Lowerer<'a> {
                     Binding::Value {
                         code: code.clone(),
                         rep: rep.clone(),
+                        ptr_info: None,
                     },
                 );
                 LirPat::Bind { code, rep }
@@ -7572,10 +7772,15 @@ impl<'a> CEmitter<'a> {
         for e in &self.a.externals {
             match &e.decl.foreign {
                 ForeignTy::Atom(a) => {
+                    // Globals can retain their declared pointer shape because
+                    // this is an object declaration, not a function ABI.  The
+                    // function parameter/return path intentionally remains
+                    // opaque for backward compatibility.
+                    let c_type = foreign_index_ctype(&ForeignTy::Atom(a.clone()));
                     let _ = writeln!(
                         self.out,
                         "extern {} {} __asm__(\"{}\");",
-                        foreign_atom_type(a),
+                        c_type,
                         e.c_name,
                         c_escape(&e.decl.symbol)
                     );
@@ -10385,6 +10590,9 @@ fn foreign_atom_type(a: &ForeignAtom) -> String {
         ForeignAtom::U64 => "uint64_t".into(),
         ForeignAtom::F32 => "float".into(),
         ForeignAtom::F64 => "double".into(),
+        // Keep foreign function parameter/return signatures ABI-compatible
+        // with the previous opaque-pointer representation.  Object declarations
+        // and explicit indexing casts retain their pointer shape separately.
         ForeignAtom::Ptr | ForeignAtom::PtrTo(_) => "const void *".into(),
         ForeignAtom::Void => "void".into(),
         ForeignAtom::Named(_) => "uintptr_t".into(),
@@ -10555,6 +10763,111 @@ fn rep_decl(r: &Rep, name: &str, functions: &[FunctionInfo]) -> String {
     }
 }
 
+fn foreign_index_ctype(t: &ForeignTy) -> String {
+    // Unlike a foreign declaration, this helper deliberately retains every
+    // declared pointer layer.  The C symbol declaration/call ABI remains as it
+    // was; only the explicit casts generated for indexing use the typed shape.
+    match t {
+        ForeignTy::Atom(ForeignAtom::PtrTo(inner)) => {
+            format!("{} *", foreign_index_ctype(inner))
+        }
+        _ => foreign_arg_type(t),
+    }
+}
+
+fn pointer_info_from_foreign(t: &ForeignTy) -> Option<PointerInfo> {
+    let ForeignTy::Atom(ForeignAtom::PtrTo(inner)) = t else {
+        return None;
+    };
+    Some(PointerInfo {
+        elem_rep: rep_from_foreign(inner),
+        elem_ctype: foreign_index_ctype(inner),
+        nested: pointer_info_from_foreign(inner).map(Box::new),
+    })
+}
+
+/// Recover pointer element information without changing the ABI-level `Rep`.
+/// Unknown `ptr` values intentionally have no shape and are indexed as bytes.
+fn pointer_info_of_expr(
+    e: &Expr,
+    a: &Analyzer,
+    env: Option<&HashMap<String, Binding>>,
+) -> Option<PointerInfo> {
+    match &e.kind {
+        ExprKind::Str(_) => Some(PointerInfo {
+            elem_rep: Rep::U8,
+            elem_ctype: "const char".into(),
+            nested: None,
+        }),
+        ExprKind::Var(n) => {
+            if let Some(binding) = env.and_then(|env| env.get(n)) {
+                return match binding {
+                    Binding::Value { ptr_info, .. } => ptr_info.clone(),
+                    Binding::Function { .. } => None,
+                };
+            }
+            let eid = a.external_by_name.get(n).copied()?;
+            pointer_info_from_foreign(&a.externals[eid].decl.foreign)
+        }
+        ExprKind::App { fun, args } => {
+            let (base, all_args) = Analyzer::flatten_application(fun, args);
+            if let ExprKind::Var(n) = &base.kind {
+                if n == "$mak.index" && all_args.len() == 2 {
+                    return pointer_info_of_expr(all_args[0], a, env)
+                        .and_then(|info| info.nested.map(|nested| *nested));
+                }
+                if let Some(eid) = a.external_by_name.get(n).copied() {
+                    if let ForeignTy::Fun { ret, .. } = &a.externals[eid].decl.foreign {
+                        return pointer_info_from_foreign(ret);
+                    }
+                }
+            }
+            None
+        }
+        ExprKind::Bin { op, l, r } if matches!(op, BinOp::Add | BinOp::Sub) => {
+            pointer_info_of_expr(l, a, env).or_else(|| pointer_info_of_expr(r, a, env))
+        }
+        ExprKind::Let { name, value, body } => {
+            let mut local_env = env.cloned().unwrap_or_default();
+            let value_info = pointer_info_of_expr(value, a, Some(&local_env));
+            let value_rep = infer_ast_rep(value, a);
+            local_env.insert(
+                name.clone(),
+                Binding::Value {
+                    code: String::new(),
+                    rep: value_rep,
+                    ptr_info: value_info,
+                },
+            );
+            pointer_info_of_expr(body, a, Some(&local_env))
+        }
+        ExprKind::Quote(inner) => pointer_info_of_expr(inner, a, env),
+        _ => None,
+    }
+}
+
+fn pointer_element_ctype(
+    expr: &Expr,
+    a: &Analyzer,
+    env: Option<&HashMap<String, Binding>>,
+    rep: &Rep,
+) -> String {
+    if let Some(info) = pointer_info_of_expr(expr, a, env) {
+        return info.elem_ctype;
+    }
+    match rep {
+        Rep::Adt(name) => format!("struct mak_{}", mangle_ident(name)),
+        Rep::Str => "const char".into(),
+        // Untyped pointers have byte arithmetic because no pointee type is
+        // available to the compiler at this expression.
+        _ => "uint8_t".into(),
+    }
+}
+
+fn is_data_pointer_rep(rep: &Rep) -> bool {
+    matches!(rep, Rep::Ptr | Rep::Str | Rep::Adt(_))
+}
+
 fn infer_ast_rep(e: &Expr, a: &Analyzer) -> Rep {
     match &e.kind {
         ExprKind::Int(v) => integer_literal_rep(*v),
@@ -10587,6 +10900,15 @@ fn infer_ast_rep(e: &Expr, a: &Analyzer) -> Rep {
         ExprKind::Let { body, .. } => infer_ast_rep(body, a),
         ExprKind::App { fun, args } => {
             let (base, all_args) = Analyzer::flatten_application(fun, args);
+            if matches!(&base.kind, ExprKind::Var(n) if n == "$mak.index") {
+                return if all_args.len() == 2 {
+                    pointer_info_of_expr(all_args[0], a, None)
+                        .map(|info| info.elem_rep)
+                        .unwrap_or(Rep::Unknown)
+                } else {
+                    Rep::Unknown
+                };
+            }
             if let ExprKind::Var(n) = &base.kind {
                 if let Some(id) = a.resolve_function_name(n) {
                     if all_args.len() == a.functions[id].params.len() {
@@ -10616,7 +10938,18 @@ fn infer_ast_rep(e: &Expr, a: &Analyzer) -> Rep {
         }
         ExprKind::Block { tail, .. } => infer_ast_rep(tail, a),
         ExprKind::Bin { op, l, r } => {
-            if matches!(
+            let lr = infer_ast_rep(l, a);
+            let rr = infer_ast_rep(r, a);
+            if matches!(op, BinOp::Add)
+                && ((is_data_pointer_rep(&lr) && rr.is_integer())
+                    || (lr.is_integer() && is_data_pointer_rep(&rr)))
+            {
+                if is_data_pointer_rep(&lr) { lr } else { rr }
+            } else if matches!(op, BinOp::Sub) && is_data_pointer_rep(&lr) && rr.is_integer() {
+                lr
+            } else if matches!(op, BinOp::Sub) && is_data_pointer_rep(&lr) && is_data_pointer_rep(&rr) {
+                Rep::I64
+            } else if matches!(
                 op,
                 BinOp::Eq
                     | BinOp::Ne
@@ -10628,10 +10961,10 @@ fn infer_ast_rep(e: &Expr, a: &Analyzer) -> Rep {
                     | BinOp::LOr
             ) {
                 Rep::I32
-            } else if infer_ast_rep(l, a).is_float() || infer_ast_rep(r, a).is_float() {
+            } else if lr.is_float() || rr.is_float() {
                 Rep::F64
             } else {
-                merge_rep(infer_ast_rep(l, a), infer_ast_rep(r, a))
+                merge_rep(lr, rr)
             }
         }
         ExprKind::Un { op, e } => {
@@ -11973,4 +12306,42 @@ pub(crate) fn validate_program(program: &Program) -> bool {
     let mut lowerer = Lowerer::new(&a);
     let lir = lowerer.lower_all();
     !lir.iter().any(|f| lir_contains_fallback(&f.body))
+}
+
+#[cfg(test)]
+mod pointer_regressions {
+    use super::*;
+    use crate::parser::Parser;
+
+    fn generated(source: &[u8]) -> String {
+        let program = Parser::parse(source).expect("regression program should parse");
+        generate(&program)
+    }
+
+    #[test]
+    fn typed_multilevel_indexing_emits_pointee_scaled_loads() {
+        let c = generated(
+            b"let extern matrix : [i32] = \"matrix\" : i32**; matrix[0][1]",
+        );
+        assert!(c.contains("int32_t *"), "inner pointer type should be retained");
+        assert!(c.contains("int32_t * *)(uintptr_t)"), "outer indexing should step over i32* elements");
+        assert!(c.contains("int32_t *)(uintptr_t)"), "inner indexing should step over i32 elements");
+        assert!(!c.contains("$mak.index"), "the parser intrinsic must not leak into C");
+    }
+
+    #[test]
+    fn typed_pointer_addition_uses_element_stride() {
+        let c = generated(b"let extern values : [i32] = \"values\" : i32*; values + 2");
+        assert!(c.contains("int32_t *)(uintptr_t)"));
+        assert!(c.contains("intptr_t)(2)"));
+    }
+
+    #[test]
+    fn typed_pointer_difference_is_in_elements_not_bytes() {
+        let c = generated(
+            b"let extern end : [i32] = \"end\" : i32*; let extern start : [i32] = \"start\" : i32*; end - start",
+        );
+        assert!(c.contains("((int64_t)(((int32_t *)(uintptr_t)("),
+            "typed pointer subtraction should emit C pointer difference");
+    }
 }

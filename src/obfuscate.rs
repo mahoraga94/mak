@@ -4,6 +4,15 @@ use crate::ast::*;
 use crate::lexer::Span;
 use std::collections::{HashMap, HashSet};
 
+/// Parser-generated names for syntax that has no dedicated AST variant.
+/// These are compiler intrinsics, not user-level references. Keep this list
+/// in sync with `sema.rs` and `parser.rs`.
+#[inline]
+fn is_builtin_intrinsic(name: &str) -> bool {
+    matches!(name, "$mak.index")
+}
+
+
 const NULL_SPAN: Span = Span { lo: 0, hi: 0 };
 const LOCAL_LAYERS: usize = 128;
 
@@ -429,6 +438,18 @@ fn wpo_recursive_from_graph(graph: &HashMap<String, HashSet<String>>) -> HashSet
     out
 }
 
+fn flatten_application_for_opt<'a>(fun: &'a Expr, args: &'a [Expr]) -> (&'a Expr, Vec<&'a Expr>) {
+    let mut base = fun;
+    let mut flattened = Vec::new();
+    if let ExprKind::App { fun: inner_fun, args: inner_args } = &base.kind {
+        let (inner_base, inner_flat) = flatten_application_for_opt(inner_fun, inner_args);
+        base = inner_base;
+        flattened.extend(inner_flat);
+    }
+    flattened.extend(args.iter());
+    (base, flattened)
+}
+
 fn wpo_pure_expr(e: &Expr, pure: &HashSet<String>, local_scc: &HashSet<String>) -> bool {
     match &e.kind {
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Var(_) => true,
@@ -438,6 +459,13 @@ fn wpo_pure_expr(e: &Expr, pure: &HashSet<String>, local_scc: &HashSet<String>) 
             wpo_pure_expr(value, pure, local_scc) && wpo_pure_expr(body, pure, local_scc)
         }
         ExprKind::App { fun, args } => {
+            let (base, flat_args) = flatten_application_for_opt(fun, args);
+            if matches!(&base.kind, ExprKind::Var(n) if n == "$mak.index") {
+                // Dereferencing unknown memory is not referentially transparent:
+                // an external call may mutate the pointed-to object.
+                let _ = flat_args;
+                return false;
+            }
             let callee_ok = match &fun.kind {
                 ExprKind::Var(n) => local_scc.contains(n) || pure.contains(n),
                 ExprKind::Fn { body, .. } => wpo_pure_expr(body, pure, local_scc),
@@ -2019,6 +2047,7 @@ where
 fn scoped(p: &Program) -> bool {
     let mut globals = HashSet::new();
     let mut ctors = HashSet::new();
+
     for d in &p.decls {
         match d {
             Decl::Let { name, .. } => {
@@ -2040,6 +2069,7 @@ fn scoped(p: &Program) -> bool {
         let mut gs: Vec<&String> = globals.iter().collect();
         gs.sort();
         eprintln!("  [scoped-debug] globals ({}): {:?}", gs.len(), gs);
+
         let mut cs: Vec<&String> = ctors.iter().collect();
         cs.sort();
         eprintln!("  [scoped-debug] ctors   ({}): {:?}", cs.len(), cs);
@@ -2073,44 +2103,70 @@ fn scoped(p: &Program) -> bool {
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Quote(_) => true,
             ExprKind::Var(n) => {
-                let ok = bound.contains(n) || globals.contains(n) || ctors.contains(n);
+                // `$mak.index` is emitted by the parser for `base[index]`.
+                // It deliberately has no Decl entry and must survive alpha
+                // renaming as an intrinsic. Do not make other `$mak.*` names
+                // valid: only explicitly listed compiler intrinsics bypass
+                // ordinary scope lookup.
+                let is_intrinsic = is_builtin_intrinsic(n);
+                let in_scope = bound.contains(n);
+                let in_globals = globals.contains(n);
+                let in_ctors = ctors.contains(n);
+                let ok = is_intrinsic || in_scope || in_globals || in_ctors;
+
                 if !ok {
                     eprintln!(
                         "  [scoped-debug] FAIL: unbound var `{}` at span {}..{} \
-                         (in_scope={} in_globals={} in_ctors={} local_bound_count={})",
+                         (in_scope={} in_globals={} in_ctors={} is_intrinsic={} local_bound_count={})",
                         n,
                         e.span.lo,
                         e.span.hi,
-                        bound.contains(n),
-                        globals.contains(n),
-                        ctors.contains(n),
+                        in_scope,
+                        in_globals,
+                        in_ctors,
+                        is_intrinsic,
                         bound.len(),
                     );
+                } else if is_intrinsic {
+                    eprintln!(
+                        "  [scoped-debug] OK: compiler intrinsic `{}` at span {}..{}",
+                        n, e.span.lo, e.span.hi
+                    );
                 }
+
                 ok
             }
             ExprKind::Let { name, value, body } => {
+                // A let name is not in scope within its own initializer.
                 if !expr_ok(value, bound, globals, ctors) {
                     return false;
                 }
+
                 let was = bound.insert(name.clone());
                 let ok = expr_ok(body, bound, globals, ctors);
+
                 if !was {
                     bound.remove(name);
                 }
+
                 ok
             }
             ExprKind::Fn { params, body } => {
+                // Reject duplicate parameters rather than letting the scope
+                // validator silently collapse them into one set entry.
                 let mut param_names = HashSet::with_capacity(params.len());
                 if params.iter().any(|p| !param_names.insert(p.clone())) {
+                    eprintln!("  [scoped-debug] FAIL: duplicate function parameter");
                     return false;
                 }
+
                 let mut added = Vec::new();
                 for p in params {
                     if bound.insert(p.clone()) {
                         added.push(p.clone());
                     }
                 }
+
                 let ok = expr_ok(body, bound, globals, ctors);
                 for n in added {
                     bound.remove(&n);
@@ -2125,6 +2181,7 @@ fn scoped(p: &Program) -> bool {
                 if !expr_ok(scrut, bound, globals, ctors) {
                     return false;
                 }
+
                 for arm in arms {
                     let mut arm_bound = bound.clone();
                     pat_binds(&arm.pat, &mut arm_bound);
@@ -2146,12 +2203,15 @@ fn scoped(p: &Program) -> bool {
     }
 
     for d in &p.decls {
-        if let Decl::Let { value, .. } = d {
-            if !expr_ok(value, &mut HashSet::new(), &globals, &ctors) {
+        if let Decl::Let { value, name, .. } = d {
+            let mut bound = HashSet::new();
+            if !expr_ok(value, &mut bound, &globals, &ctors) {
+                eprintln!("  [scoped-debug] declaration `{}` failed scope validation", name);
                 return false;
             }
         }
     }
+
     expr_ok(&p.body, &mut HashSet::new(), &globals, &ctors)
 }
 
@@ -2358,13 +2418,13 @@ fn alpha(p: Program) -> Program {
                 top.entry(name.clone()).or_insert_with(|| values.fresh());
             }
             Decl::External(e) => {
-                // Externals keep their original name or get a fresh one if 
-                // we wanted to rename them, but here we just ensure they 
-                // are in the map. Since we reserved them, values.fresh() 
-                // won't return them. However, we usually want externals 
-                // to keep their MAK name if it's not conflicting, or 
+                // Externals keep their original name or get a fresh one if
+                // we wanted to rename them, but here we just ensure they
+                // are in the map. Since we reserved them, values.fresh()
+                // won't return them. However, we usually want externals
+                // to keep their MAK name if it's not conflicting, or
                 // just map them to themselves if they are already safe.
-                // The current logic maps them to a fresh name. 
+                // The current logic maps them to a fresh name.
                 // To keep external names stable, we can do:
                 top.entry(e.name.clone()).or_insert_with(|| e.name.clone());
             }
@@ -2756,6 +2816,13 @@ fn pure_body(e: &Expr, pure: &HashSet<String>) -> bool {
         ExprKind::Bin { l, r, .. } => pure_body(l, pure) && pure_body(r, pure),
         ExprKind::Un { e, .. } => pure_body(e, pure),
         ExprKind::App { fun, args } => {
+            let (base, flat_args) = flatten_application_for_opt(fun, args);
+            if matches!(&base.kind, ExprKind::Var(n) if n == "$mak.index") {
+                // Keep memory loads out of algebraic rewrites that require
+                // referentially transparent operands.
+                let _ = flat_args;
+                return false;
+            }
             let f = match &fun.kind {
                 ExprKind::Var(n) => pure.contains(n),
                 ExprKind::Fn { .. } => true,
@@ -8459,5 +8526,58 @@ fn pat_binders(p: &Pat, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod pointer_optimization_regressions {
+    use super::*;
+    use crate::parser::Parser;
+
+    fn parse_expr(source: &[u8]) -> Expr {
+        *Parser::parse(source)
+            .expect("regression expression should parse")
+            .body
+    }
+
+    #[test]
+    fn pointer_offset_neutral_elements_are_removed() {
+        for source in [&b"ptr + 0"[..], &b"ptr - 0"[..], &b"0 + ptr"[..]] {
+            let mut changed = false;
+            let result = simp_bin(parse_expr(source), &HashSet::new(), &mut changed);
+            assert!(changed, "expected pointer offset simplification for {source:?}");
+            assert!(matches!(&result.kind, ExprKind::Var(name) if name == "ptr"));
+        }
+    }
+
+    #[test]
+    fn index_reads_are_not_misclassified_as_pure() {
+        let expr = parse_expr(b"ptr[0]");
+        let pure = HashSet::new();
+        assert!(!pure_body(&expr, &pure));
+        assert!(!wpo_pure_expr(&expr, &pure, &HashSet::new()));
+    }
+
+    #[test]
+    fn scope_validator_accepts_index_intrinsic_before_and_after_alpha() {
+        let program = Parser::parse(b"let values = 7; values[0]")
+            .expect("program with indexing should parse");
+        assert!(scoped(&program), "index intrinsic must be accepted before alpha");
+
+        let renamed = alpha(program);
+        assert!(
+            scoped(&renamed),
+            "alpha-renaming must preserve and validate the index intrinsic"
+        );
+    }
+
+    #[test]
+    fn scope_validator_still_rejects_unknown_variables() {
+        let program = Parser::parse(b"missing_value[0]")
+            .expect("program should parse even though its base name is undefined");
+        assert!(
+            !scoped(&program),
+            "recognizing the index intrinsic must not permit an undefined base name"
+        );
     }
 }

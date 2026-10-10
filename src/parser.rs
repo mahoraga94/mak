@@ -1,3 +1,4 @@
+
 use crate::ast::*;
 use crate::lexer::{Kind, Kw, Lexer, P, Span, Tok};
 
@@ -148,6 +149,7 @@ impl<'a> Parser<'a> {
     fn cur(&self) -> Tok {
         self.toks[self.pos]
     }
+
     #[inline]
     fn peek(&self, n: usize) -> Tok {
         self.toks
@@ -207,6 +209,7 @@ impl<'a> Parser<'a> {
     fn expect_p(&mut self, p: P, what: &str) -> PResult<Span> {
         self.eat_p(p).ok_or_else(|| self.err_expect(what))
     }
+
     #[inline]
     fn expect_kw(&mut self, k: Kw, what: &str) -> PResult<Span> {
         self.eat_kw(k).ok_or_else(|| self.err_expect(what))
@@ -265,29 +268,37 @@ impl<'a> Parser<'a> {
     }
 
     fn decl_bring(&mut self) -> PResult<Decl> {
-        let start = self.bump().span;
+        // Consume `bring`. The span is not needed by Decl::Bring.
+        self.bump();
+
         let mut paths = Vec::new();
         while matches!(self.cur().kind, Kind::Str | Kind::StrEsc) {
             let sp = self.bump().span;
             let raw = &self.src[sp.lo as usize..sp.hi as usize];
             paths.push(String::from_utf8_lossy(&decode_string(raw)).into_owned());
         }
+
         if paths.is_empty() {
             return Err(self.err_expect("at least one string literal after `bring`"));
         }
+
         self.expect_p(P::Semi, "`;` after `bring`")?;
         Ok(Decl::Bring(paths))
     }
 
     fn decl_let(&mut self) -> PResult<Decl> {
         let start = self.bump().span;
-        if matches!(self.cur().kind, Kind::Kw(Kw::Extern)) || self.is_soft_kw(self.pos, b"external")
+
+        if matches!(self.cur().kind, Kind::Kw(Kw::Extern))
+            || self.is_soft_kw(self.pos, b"external")
         {
             self.bump();
             return Ok(Decl::External(self.decl_external_body(start)?));
         }
+
         let name = self.ident()?;
         let mut params = Vec::new();
+
         while !matches!(self.cur().kind, Kind::P(P::Eq)) {
             if matches!(self.cur().kind, Kind::Ident) {
                 params.push(self.ident()?);
@@ -304,8 +315,10 @@ impl<'a> Parser<'a> {
                 ));
             }
         }
+
         self.expect_p(P::Eq, "`=` in `let`")?;
         let mut value = self.expr()?;
+
         if !params.is_empty() {
             let sp = value.span;
             value = Expr {
@@ -316,6 +329,7 @@ impl<'a> Parser<'a> {
                 },
             };
         }
+
         self.expect_p(P::Semi, "`;` after `let`")?;
         Ok(Decl::Let {
             name,
@@ -328,9 +342,11 @@ impl<'a> Parser<'a> {
         let span = self.bump().span;
         let name = self.ident()?;
         let mut params = Vec::new();
+
         while let Kind::Ident = self.cur().kind {
             params.push(self.ident()?);
         }
+
         if self.eat_p(P::Semi).is_some() {
             return Ok(Decl::Type {
                 name,
@@ -339,8 +355,10 @@ impl<'a> Parser<'a> {
                 span,
             });
         }
+
         self.expect_p(P::LBrace, "`{` to open type body")?;
         let mut ctors = Vec::new();
+
         while self.cur().kind != Kind::P(P::RBrace) {
             if matches!(self.cur().kind, Kind::Eof) {
                 return Err(ParseErr {
@@ -349,12 +367,15 @@ impl<'a> Parser<'a> {
                     note: Some("add a closing `}`".into()),
                 });
             }
+
             let cspan = self.cur().span;
             let cname = self.ident()?;
             let mut args = Vec::new();
+
             while !matches!(self.cur().kind, Kind::P(P::Semi) | Kind::P(P::RBrace)) {
                 args.push(self.ty()?);
             }
+
             self.eat_p(P::Semi);
             ctors.push(Ctor {
                 name: cname,
@@ -362,8 +383,10 @@ impl<'a> Parser<'a> {
                 span: cspan,
             });
         }
+
         self.expect_p(P::RBrace, "`}` to close type body")?;
         self.expect_p(P::Semi, "`;` after type declaration")?;
+
         Ok(Decl::Type {
             name,
             params,
@@ -374,13 +397,16 @@ impl<'a> Parser<'a> {
 
     fn decl_external_body(&mut self, start: Span) -> PResult<Extern> {
         let name = self.ident()?;
+
         let mak_ty = if self.eat_p(P::Colon).is_some() {
             self.ty()?
         } else {
             Ty::Bottom
         };
+
         self.expect_p(P::Eq, "`=` in external declaration")?;
         let is_global = self.is_soft_kw(self.pos, b"global");
+
         if is_global {
             self.bump();
         }
@@ -394,8 +420,11 @@ impl<'a> Parser<'a> {
                 ));
             }
         };
-        let symbol = String::from_utf8_lossy(&self.src[sym_span.lo as usize..sym_span.hi as usize])
-            .into_owned();
+
+        let symbol = String::from_utf8_lossy(
+            &self.src[sym_span.lo as usize..sym_span.hi as usize],
+        )
+        .into_owned();
 
         let foreign = if self.eat_p(P::Colon).is_some() {
             self.foreign_ty()?
@@ -416,8 +445,10 @@ impl<'a> Parser<'a> {
                         note: Some("add a closing `}`".into()),
                     });
                 }
+
                 let key = self.ident()?;
                 self.expect_p(P::Eq, "`=` in descriptor entry")?;
+
                 match key.as_str() {
                     "pure" => {
                         let v = self.ident()?;
@@ -426,10 +457,18 @@ impl<'a> Parser<'a> {
                     "from" | "abi" => {
                         let sp = match self.cur().kind {
                             Kind::Str | Kind::StrEsc => self.bump().span,
-                            _ => return Err(self.err_expect("a string literal in descriptor")),
+                            _ => {
+                                return Err(self.err_expect(
+                                    "a string literal in descriptor",
+                                ));
+                            }
                         };
-                        let v = String::from_utf8_lossy(&self.src[sp.lo as usize..sp.hi as usize])
-                            .into_owned();
+
+                        let v = String::from_utf8_lossy(
+                            &self.src[sp.lo as usize..sp.hi as usize],
+                        )
+                        .into_owned();
+
                         if key == "from" {
                             from = Some(v);
                         } else {
@@ -440,11 +479,15 @@ impl<'a> Parser<'a> {
                         let _ = self.expr()?;
                     }
                 }
+
                 self.eat_p(P::Semi);
             }
+
             self.expect_p(P::RBrace, "`}` in descriptor")?;
         }
+
         self.expect_p(P::Semi, "`;` after external declaration")?;
+
         Ok(Extern {
             name,
             mak_ty,
@@ -460,10 +503,12 @@ impl<'a> Parser<'a> {
 
     fn ty(&mut self) -> PResult<Ty> {
         let lhs = self.ty_atom()?;
+
         if self.eat_p(P::Arrow).is_some() {
             let rhs = self.ty()?;
             return Ok(Ty::Fun(Box::new(lhs), Box::new(rhs)));
         }
+
         Ok(lhs)
     }
 
@@ -471,6 +516,7 @@ impl<'a> Parser<'a> {
         match self.cur().kind {
             Kind::Ident => {
                 let s = self.ident()?;
+
                 Ok(match s.as_str() {
                     "u8" => Ty::Prim(Prim::U8),
                     "u16" => Ty::Prim(Prim::U16),
@@ -493,36 +539,48 @@ impl<'a> Parser<'a> {
             }
             Kind::P(P::LParen) => {
                 self.bump();
+
                 if self.eat_p(P::RParen).is_some() {
                     return Ok(Ty::Prim(Prim::Unit));
                 }
+
                 let first = self.ty()?;
+
                 if self.eat_p(P::Comma).is_some() {
                     let mut ts = vec![first];
                     ts.push(self.ty()?);
+
                     while self.eat_p(P::Comma).is_some() {
                         ts.push(self.ty()?);
                     }
+
                     self.expect_p(P::RParen, "`)` to close tuple type")?;
                     return Ok(Ty::Tuple(ts));
                 }
+
                 if starts_ty_atom(&self.cur()) {
                     let name = match first {
                         Ty::Named(n) => n,
-                        _ => return Err(ParseErr {
-                            msg: "the head of a parenthesized type application must be a type name"
-                                .into(),
-                            span: self.cur().span,
-                            note: Some("write `(List a)` rather than `([u8] a)`".into()),
-                        }),
+                        _ => {
+                            return Err(ParseErr {
+                                msg: "the head of a parenthesized type application must be a type name"
+                                    .into(),
+                                span: self.cur().span,
+                                note: Some("write `(List a)` rather than `([u8] a)`".into()),
+                            });
+                        }
                     };
+
                     let mut args = vec![self.ty_atom()?];
+
                     while starts_ty_atom(&self.cur()) {
                         args.push(self.ty_atom()?);
                     }
+
                     self.expect_p(P::RParen, "`)` to close type application")?;
                     return Ok(Ty::App(name, args));
                 }
+
                 self.expect_p(P::RParen, "`)` to close parenthesized type")?;
                 Ok(first)
             }
@@ -540,6 +598,7 @@ impl<'a> Parser<'a> {
     fn foreign_ty(&mut self) -> PResult<ForeignTy> {
         if self.eat_p(P::LParen).is_some() {
             let mut args = Vec::new();
+
             while self.cur().kind != Kind::P(P::RParen) {
                 if matches!(self.cur().kind, Kind::Eof) {
                     return Err(ParseErr {
@@ -548,6 +607,7 @@ impl<'a> Parser<'a> {
                         note: Some("add a closing `)` and a `->` return type".into()),
                     });
                 }
+
                 if self.cur().kind == Kind::P(P::Dot)
                     && self.peek(1).kind == Kind::P(P::Dot)
                     && self.peek(2).kind == Kind::P(P::Dot)
@@ -559,13 +619,16 @@ impl<'a> Parser<'a> {
                 } else {
                     args.push(ForeignArg::Ty(self.foreign_ty()?));
                 }
+
                 if self.eat_p(P::Comma).is_none() {
                     break;
                 }
             }
+
             self.expect_p(P::RParen, "`)` to close foreign arg list")?;
             self.expect_p(P::Arrow, "`->` before foreign return type")?;
             let ret = self.foreign_ty()?;
+
             return Ok(ForeignTy::Fun {
                 args,
                 ret: Box::new(ret),
@@ -575,6 +638,7 @@ impl<'a> Parser<'a> {
         let atom = match self.cur().kind {
             Kind::Ident => {
                 let s = self.ident()?;
+
                 match s.as_str() {
                     "i8" => ForeignAtom::I8,
                     "i16" => ForeignAtom::I16,
@@ -594,12 +658,16 @@ impl<'a> Parser<'a> {
             _ => return Err(self.err_expect("a foreign type atom")),
         };
 
-        if self.eat_p(P::Star).is_some() {
-            return Ok(ForeignTy::Atom(ForeignAtom::PtrTo(Box::new(
-                ForeignTy::Atom(atom),
-            ))));
+        // Accept repeated pointer stars (`i32*`, `i32**`, `u8***`).
+        // Preserve each pointer layer so codegen can determine the element
+        // type at every level of chained indexing.
+        let mut ty = ForeignTy::Atom(atom);
+
+        while self.eat_p(P::Star).is_some() {
+            ty = ForeignTy::Atom(ForeignAtom::PtrTo(Box::new(ty)));
         }
-        Ok(ForeignTy::Atom(atom))
+
+        Ok(ty)
     }
 
     pub fn expr(&mut self) -> PResult<Expr> {
@@ -609,17 +677,7 @@ impl<'a> Parser<'a> {
     /// Parse prefix operators before entering the binary/application layer.
     ///
     /// The operand is parsed with a binding power above `.` and every binary
-    /// operator, while implicit function application remains available. This
-    /// gives the expected grouping:
-    ///
-    ///     -f x      == -(f x)
-    ///     !f x      == !(f x)
-    ///     ~f x      == ~(f x)
-    ///     -(a + b)  == -(a + b)
-    ///     !-x       == !(-x)
-    ///
-    /// In other words, prefix operators bind tightly, but a normal function
-    /// application still belongs to the operand.
+    /// operator, while implicit function application remains available.
     fn prefix_expr(&mut self) -> PResult<Expr> {
         let t = self.cur();
 
@@ -642,7 +700,10 @@ impl<'a> Parser<'a> {
             };
 
             return Ok(Expr {
-                kind: ExprKind::Un { op, e: Box::new(e) },
+                kind: ExprKind::Un {
+                    op,
+                    e: Box::new(e),
+                },
                 span,
             });
         }
@@ -652,7 +713,17 @@ impl<'a> Parser<'a> {
 
     fn expr_bp(&mut self, min_bp: u8) -> PResult<Expr> {
         let mut lhs = self.prefix_expr()?;
+
         loop {
+            // Postfix indexing binds more tightly than implicit application
+            // and every infix operator. Lower indexing to a reserved AST
+            // intrinsic so a new public AST node is not required.
+            if matches!(self.cur().kind, Kind::P(P::LBrack)) {
+                lhs = self.index_suffix(lhs)?;
+                continue;
+            }
+
+            // Preserve the existing empty-call syntax: f().
             if matches!(self.cur().kind, Kind::P(P::LParen))
                 && matches!(self.peek(1).kind, Kind::P(P::RParen))
             {
@@ -662,6 +733,7 @@ impl<'a> Parser<'a> {
                     lo: lhs.span.lo,
                     hi: close.hi.max(open.hi),
                 };
+
                 lhs = Expr {
                     span,
                     kind: ExprKind::App {
@@ -669,14 +741,23 @@ impl<'a> Parser<'a> {
                         args: Vec::new(),
                     },
                 };
+
                 continue;
             }
+
             if self.starts_atom() {
-                let arg = self.atom()?;
+                // Parse indexing on the argument first, so `f xs[i]`
+                // means `f (xs[i])`. Keep the intermediate in a local:
+                // nesting self.atom() inside self.index_suffix() would
+                // borrow self mutably twice in the same expression.
+                let atom = self.atom()?;
+                let arg = self.index_suffix(atom)?;
+
                 let span = Span {
                     lo: lhs.span.lo,
                     hi: arg.span.hi,
                 };
+
                 lhs = Expr {
                     span,
                     kind: ExprKind::App {
@@ -684,6 +765,7 @@ impl<'a> Parser<'a> {
                         args: vec![arg],
                     },
                 };
+
                 continue;
             }
 
@@ -726,6 +808,7 @@ impl<'a> Parser<'a> {
                     span,
                     kind: ExprKind::Var(x.clone()),
                 };
+
                 lhs = Expr {
                     span,
                     kind: ExprKind::Fn {
@@ -745,6 +828,7 @@ impl<'a> Parser<'a> {
                         }),
                     },
                 };
+
                 continue;
             }
 
@@ -754,6 +838,7 @@ impl<'a> Parser<'a> {
                 lo: lhs.span.lo,
                 hi: rhs.span.hi,
             };
+
             lhs = Expr {
                 span,
                 kind: ExprKind::Bin {
@@ -763,7 +848,48 @@ impl<'a> Parser<'a> {
                 },
             };
         }
+
         Ok(lhs)
+    }
+
+    /// Parse postfix indexing suffixes from an already parsed expression.
+    /// `base[i][j]` becomes `$mak.index($mak.index(base, i), j)`.
+    fn index_suffix(&mut self, mut base: Expr) -> PResult<Expr> {
+        while matches!(self.cur().kind, Kind::P(P::LBrack)) {
+            let open = self.bump().span;
+
+            if matches!(self.cur().kind, Kind::P(P::RBrack)) {
+                return Err(ParseErr {
+                    msg: "an index expression cannot be empty".into(),
+                    span: self.cur().span,
+                    note: Some(
+                        "write `value[index]`; standalone `[]` array literals are not supported"
+                            .into(),
+                    ),
+                });
+            }
+
+            let index = self.expr()?;
+            let close = self.expect_p(P::RBrack, "`]` to close index expression")?;
+
+            let span = Span {
+                lo: base.span.lo.min(open.lo),
+                hi: close.hi.max(index.span.hi),
+            };
+
+            base = Expr {
+                span,
+                kind: ExprKind::App {
+                    fun: Box::new(Expr {
+                        span: open,
+                        kind: ExprKind::Var("$mak.index".to_string()),
+                    }),
+                    args: vec![base, index],
+                },
+            };
+        }
+
+        Ok(base)
     }
 
     fn starts_atom(&self) -> bool {
@@ -776,7 +902,6 @@ impl<'a> Parser<'a> {
                 | Kind::StrEsc
                 | Kind::P(P::LParen)
                 | Kind::P(P::LBrace)
-                | Kind::P(P::LBrack)
                 | Kind::P(P::Backslash)
                 | Kind::Kw(Kw::Fn)
                 | Kind::Kw(Kw::Let)
@@ -786,6 +911,7 @@ impl<'a> Parser<'a> {
 
     fn atom(&mut self) -> PResult<Expr> {
         let t = self.cur();
+
         match t.kind {
             Kind::Int(v) => {
                 self.bump();
@@ -804,6 +930,7 @@ impl<'a> Parser<'a> {
             Kind::Str | Kind::StrEsc => {
                 self.bump();
                 let raw = &self.src[t.span.lo as usize..t.span.hi as usize];
+
                 Ok(Expr {
                     kind: ExprKind::Str(decode_string(raw)),
                     span: t.span,
@@ -822,14 +949,14 @@ impl<'a> Parser<'a> {
                 self.expect_p(P::RParen, "`)` to close parenthesized expression")?;
                 Ok(e)
             }
-            Kind::P(P::LBrack) => {
-                self.bump();
-                self.expect_p(P::RBrack, "`]` (array literals are not yet supported)")?;
-                Ok(Expr {
-                    kind: ExprKind::Int(0),
-                    span: t.span,
-                })
-            }
+            Kind::P(P::LBrack) => Err(ParseErr {
+                msg: "unexpected `[`; indexing must follow an expression".into(),
+                span: t.span,
+                note: Some(
+                    "write `value[index]`; standalone `[]` array literals are not supported"
+                        .into(),
+                ),
+            }),
             Kind::P(P::LBrace) => {
                 self.bump();
                 let kind = self.block_body()?;
@@ -848,20 +975,25 @@ impl<'a> Parser<'a> {
 
     fn block_body(&mut self) -> PResult<ExprKind> {
         let mut stmts: Vec<Expr> = Vec::new();
+
         loop {
             if matches!(self.cur().kind, Kind::P(P::RBrace)) {
                 if stmts.is_empty() {
                     return Ok(ExprKind::Int(0));
                 }
+
                 let tail = stmts.pop().unwrap();
+
                 if stmts.is_empty() {
                     return Ok(tail.kind);
                 }
+
                 return Ok(ExprKind::Block {
                     stmts,
                     tail: Box::new(tail),
                 });
             }
+
             if matches!(self.cur().kind, Kind::Eof) {
                 return Err(ParseErr {
                     msg: "unterminated block: missing `}`".into(),
@@ -869,6 +1001,7 @@ impl<'a> Parser<'a> {
                     note: Some("every `{` needs a matching `}`".into()),
                 });
             }
+
             if matches!(self.cur().kind, Kind::Kw(Kw::Let)) {
                 let sp = self.cur().span;
                 let let_kind = self.block_let()?;
@@ -876,9 +1009,11 @@ impl<'a> Parser<'a> {
                     span: sp,
                     kind: let_kind,
                 };
+
                 if stmts.is_empty() {
                     return Ok(let_expr.kind);
                 }
+
                 return Ok(ExprKind::Block {
                     stmts,
                     tail: Box::new(let_expr),
@@ -890,19 +1025,24 @@ impl<'a> Parser<'a> {
                 Err(err) => {
                     self.errors.push(err);
                     self.recover_block();
+
                     if matches!(self.cur().kind, Kind::P(P::RBrace)) {
                         if stmts.is_empty() {
                             return Ok(ExprKind::Int(0));
                         }
+
                         let tail = stmts.pop().unwrap();
+
                         if stmts.is_empty() {
                             return Ok(tail.kind);
                         }
+
                         return Ok(ExprKind::Block {
                             stmts,
                             tail: Box::new(tail),
                         });
                     }
+
                     continue;
                 }
             };
@@ -911,18 +1051,22 @@ impl<'a> Parser<'a> {
                 if stmts.is_empty() {
                     return Ok(e.kind);
                 }
+
                 return Ok(ExprKind::Block {
                     stmts,
                     tail: Box::new(e),
                 });
             }
+
             stmts.push(e);
         }
     }
 
     fn block_let(&mut self) -> PResult<ExprKind> {
         let sp = self.bump().span;
-        if matches!(self.cur().kind, Kind::Kw(Kw::Extern)) || self.is_soft_kw(self.pos, b"external")
+
+        if matches!(self.cur().kind, Kind::Kw(Kw::Extern))
+            || self.is_soft_kw(self.pos, b"external")
         {
             return Err(ParseErr {
                 msg: "`external` declarations may only appear at the top level".into(),
@@ -930,8 +1074,10 @@ impl<'a> Parser<'a> {
                 note: Some("move this declaration outside of any function body".into()),
             });
         }
+
         let name = self.ident()?;
         let mut params = Vec::new();
+
         while !matches!(self.cur().kind, Kind::P(P::Eq)) {
             match self.cur().kind {
                 Kind::Ident => params.push(self.ident()?),
@@ -943,8 +1089,10 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+
         self.expect_p(P::Eq, "`=` in `let` binding")?;
         let mut value = self.expr()?;
+
         if !params.is_empty() {
             let vs = value.span;
             value = Expr {
@@ -955,12 +1103,14 @@ impl<'a> Parser<'a> {
                 },
             };
         }
+
         self.expect_p(P::Semi, "`;` after `let` binding")?;
         let body_kind = self.block_body()?;
         let body = Expr {
             span: sp,
             kind: body_kind,
         };
+
         Ok(ExprKind::Let {
             name,
             value: Box::new(value),
@@ -972,6 +1122,7 @@ impl<'a> Parser<'a> {
         let sp = self.bump().span;
         let name = self.ident()?;
         let mut params = Vec::new();
+
         while !matches!(self.cur().kind, Kind::P(P::Eq)) {
             match self.cur().kind {
                 Kind::Ident => params.push(self.ident()?),
@@ -983,8 +1134,10 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+
         self.expect_p(P::Eq, "`=` in `let` binding")?;
         let mut value = self.expr()?;
+
         if !params.is_empty() {
             let vs = value.span;
             value = Expr {
@@ -995,12 +1148,14 @@ impl<'a> Parser<'a> {
                 },
             };
         }
+
         self.expect_p(P::Semi, "`;` after `let` binding")?;
         let body = self.expr()?;
         let span = Span {
             lo: sp.lo,
             hi: body.span.hi,
         };
+
         Ok(Expr {
             span,
             kind: ExprKind::Let {
@@ -1014,6 +1169,7 @@ impl<'a> Parser<'a> {
     fn fn_expr(&mut self) -> PResult<Expr> {
         let sp = self.bump().span;
         let mut params = Vec::new();
+
         if self.eat_p(P::LParen).is_some() {
             while !matches!(self.cur().kind, Kind::P(P::RParen)) {
                 if matches!(self.cur().kind, Kind::Eof) {
@@ -1023,6 +1179,7 @@ impl<'a> Parser<'a> {
                         note: Some("parameter lists look like `fn (a b c) { ... }`".into()),
                     });
                 }
+
                 match self.cur().kind {
                     Kind::Ident => params.push(self.ident()?),
                     _ => {
@@ -1032,8 +1189,10 @@ impl<'a> Parser<'a> {
                         ));
                     }
                 }
+
                 self.eat_p(P::Comma);
             }
+
             self.expect_p(P::RParen, "`)` to close parameter list")?;
         } else {
             while let Kind::Ident = self.cur().kind {
@@ -1053,14 +1212,17 @@ impl<'a> Parser<'a> {
                     ));
                 }
             };
+
             let kind = self.block_body()?;
             self.expect_p(P::RBrace, "`}` to close function body")?;
             Expr { span: open, kind }
         };
+
         let span = Span {
             lo: sp.lo,
             hi: body.span.hi,
         };
+
         Ok(Expr {
             span,
             kind: ExprKind::Fn {
@@ -1073,9 +1235,12 @@ impl<'a> Parser<'a> {
     fn case_expr(&mut self) -> PResult<Expr> {
         let sp = self.bump().span;
         let scrut = self.expr()?;
+
         self.expect_kw(Kw::Of, "`of` after `case` scrutinee")?;
         self.expect_p(P::LBrace, "`{` to open case arms")?;
+
         let mut arms = Vec::new();
+
         while self.cur().kind != Kind::P(P::RBrace) {
             if matches!(self.cur().kind, Kind::Eof) {
                 return Err(ParseErr {
@@ -1084,22 +1249,27 @@ impl<'a> Parser<'a> {
                     note: Some("each arm is `pattern -> body;`".into()),
                 });
             }
+
             let asp = self.cur().span;
             let pat = self.pat()?;
             self.expect_expr_arrow("`->` or `=>` in case arm")?;
             let body = self.expr()?;
             self.eat_p(P::Semi);
+
             arms.push(Arm {
                 pat,
                 body,
                 span: asp,
             });
         }
+
         self.expect_p(P::RBrace, "`}` to close case")?;
+
         let span = Span {
             lo: sp.lo,
             hi: self.cur().span.hi,
         };
+
         Ok(Expr {
             span,
             kind: ExprKind::Case {
@@ -1113,14 +1283,18 @@ impl<'a> Parser<'a> {
         match self.cur().kind {
             Kind::Ident => {
                 let name = self.ident()?;
+
                 if name == "_" {
                     return Ok(Pat::Wild);
                 }
+
                 if name.as_bytes()[0].is_ascii_uppercase() {
                     let mut args = Vec::new();
+
                     while self.starts_atom() {
                         args.push(self.pat()?);
                     }
+
                     Ok(Pat::Ctor { name, args })
                 } else {
                     Ok(Pat::Bind(name))
@@ -1137,14 +1311,19 @@ impl<'a> Parser<'a> {
             }
             Kind::P(P::LParen) => {
                 self.bump();
+
                 if self.eat_p(P::RParen).is_some() {
                     return Ok(Pat::Tuple(vec![]));
                 }
+
                 let mut ps = vec![self.pat()?];
+
                 while self.eat_p(P::Comma).is_some() {
                     ps.push(self.pat()?);
                 }
+
                 self.expect_p(P::RParen, "`)` to close tuple pattern")?;
+
                 Ok(if ps.len() == 1 {
                     ps.pop().unwrap()
                 } else {
@@ -1232,16 +1411,23 @@ fn p_str(p: P) -> &'static str {
 }
 
 fn printable(b: u8) -> char {
-    if b.is_ascii_graphic() { b as char } else { '?' }
+    if b.is_ascii_graphic() {
+        b as char
+    } else {
+        '?'
+    }
 }
 
 fn decode_string(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
+
     while i < raw.len() {
         let b = raw[i];
+
         if b == b'\\' && i + 1 < raw.len() {
             i += 1;
+
             match raw[i] {
                 b'n' => out.push(b'\n'),
                 b't' => out.push(b'\t'),
@@ -1253,6 +1439,7 @@ fn decode_string(raw: &[u8]) -> Vec<u8> {
                 b'x' if i + 2 < raw.len() => {
                     let h = hex(raw[i + 1]);
                     let l = hex(raw[i + 2]);
+
                     if let (Some(h), Some(l)) = (h, l) {
                         out.push((h << 4) | l);
                         i += 2;
@@ -1265,8 +1452,10 @@ fn decode_string(raw: &[u8]) -> Vec<u8> {
         } else {
             out.push(b);
         }
+
         i += 1;
     }
+
     out
 }
 
@@ -1277,5 +1466,73 @@ fn hex(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod indexing_regressions {
+    use super::*;
+
+    fn is_index(e: &Expr) -> bool {
+        matches!(
+            &e.kind,
+            ExprKind::App { fun, args }
+                if matches!(&fun.kind, ExprKind::Var(name) if name == "$mak.index")
+                    && args.len() == 2
+        )
+    }
+
+    #[test]
+    fn parses_simple_and_chained_postfix_indexing() {
+        let program = Parser::parse(b"matrix[row][column]").expect("valid index expression");
+
+        let ExprKind::App { args, .. } = &program.body.kind else {
+            panic!("outer index must be an intrinsic application");
+        };
+
+        assert_eq!(args.len(), 2);
+        assert!(is_index(&args[0]), "the left side should be the inner index");
+        assert!(matches!(&args[1].kind, ExprKind::Var(n) if n == "column"));
+    }
+
+    #[test]
+    fn indexing_binds_tighter_than_implicit_application() {
+        let program = Parser::parse(b"f values[index]").expect("valid application");
+
+        let ExprKind::App { fun, args } = &program.body.kind else {
+            panic!("expression should be a function application");
+        };
+
+        assert!(matches!(&fun.kind, ExprKind::Var(n) if n == "f"));
+        assert_eq!(args.len(), 1);
+        assert!(is_index(&args[0]));
+    }
+
+    #[test]
+    fn rejects_empty_index_syntax_instead_of_treating_it_as_zero() {
+        assert!(Parser::parse(b"values[]").is_err());
+        assert!(Parser::parse(b"[]").is_err());
+    }
+
+    #[test]
+    fn preserves_repeated_pointer_stars_in_external_types() {
+        let program = Parser::parse(
+            b"let extern matrix : [i32] = \"matrix\" : i32**; matrix[0][1]",
+        )
+        .expect("valid typed external pointer declaration");
+
+        let Decl::External(external) = &program.decls[0] else {
+            panic!("expected external declaration");
+        };
+
+        let ForeignTy::Atom(ForeignAtom::PtrTo(inner)) = &external.foreign else {
+            panic!("outer pointer layer was lost");
+        };
+
+        assert!(matches!(
+            inner.as_ref(),
+            ForeignTy::Atom(ForeignAtom::PtrTo(_))
+        ));
+        assert!(is_index(&program.body));
     }
 }
