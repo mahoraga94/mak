@@ -1,2564 +1,10422 @@
-# MAK Language Syntax Reference
+# MAK Syntax Reference
 
-**Status:** source-derived language reference  
-**Source reviewed:** MAK lexer, parser, AST, and related source snapshot supplied on 10 October 2026  
-**Purpose:** describe how MAK programs are written, how the accepted forms group together, and where the implementation has important exceptions.
-
-This is a reference for people writing MAK, not a guide to the compiler's internal architecture. The rules below are derived from the supplied parser and AST definitions. Where a construct is accepted syntactically but its meaning is incomplete, surprising, ABI-dependent, or unsafe, the text says so instead of presenting it as a language guarantee.
-
-## How to read this document
-
-- **Syntax rule** means the supplied parser explicitly accepts the form.
-- **Practical rule** means the form follows from how expressions, delimiters, or declarations are parsed.
-- **Caveat** identifies a behavior that may be surprising or hazardous.
-- **Not supported by this parser** means the source form is not represented by a corresponding parser rule, even if a related AST or backend feature exists.
-- **Implementation detail** means the behavior is visible in the supplied source but should not automatically be treated as an intentional long-term language promise.
-
-Unless stated otherwise, examples are source snippets, not claims that every example has been independently executed on every MAK build. The three `ringest` examples in §11 are analyzed separately because their small textual differences materially change their parse and generated C.
-
----
-
-# 1. The shape of a MAK source file
-
-A MAK source file consists of zero or more top-level declarations followed by at most one final expression:
-
-```mak
-let answer = 40 + 2;
-let square x = x * x;
-
-square answer
-```
-
-The declarations establish names. The final expression is the program body's value. In the driver shown in the supplied source, the program body is the expression ultimately handed to compilation; the language does not require a textual `main` function in every file.
-
-## 1.1 Top-level order
-
-At the beginning of a file, the parser repeatedly consumes declarations whose first token is `let`, `type`, or `bring`. Once the next token is not one of those declaration starters, it parses the remainder as the program expression.
-
-Consequences:
-
-1. A declaration must appear in declaration position, before the final expression.
-2. `let`, `type`, and `bring` are reserved declaration starters at the beginning of a file; they are not ordinary top-level expression atoms.
-3. A second declaration after the final expression is not accepted as a new declaration. It becomes trailing input and causes a parse error.
-4. A declaration-only file is accepted by the supplied parser. If no expression remains at EOF, the parser synthesizes the integer expression `0` as the body.
-5. An empty file also takes the parser's empty-body path and becomes a program whose body is integer `0`.
-
-For a conventional file, put declarations first and the expression last:
-
-```mak
-let add x y = x + y;
-let double x = add x x;
-
-double 21
-```
-
-Do not put a semicolon after the final expression unless it is inside a context that explicitly accepts statement separators, such as a block. At the top level, `expression;` leaves a semicolon after the parsed body and therefore is not a complete source file under the supplied grammar.
-
-**Leading-`let` ambiguity:** at the beginning of the file, a leading `let` is consumed by the top-level declaration loop. If the intended final body is itself a local `let` expression, wrap it in braces or parentheses so it appears as an expression atom rather than as a top-level declaration starter. For example, use `{ let x = 1; x + 1 }` as a root body when that distinction matters.
-
-## 1.2 Top-level grammar at a glance
+## 1. Source-file structure
 
 ```ebnf
-program          = { declaration }, [ expression ], EOF ;
-declaration      = let_declaration
-                 | external_declaration
-                 | type_declaration
-                 | bring_declaration ;
+program      ::= { declaration } [ expression ] EOF
+declaration  ::= let-declaration
+               | type-declaration
+               | bring-declaration
 ```
 
-`external_declaration` is spelled with the `let` prefix in source; it is not a standalone declaration starter:
+A file contains zero or more declarations followed by at most one final expression. Top-level declarations require `;`. The final expression does not require and generally cannot have a trailing `;`. If the file contains declarations only, the parser supplies an integer `0` as its body.
 
 ```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
+let x = 10;
+let add a b = a + b;
+add x 5
 ```
 
-The `[ expression ]` notation above describes the parser's empty-body fallback. A source program intended to do useful work should supply a final expression explicitly.
+## 2. Whitespace, comments, identifiers
 
----
+### Whitespace
 
-# 2. Names, keywords, and punctuation
+Spaces, tabs, carriage returns, and newlines separate tokens. Newlines do not terminate expressions or define blocks.
 
-## 2.1 Identifier spelling
-
-Identifiers use ASCII letters, digits, and underscore. The first character must be an ASCII letter or underscore; later characters may also be digits.
-
-```text
-name
-_name
-value2
-MAX_SIZE
-lowerCamel
-snake_case
-```
-
-These are examples of valid identifier shapes. A name cannot begin with a digit. Non-ASCII letters are not accepted as identifier characters by the supplied tokenizer.
-
-**Naming convention:** lowercase names are normally used for values, functions, and type parameters; uppercase names are normally used for data constructors. This convention is important for patterns: the parser distinguishes constructors from bindings using the first character's ASCII uppercase status.
-
-## 2.2 Reserved words
-
-The tokenizer recognizes these exact lowercase spellings as keywords:
-
-| Keyword | Syntactic role |
-|---|---|
-| `let` | Top-level binding, local binding, or let-expression starter |
-| `fn` | Lambda/function expression |
-| `case` | Pattern-matching expression |
-| `type` | Top-level type declaration |
-| `extern` | External declaration modifier after `let` |
-| `of` | Separator in a `case` expression |
-| `bring` | Top-level import declaration |
-| `pass` | Tokenized as a keyword, but has no ordinary expression or declaration rule in the supplied parser |
-
-Keywords are case-sensitive. `let` is a keyword; `Let` is an identifier. The parser does not treat `Pass`, `CASE`, or `TYPE` as their lowercase keyword equivalents.
-
-### Contextual words that are not globally reserved
-
-Some meaningful words are ordinary identifiers except at a particular point in a declaration:
-
-- `external` is recognized as a soft spelling for `extern` immediately after `let`.
-- `global` is recognized as an optional modifier immediately after the `=` in an external declaration.
-- `pure`, `from`, and `abi` are ordinary identifiers interpreted as descriptor keys inside an external descriptor block.
-- `true` is an ordinary identifier; it is read as the value of the `pure` descriptor only when that descriptor expects an identifier and the exact text is `true`.
-- `false` is also an ordinary identifier. In a `pure` descriptor, every identifier other than exact `true` results in `pure = false` in the parsed descriptor.
-
-These are contextual uses, not global literal or keyword definitions. Outside their special positions, they are parsed as identifiers if the surrounding grammar permits an identifier.
-
-## 2.3 Punctuation accepted by the syntax
-
-The supplied tokenizer recognizes the following punctuation and operator spellings:
-
-```text
-{ }  ( )  [ ]  ;  ,  :  .  \
-->   =>   =
-+  -  *  /  %  &  |  ^  <<  >>
-==  /=  <  >  <=  >=  &&  ||  !  ~
-```
-
-The three dots in `...` are not a single punctuation token. The foreign-function type parser recognizes three consecutive dot tokens as a variadic marker.
-
-Important near-misses:
-
-- `!=` is **not** the not-equal operator in this grammar; use `/=`.
-- `===` is not a defined operator.
-- `:=`, `::`, `++`, `--`, `??`, `?.`, and `**` are not defined operators here.
-- `=>` is accepted wherever the parser calls for an expression arrow, including lambda-body and `case`-arm separators. Type arrows and foreign-function return arrows use `->` specifically.
-- `=` is declaration/descriptor punctuation, not an equality operator. Equality is `==`.
-
-## 2.4 Whitespace, line breaks, and comments
-
-Spaces, tabs, carriage returns, and line feeds separate tokens; normal indentation is permitted. Newlines do not generally terminate an expression. The parser uses punctuation and expression grammar, not indentation, to decide where constructs end.
-
-Both comment forms are accepted:
+### Comments
 
 ```mak
-// A line comment runs through the end of this line.
+// Line comment: continues to the end of the line.
 
-/* A block comment can span
-   multiple lines. */
-
-/* Block comments may be nested:
-   /* nested comment */
-   the outer comment continues here.
+/* Block comment.
+   Block comments can nest: /* inner comment */ still in outer comment.
 */
 ```
 
-Line comments begin with `//`. Block comments begin with `/*` and end at the matching `*/`; nesting is supported. An unterminated block comment is a lexical error.
+An unterminated block comment is a lexer error.
 
-Comments are separators, not statement terminators. A comment does not replace a required semicolon.
+### Identifiers
 
-## 2.5 Where separators are required
+```ebnf
+identifier       ::= identifier-start { identifier-continue }
+identifier-start ::= ASCII-letter | "_"
+identifier-continue ::= identifier-start | digit
+```
 
-| Construct | Separator rule |
-|---|---|
-| Top-level `let` | Final `;` is required |
-| Local `let` expression | `;` between the value and body is required |
-| `let` inside a block | `;` after the bound value is required |
-| `bring` declaration | Final `;` is required |
-| `type Name;` | Final `;` is required |
-| `type Name { ... };` | `;` after the closing `}` is required |
-| Constructors inside a type body | Separate consecutive constructors with `;`; the final constructor may be immediately followed by `}` |
-| External declaration | Final `;` is required, after its optional descriptor block |
-| External descriptor entries | `;` is optional to the parser, but recommended and practically important for unknown keys |
-| `case` arms | `;` is optional to the parser, but recommended between every pair of arms |
-| Block expressions | `;` separates non-final expressions; a trailing `;` before `}` is permitted |
-| Final top-level expression | Do not append `;` |
+Identifiers are ASCII-only and case-sensitive. Uppercase and lowercase names are distinct. A name cannot start with a digit.
 
-For type declarations, semicolons are not decoration: without a separator, a following identifier can be consumed as another field type of the preceding constructor. For example, `type T { First Second; };` is parsed like a constructor `First` with a field of type `Second`, not as two zero-field constructors. Write `First; Second;` when two constructors are intended.
+The lexically reserved words are:
 
----
+`let` `fn` `case` `type` `extern` `of` `pass` `bring`
 
-# 3. Literals
+`external` is accepted as an alternative to `extern` after `let`. `global` is a special word in an external declaration. `true` and `false` are not language keywords or dedicated boolean literals; they lex as identifiers. `pass` is lexed as a reserved word but has no declaration or expression form in the parser.
 
-The parser has three literal expression kinds: integers, floating-point numbers, and strings. There is no dedicated Boolean literal, tuple expression literal, or array expression literal in this parser.
+## 3. Literals
 
-## 3.1 Integer literals
-
-Accepted integer spellings include decimal, hexadecimal, and binary forms:
+### Integer literals
 
 ```mak
 0
-7
 42
-1_000
-0xff
-0XFF
-0b1010
-0B1010
-```
-
-### Decimal integers
-
-A decimal literal starts with a decimal digit. Underscores are consumed within the decimal integer digit run and are ignored when accumulating the integer value:
-
-```mak
-1_000
-12__34
-7_
-```
-
-The latter spellings are accepted by the current scanning loop, even though repeated or trailing separators are poor style. Prefer one underscore between digit groups, such as `1_000_000`.
-
-### Hexadecimal integers
-
-A leading `0x` or `0X` selects hexadecimal. The scanner consumes any run of hexadecimal digits following the prefix:
-
-```mak
-0x0
+1_000_000
 0x2a
-0XDEAD
-```
-
-**Caveat:** the current scanner does not require at least one hexadecimal digit after the prefix. A bare `0x` is converted to integer zero by the implementation, with the prefix consumed as part of the token. Treat this as an implementation quirk, not a spelling to use in real code.
-
-### Binary integers
-
-A leading `0b` or `0B` selects binary:
-
-```mak
-0b0
-0b1
+0X2A
 0b101010
+0B101010
 ```
 
-**Caveat:** as with hexadecimal, the current scanner does not require any binary digit after the prefix. It also stops consuming binary digits at the first character other than `0` or `1`; the remaining source is then tokenized separately. Avoid malformed prefixes such as `0b` and `0b2`.
+Decimal, hexadecimal (`0x`/`0X`), and binary (`0b`/`0B`) integers are lexed as unsigned 64-bit values. Decimal digits may contain underscores. Negative numbers use unary `-` applied to an integer expression; `-` is not part of the integer token.
 
-### Integer range and sign
-
-The literal token's value is represented as an unsigned 64-bit value (`u64`) in the AST. A leading minus sign is a separate unary expression, not part of the literal token:
+### Floating-point literals
 
 ```mak
--1
--(1 + 2)
-```
-
-The scanner uses wrapping accumulation for decimal digits and shift/OR accumulation for radix-prefixed values. Do not depend on out-of-range literals to report a neat overflow error. Use literals within the range your program and chosen target type are intended to support.
-
-There is no octal prefix rule in the supplied parser. A leading zero by itself does not select octal.
-
-## 3.2 Floating-point literals
-
-Examples of intended decimal floating-point forms:
-
-```mak
-0.5
+0.0
 3.14159
-10.0
 1e3
-1E3
-1e-3
+1E-3
 6.02e+23
 ```
 
-A decimal point belongs to a floating-point literal only when a decimal digit follows the point. An exponent marker `e` or `E` can also mark a number as floating-point.
+A decimal point is part of a float when at least one digit follows it. An exponent uses `e` or `E`, with an optional sign and digits. Floating literals are represented as `f64` values by the lexer.
 
-### Decimal point caveats
+### String literals
 
-```text
-1.25   floating-point literal
-1.     integer `1`, followed by dot `.`
-.5     dot `.`, followed by integer `5`
-```
-
-The last two forms do not mean `1.0` or `0.5` in the current grammar. Write `1.0` and `0.5`.
-
-### Exponent caveats
-
-The scanner accepts an exponent marker and an optional sign, but its scan loop does not require an exponent digit. If the captured text cannot be parsed as an `f64`, the supplied implementation substitutes `0.0` rather than reporting a lexical error. Therefore forms such as `1e`, `1e+`, or `1e-` must be considered malformed and must not be used, even though the current scanner may still produce a floating token for them.
-
-Underscores are handled inconsistently between integer and floating-point scanning: the integer portion's scan loop permits underscores, but floating-point conversion parses the original token text. Do not put underscores in floating-point literals; write `1000.25`, not `1_000.25`.
-
-No suffixes such as `f32`, `f64`, `u64`, or `i32` are part of numeric literal syntax.
-
-## 3.3 String literals
-
-Single-quoted and double-quoted string literals are accepted:
+Both quote styles are accepted:
 
 ```mak
-"hello"
-'hello'
-"a string with spaces"
-'embedded "double quotes" are fine'
-"embedded \'single quotes\' are fine"
+"double-quoted string"
+'single-quoted string'
+"line one\nline two"
+'it\'s escaped'
 ```
 
-The opening and closing quote must match. A single quote does **not** introduce a character literal; it introduces a string literal.
+Supported escapes:
 
-String contents are decoded into bytes. The supported escape spellings are:
-
-| Source escape | Decoded byte/value |
+| Escape | Meaning |
 |---|---|
-| `\n` | Newline |
-| `\t` | Horizontal tab |
-| `\r` | Carriage return |
+| `\n` | Newline byte |
+| `\t` | Tab byte |
+| `\r` | Carriage-return byte |
 | `\\` | Backslash |
 | `\"` | Double quote |
 | `\'` | Single quote |
-| `\0` | Zero byte |
-| `\xHH` | One byte from two hexadecimal digits `H` |
+| `\0` | NUL byte |
+| `\xHH` | Byte with two hexadecimal digits `HH` |
+| `\c` for another character `c` | The backslash is removed and `c` is emitted |
+
+Strings are stored as bytes. Newlines are allowed inside a quoted string if the closing quote is present. An unclosed string is a lexer error.
+
+## 4. Top-level declarations
+
+### `let` value declaration
+
+```ebnf
+let-declaration ::= "let" identifier { identifier } "=" expression ";"
+```
+
+```mak
+let answer = 42;
+let add x y = x + y;
+let twice = fn (x) -> x * 2;
+```
+
+`let name = expression;` declares a value. `let name p1 p2 = expression;` is shorthand for binding `name` to a function with parameters `p1` and `p2`. There is no top-level type-annotation form in the parser.
+
+### `type` declaration
+
+```ebnf
+type-declaration ::= "type" identifier { identifier } ";"
+                   | "type" identifier { identifier } "{" { constructor } "}" ";"
+constructor      ::= identifier { type } [ ";" ]
+```
+
+```mak
+type Empty;
+
+type Maybe a {
+    None;
+    Some a;
+};
+
+type Result a e {
+    Ok a;
+    Error e;
+};
+```
+
+The identifiers after the type name are type parameters. A constructor name is followed by zero or more field types. Constructor fields are written as types, separated by whitespace; a semicolon ends the constructor, and the final constructor may omit its semicolon before `}`. The semicolon after the closing `}` is required. `type Name;` declares a type without constructors.
+
+### `bring` declaration
+
+```ebnf
+bring-declaration ::= "bring" string-literal { string-literal } ";"
+```
+
+```mak
+bring "math.mak";
+bring "base.mak" "io.mak";
+```
+
+`bring` takes one or more quoted paths. There is no imported-name list or alias syntax in the declaration grammar.
+
+## 5. External declarations
+
+```ebnf
+external-declaration ::= "let" ("extern" | "external") identifier
+                         [ ":" type ] "=" [ "global" ] string-literal
+                         [ ":" foreign-type ] [ descriptor-block ] ";"
+
+descriptor-block ::= "{" { identifier "=" descriptor-value [ ";" ] } "}"
+```
 
 Examples:
 
 ```mak
-"first line\nsecond line"
-"column1\tcolumn2"
-"C:\\tools\\mak"
-"quote: \"hello\""
-"byte: \x41"
+let extern putchar : i32 -> i32 = "putchar" : (i32) -> i32;
+
+let extern puts : ptr -> i32 = "puts" : (ptr) -> i32 {
+    pure = false;
+    from = "stdio.h";
+    abi = "C";
+};
+
+let extern errno : i32 = global "errno" : i32;
 ```
 
-### Escape caveats
+Meaning of each part:
 
-- An unknown escape such as `\q` is decoded by dropping the backslash and retaining `q` in the current implementation. Do not assume unknown escapes are preserved verbatim or rejected.
-- `\xHH` is intended to contain exactly two hexadecimal digits. Malformed or incomplete hexadecimal escapes are not reliably diagnosed by the current decoder; avoid them.
-- There is no `\uXXXX` or `\UXXXXXXXX` Unicode escape syntax in the supplied decoder.
-- String data is byte-oriented. Unicode text can appear as UTF-8 source bytes, but the escape grammar does not add a Unicode-code-point escape mechanism.
-- The tokenizer scans until the matching quote and does not explicitly reject a line break inside the literal. Multiline string contents may therefore be accepted; ordinary style should use `\n` or deliberate multiline text consistently.
-- `\0` embeds a NUL byte. This may be significant when a string is passed to C APIs that treat strings as NUL-terminated; a byte string containing NUL is not equivalent to ordinary visible text for those APIs.
+- `let extern` / `let external`: declares a foreign symbol.
+- `name`: MAK-side name used by source expressions.
+- `: type`: optional MAK-side type. If omitted, its type defaults to `!` (bottom type) in the parsed declaration.
+- `= "symbol"`: quoted foreign symbol name.
+- `global`: marks the symbol as a global rather than an ordinary callable symbol.
+- `: foreign-type`: optional C-facing type. If omitted, the foreign type defaults to `void`.
+- `pure = true` or `pure = false`: records the purity flag; only the identifier spelling `true` sets it to true.
+- `from = "..."`: source/library descriptor string.
+- `abi = "..."`: ABI descriptor string.
+- Other descriptor keys are parsed with an expression as their value and have no special meaning in the parser.
 
-The decoder is used for expression strings, patterns, and `bring` paths. External symbol names and the `from`/`abi` descriptor strings are extracted differently in the supplied parser: escaped text in those positions should not be assumed to decode the same way as an ordinary expression string. Prefer plain symbol names and unescaped header/ABI strings.
+Descriptor entries may end with semicolons; the final entry does not need one. The descriptor block and the external declaration must be closed/terminated.
 
-## 3.4 Boolean-like values
+### Foreign types
 
-`true` and `false` are not lexical Boolean literals in the supplied parser. They are identifiers. A program may define values with these names, but their status as Boolean values depends on the surrounding program and backend behavior.
-
-For a simple integer truth convention, a program might use `1` and `0`, but this is a programming convention rather than a built-in Boolean-literal syntax.
-
-## 3.5 Missing literal forms
-
-The supplied parser does not provide source syntax for:
-
-- Character literals distinct from strings.
-- `null` or `nil` literals.
-- Tuple values such as `(a, b)`.
-- Non-empty array values such as `[1, 2, 3]`.
-- Record/object literals.
-- Numeric type suffixes.
-- Interpolated strings.
-- Raw string delimiters.
-
-An isolated `[]` is a special exception described in §7.6: it is accepted as a placeholder expression producing integer zero, not as a usable array value.
-
----
-
-# 4. Type syntax
-
-Types occur in external declarations and constructor field declarations. The AST defines primitive, named, applied, array, tuple, function, and bottom-type forms.
-
-## 4.1 Primitive types
-
-The primitive spellings explicitly recognized by the type parser are:
-
-```text
-u8   u16   u32   u64
-i8   i16   i32   i64
-f32  f64
-()
-!
+```ebnf
+foreign-type ::= foreign-atom { "*" }
+               | "(" [ foreign-type { "," foreign-type } [ "," ] ] ")" "->" foreign-type
+               | "(" foreign-type { "," foreign-type } "," "..." ")" "->" foreign-type
+foreign-atom ::= "i8" | "i16" | "i32" | "i64"
+               | "u8" | "u16" | "u32" | "u64"
+               | "f32" | "f64" | "ptr" | "void" | identifier
 ```
 
-`()` is the unit type when it appears in type position. `!` is the bottom/never-returning type in type position.
+```mak
+let extern read_byte : i32 -> i32 = "read_byte" : (i32) -> i32;
+let extern variadic : i32 = "variadic" : (i32, ...) -> i32;
+let extern bytes : [u8] = global "bytes" : u8*;
+let extern matrix : [u8] = global "matrix" : u8**;
+```
 
-### Important naming exception
+Foreign function arguments are comma-separated. `...` marks variadic arguments. A trailing comma in a foreign argument list is accepted. Repeated pointer stars are accepted: `u8*`, `u8**`, `u8***`.
 
-The parser recognizes `u8` through `u64`, `i8` through `i64`, `f32`, and `f64` specially. It does **not** map the identifier `unit` to the unit primitive; `unit` parses as a named type. Write `()` for unit in a type declaration.
+## 6. Expressions
 
-`ptr` is not one of the ordinary primitive `Ty::Prim` spellings. It is recognized as a foreign type atom in a C external signature. Do not assume `ptr` has the same status in all type contexts.
+```ebnf
+expression ::= prefix-expression { postfix-or-infix-part }
+```
 
-## 4.2 Named types
+### Atomic expressions
 
-An identifier that is not one of the recognized primitive spellings becomes a named type:
+```ebnf
+atom ::= integer-literal
+       | float-literal
+       | string-literal
+       | identifier
+       | "(" expression ")"
+       | block
+       | function-expression
+       | let-expression
+       | case-expression
+```
+
+```mak
+123
+3.5
+"hello"
+value
+(value + 1)
+{ 1 + 2 }
+```
+
+Parentheses group one expression. Parentheses do not create tuple expressions. Empty expression parentheses `()` are not accepted as an expression literal.
+
+### Function application
+
+```ebnf
+application ::= expression atom
+```
+
+```mak
+f x
+add 2 3
+f (x + 1)
+f xs[i]
+```
+
+Application is written by placing an argument atom after the function. Whitespace is conventional, not the operator: `f x` and `f(x)` both apply `f` to the single expression `x`. Immediate lambda invocation is also juxtaposition: `(\x -> x*x) 2` and `(\x -> x*x)2` both apply the anonymous square function to `2`. The space is recommended for readability.
+
+Application chains associate syntactically to the left: `f x y` is grouped as `(f x) y`. The compiler also flattens a contiguous application chain when resolving calls, so a definition with two parameters, `let f x y = ...;`, is ordinarily called as `f x y` with two arguments. Do not infer from the left-associated parse shape alone that every two-step call is a curried unary call.
+
+Parentheses around one argument are grouping, not a special call syntax. A comma-separated nonempty argument list such as `f(x, y)` is not supported. The parser has a special zero-argument spelling `f()`. The expression `f ()` is different: `()` is not an ordinary unit-value expression atom.
+
+### Indexing
+
+```ebnf
+indexed-expression ::= atom { "[" expression "]" }
+```
+
+```mak
+items[i]
+items[i][j]
+(f x)[index]
+f items[i]
+```
+
+Indexing is postfix, binds tightly, and may be chained. `value[index]` is parsed into an application of the reserved intrinsic `$mak.index` to the value and index. The index is an expression. Empty brackets `value[]` and standalone array literals `[]` are not accepted.
+
+### Unary expressions
+
+```ebnf
+unary-expression ::= "-" expression
+                   | "!" expression
+                   | "~" expression
+```
+
+```mak
+-x
+!condition
+~bits
+-f x
+```
+
+| Form | Operation |
+|---|---|
+| `-x` | Numeric negation |
+| `!x` | Logical/boolean-style negation operator |
+| `~x` | Bitwise complement |
+
+Unary operands include following application and indexing, but stop before infix operators. For example, `-f x` parses as `-(f x)`.
+
+### Anonymous functions
+
+```ebnf
+function-expression ::= ("fn" | "\\") parameter-list ("->" | "=>") expression
+                      | ("fn" | "\\") parameter-list block
+parameter-list     ::= identifier { identifier }
+                      | "(" [ identifier { [ "," ] identifier } ] ")"
+```
+
+```mak
+fn x -> x + 1
+fn (x) => x + 1
+fn (x, y) { x + y }
+fn x y { x * y }
+\x -> x * 2
+\(x, y) => x + y
+fn () -> 42
+
+// Invoke a one-argument lambda immediately:
+(\x -> x * x) 9
+(\x -> x * x)9
+
+// Two named parameters:
+(\x y -> x + y) 20 22
+(\(x, y) -> x + y) 20 22
+```
+
+`fn` and `\` both introduce anonymous functions. Parameters are identifiers; parenthesized parameters may be separated by commas, and the parser also accepts adjacent identifiers inside parentheses. Without parentheses, the parser consumes consecutive identifiers as parameters until it reaches `->`, `=>`, or `{`. A body is either an expression introduced by `->` or `=>`, or a braced block. Empty parameter lists are accepted as `fn () ...` / `\ () ...`.
+
+A lambda is an expression value. It can be bound to a name, passed as an argument, composed with another function, or immediately invoked. To immediately invoke it, parenthesize the lambda so that the closing parenthesis marks the end of the function expression: `(\x -> x * x) 9`.
+
+### Local `let` expression
+
+```ebnf
+let-expression ::= "let" identifier { identifier } "=" expression ";" expression
+```
+
+```mak
+let answer = 42; answer + 1
+let add x y = x + y; add 10 20
+let square = fn x -> x * x; square 9
+```
+
+A local binding introduces a name for the expression after the semicolon. Parameters after the binding name make the value a function. The `;` after the value is required; the expression after it is the body of the binding.
+
+### Blocks and sequencing
+
+```ebnf
+block ::= "{" { expression ";" } [ expression ] "}"
+```
+
+```mak
+{
+    first_action;
+    second_action;
+    final_value
+}
+
+{
+    let x = 10;
+    let y = 20;
+    x + y
+}
+```
+
+A block uses `{` and `}`. Semicolons separate completed expressions. The final expression is the block result and normally has no semicolon. Local `let` declarations inside a block require their own terminating semicolon. An empty block parses to integer `0`.
+
+### Pattern matching with `case`
+
+```ebnf
+case-expression ::= "case" expression "of" "{" { case-arm } "}"
+case-arm        ::= pattern ("->" | "=>") expression [ ";" ]
+pattern         ::= "_"
+                  | identifier
+                  | integer-literal
+                  | string-literal
+                  | constructor-pattern
+                  | "(" ")"
+                  | "(" pattern { "," pattern } ")"
+constructor-pattern ::= uppercase-identifier { pattern-atom }
+```
+
+```mak
+case value of {
+    0 -> "zero";
+    1 => "one";
+    _ -> "other"
+}
+
+case option of {
+    None -> 0;
+    Some x -> x;
+}
+
+case pair of {
+    (x, y) -> x + y
+}
+```
+
+`case` evaluates a scrutinee expression, then matches arms in source order as handled by the compiler. An arm uses `->` or `=>`; its semicolon is optional. Pattern forms:
+
+- `_`: wildcard; matches without introducing a name.
+- `name`: lowercase-leading identifier; binds the matched value.
+- `INTEGER`: integer literal pattern.
+- `STRING`: string literal pattern.
+- `Ctor p1 p2`: uppercase-leading constructor name with zero or more subpatterns.
+- `(p1, p2, ...)`: tuple pattern.
+- `()`: empty tuple pattern.
+- `(p)`: parenthesized single pattern, equivalent to `p`.
+
+The parser classifies a pattern identifier by its first ASCII character: uppercase means constructor pattern; otherwise it is a binding, except `_` which is wildcard. Floating-point literal patterns are not accepted.
+
+## 7. Operators
+
+Indexing and application bind most tightly. Application is included inside a unary operand (`-f x` parses as `-(f x)`). Unary operators bind more tightly than infix operators. All listed binary operators except composition `.` associate left-to-right; `.` associates right-to-left. Operator meaning at runtime depends on operand representations and compiler lowering.
+
+| Binding | Operators | Meaning |
+|---|---|---|
+| Postfix, tightest | `x[i]` | Indexing |
+| Application | `f x` | Function application |
+| Prefix | `-x` `!x` `~x` | Negation, logical not, bitwise not |
+| 9 | `.` | Function composition |
+| 7 | `*` `/` `%` | Multiply, divide, remainder |
+| 6 | `+` `-` | Add, subtract |
+| 5 | `<<` `>>` | Left shift, right shift |
+| 4 | `&` `^` `\|` | Bitwise AND, XOR, OR |
+| 3 | `==` `/=` `<` `>` `<=` `>=` | Equal, not equal, less/greater comparisons |
+| 2 | `&&` | Logical AND |
+| 1, loosest | `\|\|` | Logical OR |
+
+### Arithmetic
+
+```mak
+a + b
+a - b
+a * b
+a / b
+a % b
+```
+
+### Shifts and bitwise operators
+
+```mak
+bits << count
+bits >> count
+a & b
+a ^ b
+a | b
+```
+
+### Comparisons
+
+```mak
+a == b
+a /= b
+a < b
+a > b
+a <= b
+a >= b
+```
+
+`/=` is not-equal. `!=` is not recognized as an operator.
+
+### Logical operators
+
+```mak
+a && b
+a || b
+```
+
+### Function composition
+
+```mak
+f . g
+f . g . h
+```
+
+`f . g` builds a function equivalent to `fn x -> f (g x)`. Composition binds less tightly than application and is right-associative. The dot is not field/member access.
+
+### Operator spellings not available
+
+There is no parser production for assignment operators such as `+=`, a ternary `?:` expression, `!=`, `::`, `=>` as an infix operator, or a field/member-access operator. `=` is used in declarations and bindings. `=>` is accepted only where the parser accepts an expression arrow, such as a function body or case arm.
+
+## 8. MAK types
+
+Type expressions are used in user-defined constructor fields and external declarations.
+
+```ebnf
+type ::= type-atom [ "->" type ]
+type-atom ::= primitive-type
+            | identifier
+            | "[" type "]"
+            | "(" ")"
+            | "(" type ")"
+            | "(" type "," type { "," type } ")"
+            | "(" identifier type-atom { type-atom } ")"
+            | "!"
+```
+
+### Primitive type spellings
+
+| Syntax | Type form |
+|---|---|
+| `u8` `u16` `u32` `u64` | Unsigned integer type names |
+| `i8` `i16` `i32` `i64` | Signed integer type names |
+| `f32` `f64` | Floating-point type names |
+| `()` | Unit type |
+| `!` | Bottom / non-returning type form |
+
+The parser also accepts any other identifier as a named type. In particular, there is no dedicated `bool` type token or boolean literal syntax.
+
+### Named and parameterized types
 
 ```mak
 MyType
-List
-Result
-T
+(List a)
+(Result value error)
+(Ptr [u8])
 ```
 
-A bare name is a named type. The parser does not prove that the name is declared or that the type is usable in a particular context; such questions belong to later processing.
+A bare identifier is a named type. Type application uses parentheses with the type constructor name first, for example `(List a)`. Its head must be a named type. A type application is not written as a bare `List a` outside that parenthesized form.
 
-## 4.3 Array types
-
-An array type wraps one type in square brackets:
+### Array type
 
 ```mak
 [u8]
-[i32]
-[[u8]]
-[(i32, i32)]
+[MyType]
+[[i32]]
 ```
 
-The grammar is type-level only. It does not imply that square-bracket array values can be constructed with a literal expression.
+`[T]` is the array type form. It does not create an array value literal.
 
-## 4.4 Tuple types
-
-Tuple types use parentheses and commas:
+### Tuple types
 
 ```mak
+()
 (i32, i32)
 (i32, f64, [u8])
-()
 ```
 
-The comma is what distinguishes a tuple type from a parenthesized single type. `()` is specifically unit. A one-item form such as `(i32)` is just the parenthesized type `i32`, not a one-element tuple.
+`()` is unit. `(T)` groups a type. `(T, U, ...)` is a tuple type and requires at least two elements; `(T,)` is not accepted as a one-element tuple type.
 
-A trailing comma is not a general one-tuple feature. The parser requires another type after each comma in a tuple type, so `(i32,)` is invalid. Prefer tuples with at least two entries.
-
-## 4.5 Function types
-
-The arrow `->` builds a function type:
+### Function types
 
 ```mak
- i32 -> i32
- (i32, i32) -> i32
- i32 -> i32 -> i32
+i32 -> i32
+(i32, i32) -> i32
+u8 -> u64 -> f64
+(i32 -> i32) -> i32
 ```
 
-Function arrows associate to the right. Thus:
+`A -> B` is a function type. The arrow associates right-to-left: `A -> B -> C` means `A -> (B -> C)`. Parentheses group the left side when it is itself a function type.
+
+### Bottom type
 
 ```mak
-i32 -> i32 -> i32
+!
 ```
 
-is read as:
+`!` is parsed as the bottom type and is used as the default MAK-side type for an external declaration when `: type` is omitted.
 
-```text
-i32 -> (i32 -> i32)
-```
+## 9. Pattern syntax quick reference
 
-For a multi-argument function signature, the tuple form on the left explicitly groups the arguments, as in `(i32, i32) -> i32`. The source type representation may be more general than every C ABI or backend path can support; use the foreign type on an external declaration to describe the linked C calling shape.
+| Pattern | Meaning |
+|---|---|
+| `_` | Ignore the matched value |
+| `x` | Bind the value to `x` |
+| `0` | Match integer zero |
+| `"text"` | Match a string value |
+| `Some x` | Match constructor `Some` and bind its first payload as `x` |
+| `Node left right` | Match constructor with two payload patterns |
+| `(x, y)` | Match a tuple with two elements |
+| `()` | Empty tuple pattern |
+| `(x)` | Same as pattern `x` |
 
-## 4.6 Type application
+A constructor pattern is recognized from an identifier whose first character is uppercase. Its subpatterns are read as following pattern atoms. Patterns do not accept float literals, arithmetic expressions, type annotations, or `name @ pattern` syntax.
 
-The parser's explicit type-application form is parenthesized:
+## 10. Punctuation reference
 
-```mak
-(List a)
-(Result e value)
-(Map key value)
-(List [u8])
-```
+| Token | Syntax role |
+|---|---|
+| `(` `)` | Group expressions; parameter lists; tuple types/patterns; foreign function types |
+| `{` `}` | Blocks, type bodies, case arms, external descriptor blocks |
+| `[` `]` | Array type brackets; postfix indexing |
+| `;` | Terminates top-level declarations; separates block expressions and local bindings; optionally terminates case arms and constructor entries |
+| `,` | Separates tuple types/patterns, parenthesized function parameters, and foreign function arguments |
+| `:` | Introduces a MAK type or foreign type in an external declaration |
+| `.` | Function composition |
+| `\` | Anonymous-function introducer |
+| `->` | Function body arrow, case-arm arrow, function-type arrow |
+| `=>` | Alternate function body arrow and case-arm arrow |
+| `=` | Binds a `let` value or external symbol; separates descriptor keys from values |
 
-Inside the parentheses, the head must be a named type. The argument types are parsed as type atoms rather than arbitrary unparenthesized function types.
-
-Caveats:
-
-- `List a` written without the type-application parentheses is not one `Ty::App` node in this grammar. In contexts that parse multiple constructor field types, it may instead be read as separate type tokens/fields.
-- The parser's ability to create a `Ty::App` node does not prove that all generic types are fully supported by representation inference and C layout.
-- Use nested parentheses to make complex type applications unambiguous.
-
-## 4.7 Type grammar summary
+## 11. Grammar summary
 
 ```ebnf
-type             = type_atom, [ "->", type ] ;
-type_atom        = primitive_or_name
-                 | "[", type, "]"
-                 | "(", ")"
-                 | "(", type, ")"
-                 | "(", type, ",", type, { ",", type }, ")"
-                 | "(", named_type, type_atom, { type_atom }, ")"
-                 | "!" ;
+program               ::= { declaration } [ expression ] EOF
+declaration           ::= let-declaration | type-declaration | bring-declaration
+let-declaration       ::= "let" identifier { identifier } "=" expression ";"
+                        | "let" ("extern" | "external") identifier [ ":" type ] "=" [ "global" ] string-literal [ ":" foreign-type ] [ descriptor-block ] ";"
+type-declaration      ::= "type" identifier { identifier } ";"
+                        | "type" identifier { identifier } "{" { constructor } "}" ";"
+constructor           ::= identifier { type } [ ";" ]
+bring-declaration     ::= "bring" string-literal { string-literal } ";"
+descriptor-block      ::= "{" { identifier "=" descriptor-value [ ";" ] } "}"
+expression            ::= prefix-expression { postfix-index | application-argument | binary-tail }
+prefix-expression     ::= [ "-" | "!" | "~" ] atom
+atom                  ::= integer | float | string | identifier | "(" expression ")" | block | function-expression | let-expression | case-expression
+application-argument ::= atom
+postfix-index         ::= "[" expression "]"
+binary-tail           ::= infix-operator expression
+function-expression   ::= ("fn" | "\\") parameters (("->" | "=>") expression | block)
+parameters            ::= { identifier } | "(" [ identifier { [ "," ] identifier } ] ")"
+let-expression        ::= "let" identifier { identifier } "=" expression ";" expression
+block                 ::= "{" { expression ";" } [ expression ] "}"
+case-expression       ::= "case" expression "of" "{" { pattern ("->" | "=>") expression [ ";" ] } "}"
+pattern               ::= "_" | identifier | integer | string | constructor-pattern | "()" | "(" pattern { "," pattern } ")"
+type                  ::= type-atom [ "->" type ]
+type-atom             ::= identifier | "[" type "]" | "(" ")" | "(" type ")" | "(" type "," type { "," type } ")" | "(" identifier type-atom { type-atom } ")" | "!"
+foreign-type          ::= foreign-atom { "*" } | "(" foreign-arguments ")" "->" foreign-type
+foreign-arguments     ::= [ foreign-argument { "," foreign-argument } [ "," ] ]
+foreign-argument      ::= foreign-type | "..."
+descriptor-value      ::= expression
 ```
 
-This compact grammar is explanatory rather than a replacement for the detailed rules above. The applied-type form is a special parenthesized shape, and function types are right-associative.
+## 12. Unsupported expression forms
 
----
+The parser does not provide syntax for:
 
-# 5. Top-level declarations
+- Array literals such as `[1, 2, 3]`.
+- Tuple expressions such as `(a, b)`.
+- Empty expression/unit literal `()`.
+- Member or field access such as `value.field` (`.` means composition).
+- Not-equal written as `!=` (use `/=`).
+- `if` / `else`, loops, `while`, `for`, `switch`, or ternary expressions.
+- Lambda parameter type annotations, general expression type annotations, or top-level function signatures.
+- Named arguments, keyword arguments, or calls with comma-separated argument lists such as `f(a, b)`.
+- Float patterns in `case` arms.
+- A trailing semicolon after the final top-level expression.
 
-## 5.1 Value declarations
+## 26. Function application and function composition — exact semantics
 
-The basic declaration is:
+### 26.1 The two forms are different operations
 
 ```mak
-let name = expression;
+f g
+f . g
 ```
 
-Example:
+`f g` is **function application**. It means “call/apply `f` to the value `g`.” In the parser, juxtaposing an expression with the next atom constructs an application node. Conceptually:
 
 ```mak
-let answer = 42;
-let greeting = "hello";
-
-answer
+f g
 ```
 
-The semicolon is required after a top-level binding.
+means:
 
-Top-level bindings can also use parameter sugar:
+```mak
+f(g)
+```
+
+where the parentheses are explanatory notation, not required MAK syntax. `g` is evaluated/used as the argument value; MAK does not automatically call `g` just because it appears after `f`.
+
+`f . g` is **function composition**. It does not mean “call `f` with `g` as an argument.” The parser lowers the dot expression to a one-argument function equivalent to:
+
+```mak
+fn x => f (g x)
+```
+
+The exact generated internal parameter name is an implementation detail. Semantically, the composed function accepts an input `x`, applies `g` to `x`, and then applies `f` to the result. The dot operator therefore constructs a function; it does not, by itself, run the composed function on an input.
+
+### 26.2 A concrete numeric example
+
+```mak
+let double x = x * 2;
+let increment x = x + 1;
+let a = double increment;
+let b = double . increment;
+```
+
+These two right-hand sides are not interchangeable.
+
+- `double increment` passes the function value `increment` as the argument to `double`. The expression is an ordinary application. Whether it is type-correct depends on whether `double` accepts a function value; this `double` expects a numeric value, so this is not a valid way to mean “double the result of increment.”
+- `double . increment` constructs a new function. When that function is later given `n`, it computes `double (increment n)`, i.e. `2 * (n + 1)`.
+
+To apply the composed function, provide its input:
+
+```mak
+(double . increment) 10
+```
+
+The parentheses make the intended grouping explicit: first form the composition, then apply the resulting function to `10`. The intended result is `22`.
+
+### 26.3 Application does not implicitly invoke function-valued arguments
+
+Suppose:
+
+```mak
+let f x = x + 10;
+let g x = x * 3;
+```
+
+Then:
+
+```mak
+f 4
+```
+
+applies `f` to the integer `4` and yields `14`.
+
+```mak
+g 4
+```
+
+applies `g` to `4` and yields `12`.
+
+```mak
+f g
+```
+
+passes the function `g` itself to `f`. It does **not** mean `f (g x)` because no `x` is supplied and there is no composition operator. Since `f` uses its parameter as an integer, this example is incompatible with the intended numeric operation.
+
+```mak
+f (g 4)
+```
+
+first computes `g 4` and then passes that result to `f`: `g 4` is `12`, so the result is `22`.
+
+```mak
+(f . g) 4
+```
+
+constructs the composition `fn x => f (g x)` and applies it to `4`, also yielding `22`. For this particular pure example, `f (g 4)` and `(f . g) 4` have the same numerical result, but they are different expression structures: the former directly applies `f` to an already-written expression; the latter creates a reusable function and then applies it.
+
+### 26.4 Application grouping: `f x y` versus `f (x y)`
+
+The parser groups a chain of juxtaposed applications syntactically to the left:
+
+```mak
+f x y
+```
+
+has this grouping:
+
+```mak
+(f x) y
+```
+
+It does **not** have this grouping:
+
+```mak
+f (x y)
+```
+
+The explicitly grouped form `f (x y)` treats `x y` as one argument expression to `f`; `f x y` is a chain whose source-level grouping is left-associated. Parentheses matter because `x y` is then parsed as a separate inner application.
+
+There is an important implementation distinction: call resolution flattens a contiguous application chain and checks its overall arity. For example:
 
 ```mak
 let add x y = x + y;
-let square x = x * x;
+add 3 4
 ```
 
-The parameterized form is represented as a function value. Its shape corresponds to:
+is the normal form for calling this two-parameter definition with two arguments. Do not explain this by saying `add 3` necessarily returns a one-parameter function and then `4` invokes that result. The syntax tree's left grouping and the compiler's multi-parameter call resolution are different layers. Likewise, do not assume that a nested unary-function value and a single two-parameter function have interchangeable call behavior.
+
+### 26.5 `f . g x` is not the same as `(f . g) x`
+
+Because application binds more tightly than dot composition, the source:
 
 ```mak
-let add = fn x y -> x + y;
-let square = fn x -> x * x;
+f . g x
 ```
 
-The parameter list in a top-level `let` declaration is an unparenthesized sequence of identifiers between the declared name and `=`. Unlike the `fn` parameter form, commas and parentheses are not accepted there:
+parses the right side of the dot as `g x`. Its effective grouping is:
 
 ```mak
-let add x y = x + y;       // accepted shape
-let add (x, y) = x + y;    // not this declaration grammar
+f . (g x)
 ```
 
-### Binding boundaries
+Composition then attempts to use `f` and the expression `g x` as the two sides of composition. Since the right side is an application result rather than necessarily a function, this commonly does not express the intended operation.
 
-- The parser reads the declaration name first.
-- Every consecutive identifier before `=` is treated as a parameter.
-- A non-identifier before `=` (other than `=` itself) causes an error.
-- The entire right-hand expression is parsed up to the declaration's required semicolon.
-- There is no type-annotation syntax on an ordinary `let` binding in this grammar.
-
-For a local binding with a body, see §6.3. The final semicolon in `let name = value; body` separates the bound value from the expression that can use it; it does not terminate the whole program.
-
-## 5.2 Type declarations
-
-A type declaration has one of two forms.
-
-### Declaration without a constructor body
+If the intention is “compose `f` with `g`, then apply the composed function to `x`,” write:
 
 ```mak
-type Name;
-type Name parameter;
-type Name parameter1 parameter2;
+(f . g) x
 ```
 
-This records the type name and its parameter names with an empty constructor list in the AST. The parser accepts the form, but an empty type is not the same as a type with a conventional default value.
+If the intention is “apply `g` to `x`, then pass that result to `f`,” write:
 
-### Declaration with constructors
+```mak
+f (g x)
+```
+
+These last two forms describe the same mathematical result when the functions and values have compatible types and the language's evaluation effects do not make the difference observable. The parentheses in `(f . g) x` are crucial because they close the composition before the argument `x` is applied.
+
+### 26.6 Dot composition is not member access
+
+The dot token is not parsed as a field selector, namespace separator, or method-call marker. For example, `value.field` is not a record-field lookup in this grammar. It is parsed using the composition operator's rules, which means it will only make sense if both sides are expressions with compatible function meanings.
+
+Do not read:
+
+```mak
+object.method
+```
+
+as “the `method` member of `object`.” MAK's parser does not implement that interpretation for `.`.
+
+### 26.7 Composition is right-associative in the parser
+
+Dot has equal left and right binding powers in the Pratt parser. The right-hand expression is parsed with a binding power that allows another dot to be consumed into that right-hand side. Therefore:
+
+```mak
+f . g . h
+```
+
+groups as:
+
+```mak
+f . (g . h)
+```
+
+Its usual mathematical behavior for compatible unary functions is `f (g (h x))` on input `x`: apply `h` first, then `g`, then `f`. This is the parser's right-associated grouping, not left-associated `(f . g) . h` syntax. Parentheses can always document the intended grouping explicitly.
+
+### 26.8 Parentheses change the role of an expression
+
+```mak
+f g
+f (g x)
+(f . g) x
+f . g
+```
+
+Read these as four different structures:
+
+1. `f g`: apply `f` to the value represented by `g`.
+2. `f (g x)`: apply `g` to `x`, then pass the result to `f`.
+3. `(f . g) x`: construct a composition and apply it to `x`.
+4. `f . g`: construct a composed function; no final input is supplied here.
+
+Parentheses around a normal expression do not create a tuple by themselves. `(x)` is the grouped expression `x`; tuple-pattern syntax is a separate matter, and general tuple *expression* literals are not supported by this parser.
+
+### 26.9 Application is whitespace-based, but not arbitrary token concatenation
+
+The parser recognizes application when an expression is followed by a token that can start an atom: an identifier, integer, float, string, parenthesized expression, block, backslash function, `fn`, `let`, or `case`. This is a grammatical rule, not a rule that every adjacent token is an argument.
+
+Examples:
+
+```mak
+f x
+f 10
+f "text"
+f (x + 1)
+f { x + 1 }
+f (fn x => x + 1)
+```
+
+Each has one argument expression. A sequence such as `f x y` forms a chain of applications. A binary operator is not simply another application argument: `f x + y` is parsed according to the operator-precedence rules, not as a three-argument call.
+
+Empty-call syntax is a special case:
+
+```mak
+f()
+```
+
+The parser accepts this as an application of `f` with zero arguments. It does not imply that `f` is automatically called in every context, and it is not equivalent in syntax to `f ()` (where `()` is not an ordinary unit-value expression atom in the expression parser).
+
+### 26.10 Indexing has higher precedence than application
+
+Indexing is postfix and binds more tightly than implicit application. Therefore:
+
+```mak
+f xs[i]
+```
+
+means applying `f` to `xs[i]`, equivalent in grouping to:
+
+```mak
+f (xs[i])
+```
+
+The parser lowers indexing into a reserved intrinsic application, conceptually `$mak.index(xs, i)`. Chained indexing:
+
+```mak
+xs[i][j]
+```
+
+is applied sequentially: first index `xs` by `i`, then index the result by `j`.
+
+An opening `[` cannot begin a standalone expression. Thus `[]` and `[1, 2]` are not array literals in the current expression grammar; brackets are for indexing an existing expression.
+
+### 26.11 Unary operators include application in their operand
+
+The prefix parser parses the unary operand at a binding power that still permits application but stops before dot composition and ordinary infix operators. This means a unary operator can cover an application chain before the parser returns to the composition/binary layer. Use parentheses when the intended operand boundary could be ambiguous.
+
+The supported prefix operators are `-`, `!`, and `~`. They mean numeric negation, logical not, and bitwise not respectively at the syntax/AST level; type and backend validity depend on the operand and later compiler stages.
+
+### 26.12 Precedence relevant to application and composition
+
+From tighter to looser, the parser handles the important layers in this order:
+
+1. Postfix indexing, such as `xs[i]`.
+2. Implicit application, such as `f x` and `f x y`.
+3. Dot composition, such as `f . g`.
+4. Multiplication, division, and remainder: `*`, `/`, `%`.
+5. Addition and subtraction: `+`, `-`.
+6. Shifts: `<<`, `>>`.
+7. Bitwise operators: `&`, `^`, `|` (these share the same binding-power tier in the parser).
+8. Comparisons: `==`, `/=`, `<`, `>`, `<=`, `>=`.
+9. Logical AND: `&&`.
+10. Logical OR: `||`.
+
+The unary layer sits before application/infix parsing but deliberately allows application inside its operand. Parentheses override these defaults. For expressions whose meaning depends on the exact boundary between composition and application, prefer explicit grouping over relying on memory.
+
+### 26.13 Operator spellings that must not be confused
+
+`/=` is the not-equal comparison token. It is not an assignment operator. The slash used in `/=` should not be confused with `/`, which is division. Likewise `.` is composition, not member access. `=` introduces bindings/declarations, while `==` tests equality.
+
+### 26.14 Type compatibility is separate from parsing
+
+The parser can construct an application node without proving that its function operand is callable or that its argument has the correct type. Likewise, it can construct a composition node without proving that the two operands have compatible function types. A syntactically accepted expression can still fail semantic analysis, type-related checks, or code generation.
+
+For composition, the intended ordinary function-type relationship is:
+
+```text
+g : A -> B
+f : B -> C
+f . g : A -> C
+```
+
+This notation describes the mathematical contract of composition; it is not a claim that MAK requires or accepts this exact type-annotation syntax everywhere. The intermediate result of `g` must be acceptable as the argument to `f`.
+
+For application, the ordinary relationship is:
+
+```text
+f : A -> B
+x : A
+f x : B
+```
+
+A mathematical notation such as `f : A -> (B -> C)` describes a unary function whose result is another function. Do not assume that writing `f x y` automatically invokes that returned function as a second unary call: this implementation flattens contiguous application chains when resolving calls and checks their total arity against known function parameters. The source form `fn x y -> body` is a single function declared with two parameters; it is not the same function shape as `fn x -> fn y -> body`. The type equations here are explanatory notation, not standalone MAK declarations or a guarantee of support for every higher-order call shape.
+
+### 26.15 A compact comparison table
+
+| Source | Syntax operation | Resulting idea |
+|---|---|---|
+| `f x` | Application | Apply `f` to `x` |
+| `f x y` | Left-associated syntax, with contiguous chains flattened during call resolution | Often the call form for a two-parameter function; not proof of currying |
+| `f (g x)` | Nested application | Compute `g x`, then pass that value to `f` |
+| `f g` | Application | Pass the value/function `g` to `f`; does not invoke `g` automatically |
+| `f . g` | Composition | Build a function equivalent to `fn x => f (g x)` |
+| `(f . g) x` | Composition, then application | Apply the composed function to `x` |
+| `f . (g x)` | Composition with an application expression on the right | Usually not the intended composition of `f` and `g` |
+| `f . g x` | Application binds before dot | The right operand of dot is parsed as `g x` |
+| `object.field` | Dot operator | Not field/member access |
+| `xs[i]` | Indexing | Index `xs` with `i` |
+| `f xs[i]` | Index then application | Apply `f` to `xs[i]` |
+
+### 26.16 Minimal decision procedure for reading an expression
+
+When reading an unfamiliar expression, apply these checks in order:
+
+1. Find explicit parentheses and treat their contents as grouped expressions.
+2. Attach every postfix `[index]` to the expression immediately before it.
+3. Read juxtaposed atoms as application chains: `f x y` means `(f x) y`.
+4. Only after application grouping, interpret `.` as composition.
+5. Apply arithmetic, comparison, and logical precedence to the remaining operators.
+6. Check whether each application receives a value or a function, and whether each composition operand is intended to be a function.
+7. Check semantic/type validity separately from whether the parser can construct the syntax tree.
+
+This procedure prevents the most common misreadings: treating `f g` as composition, treating `f . g` as a call, treating dot as member access, or assuming `f . g x` means `(f . g) x`.
+
+## 27. Anonymous functions: practical use, exact boundaries, and common forms
+
+An anonymous function (often called a *lambda*) creates a function value without giving it a top-level name. The parser accepts either `fn` or a backslash (`\`) as the introducer. The arrow may be `->` or `=>`; both spellings have the same role here.
+
+### 27.1 Copyable patterns
+
+```mak
+// One parameter, expression body
+fn x -> x + 1
+\x -> x + 1
+
+// Equivalent parenthesized parameter spelling
+fn (x) -> x + 1
+\(x) => x + 1
+
+// Two parameters on one function
+fn x y -> x + y
+fn (x, y) -> x + y
+\(x y) -> x + y
+
+// No parameters
+fn () -> 42
+\() => 42
+
+// A block body; the final expression is the result
+fn x {
+    let doubled = x * 2;
+    doubled + 1
+}
+```
+
+The parameter list contains identifiers only. It does not allow parameter type annotations, defaults, destructuring patterns, or named-argument declarations. A parenthesized parameter list may use commas or simply place identifiers next to each other. The parser consumes commas when present, so both `fn (x, y) -> ...` and `fn (x y) -> ...` are accepted.
+
+### 27.2 Invoke a lambda immediately
+
+This is the compact inline pattern for creating a function and calling it right away:
+
+```mak
+(\x -> x * x) 2
+(\x -> x * x)2
+```
+
+Both forms mean: create the one-parameter function `\x -> x * x`, then apply it to `2`. The second form works because `)` and `2` remain separate tokens even with no intervening space. Prefer the first form in ordinary code: the space makes the function/argument boundary easier to see. Either expression is intended to compute `4`.
+
+A few more shapes:
+
+```mak
+(\n -> n + 1) 41
+(\n -> n * 10) 7
+(\x y -> x + y) 20 22
+(\(x, y) -> x * y) 6 7
+```
+
+The first two are one-parameter lambdas, each immediately called with one value. The latter two declare one function with two parameters and call it with two arguments. `\x y -> ...` is one function with two parameters; do not silently rewrite it as `\x -> (\y -> ...)` because those are different function structures.
+
+### 27.3 Parenthesize the lambda to mark where it ends
+
+```mak
+(\x -> x * x) 5
+(\x -> x + 10) (3 * 4)
+(\x -> x + 1) ((\y -> y * 2) 10)
+```
+
+The last example first evaluates the inner call to `20`, then calls the outer lambda with `20`, producing `21` when the relevant arithmetic operations are valid.
+
+Do not omit the parentheses around the function in an attempt to write an immediate call:
+
+```mak
+\x -> x * x 2
+```
+
+This parses as a lambda whose body is `x * (x 2)`: application is allowed inside the body, and the `2` attaches to `x`. It does **not** mean `(\x -> x * x) 2`. If the goal is immediate invocation, parenthesize the lambda expression.
+
+### 27.4 Give a lambda a name when you reuse it
+
+```mak
+let square = \x -> x * x;
+square 9
+```
+
+A top-level declaration ends with a semicolon, while the final program expression `square 9` does not. A local `let` expression uses a semicolon between its value and body:
+
+```mak
+let square = \x -> x * x; square 9
+```
+
+This local expression binds `square` and then evaluates the body `square 9`. It is not the same syntactic context as a top-level declaration followed by a separate final expression.
+
+### 27.5 Pass a lambda as a value
+
+```mak
+some_function (\x -> x + 1)
+```
+
+Syntactically, this applies `some_function` to a lambda value. Whether `some_function` accepts a function argument is a separate type/implementation question. Passing a function value does not, on its own, call that function; an actual application must supply an argument to invoke it.
+
+### 27.6 Expression body versus block body
+
+Expression-bodied lambdas use `->` or `=>`:
+
+```mak
+\x -> x + 1
+\x -> double x + 1
+\x -> (double x) + 1
+```
+
+A block-bodied lambda puts `{` after its parameter list and does not need an arrow:
+
+```mak
+\x {
+    let y = x * 2;
+    y + 1
+}
+```
+
+Inside a block, semicolons terminate preceding expressions and the last unterminated expression supplies the block's value. If the final expression has a semicolon, the parser treats it as a completed preceding expression instead of the usual tail-value form.
+
+### 27.7 Zero-parameter lambdas and empty calls
+
+```mak
+let forty_two = fn () -> 42;
+forty_two()
+```
+
+Empty parameter lists are accepted. Invocation uses the special empty-call spelling `forty_two()`. Do not assume `forty_two ()` is equivalent: `()` is not a normal expression value in the expression grammar. Empty tuple/unit forms occur in type and pattern syntax, but there is no standalone unit expression atom.
+
+## 28. Reading application chains without guessing
+
+Application is represented by juxtaposition rather than by a dedicated call token. These are the parser's practical rules:
+
+| Source | How to read it | Important boundary |
+|---|---|---|
+| `f x` | Apply `f` to `x` | One argument |
+| `f(x)` | Same grouping as `f x` | Parentheses group the single expression `x` |
+| `f (x + 1)` | Apply `f` to the whole sum | Parentheses keep the sum together |
+| `f x y` | Syntactic grouping `(f x) y`; contiguous application chains can be flattened during call resolution | A multi-parameter function is normally called this way |
+| `f (g x)` | Apply `f` to the result of `g x` | Inner call is the argument expression |
+| `(f x) y` | Parenthesize the first application, then apply the result to `y` | Compiler call resolution can flatten a contiguous chain |
+| `f xs[i]` | Apply `f` to `xs[i]` | Indexing binds tightly |
+| `f()` | Apply with zero arguments | Special empty-call syntax |
+| `f(x, y)` | Not a two-argument call form | Comma-separated call arguments are unsupported |
+
+For a named function with two parameters, write the arguments as a whitespace-separated chain:
+
+```mak
+let add x y = x + y;
+add 3 4
+```
+
+The definition has two parameter identifiers; `add 3 4` supplies two arguments. The parser builds the application syntax left-to-right, but compiler call resolution flattens a contiguous chain and checks total arity against the function's parameter count. Therefore, **the syntactic grouping alone does not prove that MAK is treating every chained application as runtime currying**.
+
+A single-parameter immediate lambda is much less ambiguous:
+
+```mak
+(\x -> x * x) 12
+```
+
+Do not casually transform `fn x y -> body` into the nested-returning-function expression `fn x -> fn y -> body`. They have different AST shapes, and a chain that resembles mathematical currying may be handled differently by the implementation. When exact behavior matters, use the parameter form declared for the function and do not assume returned/indirect function calls work merely because a corresponding expression can be parsed.
+
+## 29. Composition versus application: expanded examples
+
+Composition `.` creates a new unary function. Application supplies arguments to a function. These are different operations:
+
+```mak
+let double x = x * 2;
+let increment x = x + 1;
+
+double (increment 10)
+(double . increment) 10
+```
+
+Both displayed expressions intend to increment `10` and then double the result. The composition expression constructs a reusable function equivalent in meaning to `fn x -> double (increment x)`, then invokes it with `10`, producing `22` when the functions have the expected numeric behavior.
+
+```mak
+f g                  // apply f to the value g
+f . g                // build x -> f (g x)
+(f . g) x            // call the function made by composition
+f (g x)              // call g first; pass its result to f
+f . g . h            // right-associative: f . (g . h)
+```
+
+### 29.1 Dot is not a member selector
+
+`record.field` is not field/member lookup. The parser assigns `.` the meaning of function composition. No general member-access operator is provided by this grammar.
+
+### 29.2 The subtle case `f . g x`
+
+Application binds more tightly than dot, so:
+
+```mak
+f . g x
+```
+
+is parsed as:
+
+```mak
+f . (g x)
+```
+
+It is **not** parsed as:
+
+```mak
+(f . g) x
+```
+
+The first form attempts to compose `f` with the expression `g x`; that right-hand expression must itself be a function suitable for composition. If the intention is “compose `f` and `g`, then apply the composed function to `x`,” include the parentheses:
+
+```mak
+(f . g) x
+```
+
+### 29.3 Composition associativity
+
+Dot is right-associative:
+
+```mak
+f . g . h
+```
+
+means:
+
+```mak
+f . (g . h)
+```
+
+The resulting function applies `h` first, then `g`, then `f`, conceptually `fn x -> f (g (h x))`. This is the opposite of the syntactic grouping of an application chain such as `f x y`, which groups as `(f x) y`.
+
+### 29.4 Composition of lambdas, and then immediate invocation
+
+```mak
+(\x -> x * x) . (\x -> x + 1)
+((\x -> x * x) . (\x -> x + 1)) 4
+```
+
+The first expression constructs a function. The second constructs the composition and applies it to `4`: increment to `5`, then square to `25`, assuming the numeric operations are valid. The parentheses around the lambdas identify the operands; the outer parentheses make it clear that the composition itself is being invoked.
+
+## 30. Precedence and grouping: worked readings
+
+The complete operator ordering is in §7. These readings are useful when checking a complex line:
+
+| Source | Grouping / reading |
+|---|---|
+| `f x + y` | `(f x) + y` |
+| `f (x + y)` | Apply `f` to the whole sum `x + y` |
+| `f x * y` | `(f x) * y` |
+| `-f x` | `-(f x)`; application remains inside the unary operand |
+| `f xs[i]` | `f (xs[i])` |
+| `xs[i][j]` | Index the result of `xs[i]` by `j` |
+| `a - b - c` | `(a - b) - c` |
+| `a / b * c` | `(a / b) * c` |
+| `a && b || c` | `(a && b) || c` |
+| `f . g x` | `f . (g x)` |
+| `(f . g) x` | Apply the composed function to `x` |
+| `f . g . h` | `f . (g . h)` |
+
+A reliable reading method is to mark explicit parentheses first, then attach postfix indexes, then group juxtaposed application chains, then resolve composition and the remaining infix operators according to §7. Add parentheses whenever the intended grouping differs from the grammar's default.
+
+## 31. Top-level `let`, local `let`, and blocks are different contexts
+
+```mak
+// Top-level declaration, terminated by semicolon:
+let n = 10;
+n + 1
+```
+
+```mak
+// Local let-expression: value; then the expression that uses the binding:
+let n = 10; n + 1
+```
+
+```mak
+// Block with local bindings and a tail value:
+{
+    let width = 6;
+    let height = 7;
+    width * height
+}
+```
+
+At file level, the parser reads declarations while the next token starts `let`, `type`, or `bring`, then parses at most one final expression. A file containing only declarations is given a parser-supplied body `0`. The final top-level expression normally has no trailing semicolon.
+
+A local `let` has the shape `let name [parameters] = value; body`. Its semicolon separates the bound value from the body expression; both are required. A block, by contrast, contains zero or more semicolon-terminated expressions followed optionally by a final tail expression. The tail expression supplies the block result. An empty block parses as integer `0`.
+
+## 32. `case` patterns: constructor spelling and tuple patterns
+
+The general shape is:
+
+```mak
+case scrutinee of {
+    pattern -> expression;
+    other_pattern => expression
+}
+```
+
+Both `->` and `=>` are accepted between a pattern and its arm expression. Arm semicolons are optional, though consistent separators are easier to scan.
 
 ```mak
 type Maybe a {
     None;
     Some a;
 };
-```
 
-A more involved example:
-
-```mak
-type List a {
-    Nil;
-    Cons a (List a);
+let unwrap_or_zero option = case option of {
+    None -> 0;
+    Some value -> value
 };
 ```
 
-Rules:
-
-1. The declaration begins with `type`, followed by an identifier.
-2. Zero or more following identifiers are consumed as type parameters until the parser reaches a token that is not an identifier.
-3. A semicolon at that point completes an empty type declaration; otherwise `{` must open the constructor body.
-4. Each constructor begins with an identifier.
-5. Constructor field types follow the constructor name. Each field type is parsed in sequence until `;` or `}`.
-6. A constructor's semicolon is consumed if present; the parser also permits a constructor immediately followed by `}` without its own semicolon.
-7. The closing `}` of a non-empty-body-form declaration must be followed by a semicolon.
-
-The last semicolon is significant:
+Pattern names are classified by their first ASCII character: an uppercase-leading identifier is interpreted as a constructor pattern; a lowercase-leading identifier binds the matched value; `_` is a wildcard. Constructor subpatterns follow the constructor as adjacent pattern atoms.
 
 ```mak
-type Color {
-    Red;
-    Green;
-    Blue;
-};                       // declaration terminator required
-```
-
-### Constructor naming caveat
-
-The type-declaration parser accepts any identifier as a constructor name. It does not enforce initial uppercase. Pattern parsing, however, treats an identifier beginning with an uppercase ASCII letter as a constructor pattern and a lowercase identifier as a binding pattern.
-
-The parser also does not require constructor names to be globally unique across type declarations. Reusing one name for constructors of different types can make later resolution ambiguous or version-dependent. Prefer unique constructor names unless the compiler version documents and tests a reliable disambiguation rule.
-
-Therefore, use uppercase constructor names consistently:
-
-```mak
-type Option a {
-    None;
-    Some a;
-};
-```
-
-A lowercase constructor may parse in a declaration but will be ambiguous or unusable as the constructor pattern you intended.
-
-### Constructor-field syntax
-
-Constructor field types are written adjacent to the constructor name, without commas:
-
-```mak
-Pair i32 i32;
-Wrapped (List i32);
-Callback (i32 -> i32);
-```
-
-Use type parentheses where necessary to keep a complex field type together. Do not use commas as constructor field separators; commas have roles in tuple types and parameter/pattern lists, not here.
-
-The parser records constructor type names and field-type syntax. That alone does not guarantee that polymorphic recursion, generic layouts, or every nested representation is supported correctly at runtime.
-
-## 5.3 External declarations: calling C or another foreign symbol
-
-External declarations declare a MAK-visible name and the external symbol/type information used by the backend.
-
-General shape:
-
-```mak
-let external name : MAK_TYPE = "foreign_symbol" : FOREIGN_TYPE {
-    pure = false;
-    from = "<header.h>";
-    abi = "C";
-};
-```
-
-The keyword spelling `extern` is also accepted after `let`:
-
-```mak
-let extern name : MAK_TYPE = "foreign_symbol" : FOREIGN_TYPE;
-```
-
-The shorter required skeleton is:
-
-```mak
-let external name = "foreign_symbol";
-```
-
-In this shorter form, the parser defaults the MAK-side type to bottom (`!`) and the foreign type to `void`. Those defaults may not describe the actual function you are linking; give explicit types for real interop.
-
-### External declaration fields
-
-| Piece | Required? | Meaning in the syntax |
-|---|---:|---|
-| `let` | Yes | Introduces the top-level declaration |
-| `external` or `extern` | Yes | Marks it as an external declaration |
-| `name` | Yes | MAK-visible identifier |
-| `: MAK_TYPE` | No | MAK-side type; defaults to `!` if absent |
-| `=` | Yes | Introduces the foreign symbol selection |
-| `global` | No | Contextual modifier recognized immediately after `=` |
-| string literal | Yes | Foreign symbol name |
-| `: FOREIGN_TYPE` | No | Foreign-call type; defaults to `void` if absent |
-| `{ ... }` | No | Descriptor block |
-| final `;` | Yes | Terminates the declaration |
-
-Examples:
-
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-
-let external putchar : i32 -> ! = "putchar" : (i32) -> void {
-    from = "<stdio.h>";
-};
-
-let external exit : i32 -> ! = "exit" : (i32) -> void {
-    from = "<stdlib.h>";
-};
-```
-
-The source-visible type and the foreign calling type are distinct descriptions. They must agree about argument shape, return shape, pointer/value interpretation, and calling convention if the call is to be safe.
-
-### The contextual `global` modifier
-
-The parser recognizes the identifier `global` specially only in the position immediately following the external declaration's `=`:
-
-```mak
-let external errno : i32 = global "errno" : i32 {
-    from = "<errno.h>";
-};
-```
-
-This is accepted as a syntactic global external declaration. Its actual suitability depends on how the backend handles global symbols; it is not equivalent to a function call signature. Use the form only when the target backend and symbol kind support it.
-
-### Descriptor blocks
-
-The descriptor block is optional and contains entries of the following known forms:
-
-```mak
-pure = true;
-pure = false;
-from = "<stdio.h>";
-abi = "C";
-```
-
-`pure`, `from`, and `abi` are identifiers interpreted specially inside this block. Known entries require `=` followed by the expected value. A semicolon after an entry is optional in the parser, but using one is strongly recommended for readability and separation.
-
-Rules and exceptions:
-
-- `pure` reads one identifier. It sets the parsed flag to true only for the exact spelling `true`; another identifier such as `false` sets it to false. A quoted string or integer is not accepted as the `pure` value.
-- `from` and `abi` require a string literal.
-- Unknown descriptor keys are not rejected by the parser. The parser consumes an expression as their value and discards that value. Do not depend on unknown keys: they may be ignored rather than having any meaning.
-- Since unknown-key values are parsed as expressions, omitting a semicolon before a following identifier can cause that identifier to be consumed as part of the expression. Use a semicolon after every descriptor entry.
-- A descriptor block must close with `}` and the external declaration must then end with `;`.
-- The supplied parser extracts the text for `from` and `abi` differently from ordinary expression strings. Keep these values plain and avoid escape sequences.
-
-### Variadic foreign functions
-
-A foreign signature can use `...` to indicate a variadic argument marker:
-
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-```
-
-The fixed arguments and the variadic marker are separated by commas. The foreign parser recognizes three consecutive dot tokens as `...`; whitespace may appear between those dot tokens because they are tokenized separately, but write them contiguously to express intent.
-
-The parser's grammar is more permissive than a robust C declaration validator: it does not itself guarantee that a variadic marker appears only in a position valid for the C ABI. Use the conventional shape `(fixed_arg_types..., ...) -> result_type`, with `...` last in the argument list.
-
-### Foreign type atoms and pointer syntax
-
-The foreign type atom spellings are:
-
-```text
-i8 i16 i32 i64
-u8 u16 u32 u64
-f32 f64
-ptr void
-```
-
-Any other identifier is represented as a named foreign type. An atom may be followed by one `*` to express a pointer-to-atom type:
-
-```mak
-i32*
-ptr*
-MyStruct*
-```
-
-The supplied parser supports one star suffix on a foreign atom. Do not assume arbitrary pointer depth (`i32**`) or a pointer suffix on a whole foreign function type is supported.
-
-Foreign function types use parentheses for the argument list and `->` for the result:
-
-```mak
-() -> i32
-(i32) -> i32
-(ptr, u64) -> i32
-(ptr, ...) -> i32
-(i32, f64) -> void
-```
-
-The parser accepts an empty argument list and also allows a trailing comma. For portable, readable declarations, avoid unusual arrangements of repeated or non-final variadic markers even if they get past parsing.
-
-### Safety rules for FFI declarations
-
-This syntax exposes powerful behavior, but does not automatically make the signature safe. Before calling an external function, check all of the following:
-
-1. The symbol string exactly names the intended linked function or global.
-2. The MAK-side type describes how source code will call the name.
-3. The foreign type matches the actual C prototype and ABI.
-4. Pointer arguments are actual valid pointers, not integer values converted to pointers by a cast.
-5. Variadic arguments have the C types expected by the function's format string or API.
-6. Any return-type mismatch is avoided, especially for `void`, pointer, floating-point, and aggregate returns.
-7. `pure = true` is used only if the external function truly has no observable side effects and its result depends only on its arguments. A false purity claim can make optimization unsound.
-
-For example, this declaration describes `printf` as accepting a pointer followed by variadic arguments:
-
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-```
-
-The format string must be the first argument. `printf 16` is not a safe way to print the number sixteen: it puts an integer where the foreign signature expects a pointer. Use `printf "%d\n" 16` or an equivalently parenthesized expression.
-
-## 5.4 Import declarations (`bring`)
-
-The import declaration is:
-
-```mak
-bring "path/to/file.mak";
-```
-
-One `bring` declaration can name several paths before its one terminating semicolon:
-
-```mak
-bring "math.mak" "strings.mak" "platform/io.mak";
-```
-
-Rules:
-
-- At least one string literal is required after `bring`.
-- The declaration must end with `;`.
-- Both single-quoted and double-quoted strings are accepted by the parser.
-- The driver resolves relative paths against the directory of the file containing that import.
-- The loader tracks visited paths to avoid loading the same canonical path more than once.
-- Imported declarations are incorporated into the program; the imported file's final expression is not used as the root program body by the supplied loader.
-- `bring` is a top-level declaration. It is not an expression and cannot be used as a block statement or lambda body.
-
-Use clear relative paths and keep imports at the beginning of a file with the other declarations:
-
-```mak
-bring "prelude.mak";
-
-let main_value = 7;
-main_value
-```
-
-The exact module visibility and duplicate-name rules depend on later semantic/backend behavior; `bring` itself is not a namespace-qualified import syntax.
-
----
-
-# 6. Expressions
-
-Every final program body, function body, local `let` body, block tail, and `case` arm body is an expression. The main expression forms supported by the parser are:
-
-- integer, floating-point, and string literals;
-- identifiers;
-- parenthesized expressions;
-- the special empty-bracket placeholder `[]`;
-- brace-delimited blocks;
-- `let` expressions;
-- `fn` and backslash lambda expressions;
-- `case` expressions;
-- function application;
-- function composition with `.`;
-- unary and binary operators.
-
-## 6.1 Identifiers and parenthesized expressions
-
-A bare identifier is a variable expression:
-
-```mak
-answer
-square
-printf
-```
-
-Parentheses group an expression:
-
-```mak
-(answer)
-(square (x + 1))
-((\x -> x * x) 4)
-```
-
-Parentheses are the reliable way to make a desired grouping explicit. A parenthesized expression evaluates syntactically to the inner expression; the AST does not gain a separate grouping node.
-
-### No tuple expression syntax
-
-Although tuple types and tuple patterns exist, a comma-separated tuple *value* is not parsed by the expression grammar:
-
-```mak
-(a, b)        // not a tuple expression
-```
-
-Inside ordinary expression parentheses, the parser reads one expression and then expects `)`. A comma therefore causes an error.
-
-## 6.2 Function expressions (lambdas)
-
-The parser accepts `fn` and backslash as lambda starters. Each form creates a function expression.
-
-### Arrow-bodied lambda, unparenthesized parameters
-
-```mak
-fn x -> x + 1
-fn x y -> x + y
-\x -> x + 1
-\x y -> x + y
-```
-
-Parameters are consecutive identifiers. In the unparenthesized form, stop writing parameters when the next token is not an identifier.
-
-### Arrow-bodied lambda, parenthesized parameters
-
-```mak
-fn (x) -> x + 1
-fn (x, y) -> x + y
-fn (x y) -> x + y
-\(x, y) -> x + y
-```
-
-Commas are optional between identifiers in a parenthesized lambda parameter list. A trailing comma is accepted by the current loop:
-
-```mak
-fn (x,) -> x
-```
-
-This permissiveness is a parser behavior; for style and consistency, omit the trailing comma unless there is an explicit project convention.
-
-A comma-separated parameter list is most readable:
-
-```mak
-fn (left, right) -> left + right
-```
-
-### Braced lambda body
-
-A lambda may use a brace-delimited body instead of an arrow:
-
-```mak
-fn (x) { x + 1 }
-fn (x, y) { x + y }
-fn x y { x + y }
-\x { x + 1 }
-```
-
-The parser expects `{`, `->`, or `=>` after the parameter list. The braced body uses the same block-body rules described in §6.5.
-
-### Fat arrow
-
-`=>` is accepted as an alternative expression arrow:
-
-```mak
-fn x => x + 1
-case value of { 0 => "zero"; _ => "other" }
-```
-
-The type syntax does not use `=>`; use `->` for function types and foreign function result types.
-
-### Zero-parameter functions
-
-The parser allows an empty parameter list or no parameters before an arrow/body:
-
-```mak
-fn -> 42
-fn () -> 42
-fn () { 42 }
-\ -> 42
-```
-
-This is a syntactic allowance. Confirm how zero-parameter functions are represented and called in the compiler version you are using before relying on them in a public API.
-
-### Parameters are names, not patterns
-
-Lambda parameter positions accept identifiers only. They do not accept constructor patterns, literals, tuple destructuring, or type annotations:
-
-```mak
-fn (x, y) -> x + y     // valid parameter names
-fn (Some x) -> x       // not a pattern parameter
-fn (x: i32) -> x       // no parameter type-annotation grammar
-```
-
-Use `case` to destructure a value after binding it to a parameter.
-
-## 6.3 `let` expressions
-
-A local `let` expression has a binding, a required semicolon, and a body expression:
-
-```mak
-let name = value; body
-```
-
-Example:
-
-```mak
-let radius = 5;
-radius * radius
-```
-
-The body is part of the expression and may refer to the new name. There is no `in` keyword.
-
-### Function sugar in a local `let`
-
-```mak
-let square x = x * x;
-square 9
-```
-
-The parser wraps the right-hand value in a lambda when one or more parameter identifiers appear between the local name and `=`. This is equivalent in shape to:
-
-```mak
-let square = fn x -> x * x;
-square 9
-```
-
-### Local binding syntax and scope
-
-- The local binding's `=` is mandatory.
-- The semicolon after the value is mandatory.
-- A body expression is mandatory.
-- The binding name is one identifier.
-- Zero or more unparenthesized identifier parameters may follow that name.
-- A local external declaration is prohibited; `external` declarations may appear only at top level.
-
-This is the idiomatic way to name an intermediate result:
-
-```mak
-let x = 10;
-let y = x * 2;
-y + 1
-```
-
-In this source shape, the second `let` is the body of the first `let`. Braces are not necessary for nested local `let` expressions.
-
-### Binding scope
-
-A local binding's value is parsed before the binding's body. The value is not written as a recursive binding by this syntax alone. Do not assume the new name is in scope inside its own right-hand value.
-
-Use an explicit top-level function or another supported recursive pattern for recursion; the accepted syntax does not document a `let rec` form.
-
-## 6.4 Function application
-
-Application places one or more argument expressions after a function expression, generally without commas:
-
-```mak
-f x
-add x y
-square (n + 1)
-printf "%d\n" 16
-```
-
-The intended simple grouping is left-associated:
-
-```mak
-f x y
-```
-
-means repeated application in the order:
-
-```text
-(f x) y
-```
-
-The backend also has machinery to flatten applications while resolving calls. That does not mean every application expression is guaranteed to behave like a C call with arbitrary arguments; currying, known function arity, external declarations, and optimization may affect lowering.
-
-### Arguments are atoms unless grouped
-
-An argument can be an identifier, literal, parenthesized expression, block, lambda, `let`, `case`, or other expression form that begins an atom. Since function application binds more tightly than ordinary infix operators, write parentheses around compound argument expressions:
-
-```mak
-f (x + y)
-f (g x)
-f (case x of { 0 -> 1; _ -> 2 })
-```
-
-For example:
-
-```mak
-f x + y
-```
-
-is grouped as:
-
-```mak
-(f x) + y
-```
-
-not as `f (x + y)`.
-
-### Zero-argument postfix application
-
-A special postfix form consisting of empty parentheses is accepted after an expression:
-
-```mak
-f()
-f ()
-f()()
-```
-
-The parser represents this as an application with zero arguments. In this implementation, `f()` and `f ()` have the same token sequence for the parser's special check, so whitespace does not turn it into a unit-valued argument.
-
-A standalone `()` is not a unit *expression*. In expression position, parentheses must contain an expression; `()` by itself therefore does not parse as a value.
-
-Do not confuse:
-
-```mak
-f()      // zero-argument application syntax
-f (x)    // one argument, the value of x
-```
-
-### No comma-separated ordinary call syntax
-
-Ordinary application does not use comma separators:
-
-```mak
-f x y           // ordinary application shape
-f(x, y)         // not a general C-style argument-list syntax
-```
-
-Parentheses group a single expression, while the parser's special empty-parentheses case handles zero-argument application. Comma-separated parameters and foreign ABI argument lists have their own grammar.
-
-## 6.5 Blocks
-
-A block is delimited by braces:
-
-```mak
-{
-    expression1;
-    expression2;
-    final_expression
-}
-```
-
-A block is an expression. Its final expression supplies the block's value. Semicolons separate preceding expressions from what follows; a trailing semicolon is permitted.
-
-Examples:
-
-```mak
-{ 7 }
-{ 7; }
-{ 1; 2; 3 }
-{ let x = 5; x * 2 }
-```
-
-### Block edge cases in the supplied parser
-
-The current parser has several specific behaviors worth knowing:
-
-- An empty block `{}` is represented as integer `0`.
-- A block with one expression returns that expression directly, with or without a final semicolon.
-- A block with multiple expressions stores earlier semicolon-terminated expressions as statements and the last expression as its tail.
-- A trailing semicolon is allowed before `}`.
-- A local `let` encountered during block parsing is handled specially: the binding's body consumes the remainder of that block. Its scope includes the following portion of the block, not expressions that precede the binding.
-- A local `let` has its own required semicolon after the bound value; this is different from the optional final expression separator before a closing brace.
-
-Illustration:
-
-```mak
-{
-    do_first_thing;
-    let value = compute();
-    use value
-}
-```
-
-The local binding encloses the remaining block body so that `value` is available to `use value`. It does not retroactively enclose `do_first_thing`.
-
-### Block values are not implicit unit values
-
-The parser uses integer zero for an empty block rather than a dedicated unit-expression node. Do not assume `{}` is interchangeable with a value of type `()` in all contexts.
-
-## 6.6 `case` expressions
-
-A `case` expression matches one scrutinee against ordered arms:
-
-```mak
-case expression of {
-    pattern -> result;
-    pattern -> result;
-    _ -> default_result
-}
-```
-
-`of`, the opening brace, and the closing brace are mandatory. Every arm needs a pattern and an expression arrow (`->` or `=>`). The semicolon after an arm is optional in the parser; using it consistently is strongly recommended.
-
-Example:
-
-```mak
-case number of {
+case value of {
     0 -> "zero";
-    1 -> "one";
+    "ready" -> "text";
+    (left, right) -> left + right;
     _ -> "other"
 }
 ```
 
-### Arm ordering and separators
+Tuple patterns such as `(left, right)` and the empty pattern `()` exist even though tuple values and `()` are not supported as ordinary expression literals. A parenthesized single pattern `(x)` groups `x`; it does not make a one-element tuple pattern. Float literal patterns are not accepted.
 
-The parser retains arms in source order. Pattern matching normally uses that order, so place more specific patterns before catch-all patterns.
+## 33. Type syntax: more examples and non-examples
 
-Although the parser permits an omitted semicolon between arm bodies, omission is not always unambiguous: an adjacent token that can start an atom can be absorbed into the preceding expression as another application argument. Use semicolons between all arms in normal code.
-
-The arm loop itself does not require a first arm before `}`; consequently `case value of {}` is accepted by the parser as a case node with zero arms. This is a parse-level edge case, not a useful default or a promise that later compilation can evaluate it. Provide at least one arm in practical programs.
-
-### No guards or `if` clauses
-
-The supplied pattern grammar has no guard syntax such as `pattern when condition`, and it has no `if`/`then`/`else` expression form. Express conditional behavior with nested `case` expressions or a function/library convention that is available in your program.
-
-## 6.7 Function composition (`.`)
-
-The dot operator is accepted between expressions:
+Arrows in MAK types associate to the right:
 
 ```mak
-f . g
+i32 -> i32 -> i32
 ```
 
-The parser desugars this syntax into a one-parameter lambda whose body applies the left expression to the result of applying the right expression to the parameter. Conceptually:
+This parses as `i32 -> (i32 -> i32)`. Parentheses can make grouping explicit. A tuple-type input is written separately:
 
 ```mak
-f . g
+(i32, i32) -> i32
 ```
 
-means:
+That syntax differs from `i32 -> i32 -> i32`: the first writes a tuple type on the left of the arrow; the second nests arrows. Type expressions occur in constructor fields and external declaration annotations; this grammar does not provide general type annotations on arbitrary `let` bindings or lambda parameters.
 
 ```mak
-\x -> f (g x)
+[u8]             // array type
+[[i32]]          // array whose element type is [i32]
+(List a)         // named type application
+(Result a e)     // named type application with two type arguments
+()               // unit type
+!                // bottom type
 ```
 
-The parser uses the internal name `$x` for that generated binder. It is an implementation-generated placeholder, not a name to write in source code.
+A named type application is written with parentheses and the named type head first. Bare `List a` is not this type-application form. `[u8]` is a type, not an array value literal. `(i32)` groups the type `i32`; it is not a one-element tuple type. `(i32,)` is not accepted by the tuple-type grammar.
 
-### Composition is not function piping
+## 34. Lexical and grammatical traps checklist
 
-Composition does not mean “evaluate `f` and then pass it to `g`.” The left expression is applied to the result of applying the right expression to a new input.
+| Tempting spelling | Actual rule |
+|---|---|
+| `true`, `false` | Ordinary identifiers lexically; they are not dedicated boolean literal tokens |
+| `!=` | Not recognized; use `/=` for not-equal |
+| `a.b` | Dot means composition, not field access |
+| `[1, 2]` | No array literal syntax; square brackets postfix-index an existing expression |
+| `(a, b)` as an expression | No general tuple-expression syntax, despite tuple types/patterns existing |
+| `()` as an expression | No standalone unit expression atom |
+| `f(x, y)` | Not a comma-separated call; for a two-parameter function use application like `f x y` |
+| `let x: i32 = 1;` | General `let` binding type annotations are not provided by this grammar |
+| `\(x: i32) -> x` | Lambda parameter type annotations are not provided |
+| `if condition then a else b` | No `if`/`else` expression in this parser grammar; `case` is a supported branching form |
+| `x += 1` | No compound-assignment expression form |
+| `fn x -> x;` as the final top-level expression | A trailing semicolon is not the terminator for a final top-level expression |
+| `pass` | Reserved lexically, but no expression/declaration form is implemented for it in this parser |
 
-If the right side is itself an application, grouping matters:
+## 35. Fast reference: common tasks
 
 ```mak
-f . (g x)
+// Bind a value
+let count = 3;
+
+// Define a named one-parameter function
+let square x = x * x;
+
+// Define a named two-parameter function
+let add x y = x + y;
+
+// Call a named function
+square 12
+
+// Immediately call an anonymous function
+(\x -> x * x) 12
+
+// Same immediate call without the readability space
+(\x -> x * x)12
+
+// Pass parenthesized expressions as separate arguments
+add (2 + 3) (4 + 5)
+
+// Index a value, then pass the selected item to a function
+consume items[i]
+
+// Compose two unary functions and then invoke the composed function
+(increment . double) 10
+
+// Pattern matching
+case answer of {
+    0 -> "zero";
+    _ -> "nonzero"
+}
+
+// Return the final expression from a block
+{
+    let n = 6;
+    n * n
+}
 ```
 
-means composition of `f` with the value-expression `g x`, and desugars to a lambda which attempts to apply `g x` to the new argument. This is usually not the intent.
+The safest habits are: parenthesize immediately invoked lambdas; use whitespace-separated arguments rather than comma-call syntax; distinguish multi-parameter functions from nested unary functions; and parenthesize a composition before applying it when you mean `(f . g) x` rather than `f . (g x)`.
 
-A composition expression is useful when both sides represent functions:
+---
+
+# Part IV — Full implementation-oriented reference
+
+## 36. Scope and confidence: grammar versus later compiler stages
+
+This document describes the MAK lexer, parser, representation inference, and C/code-generation paths present in the source snapshot supplied with this reference. It distinguishes four separate questions that should not be conflated:
+
+1. **Lexically accepted**: the byte sequence is tokenized as the documented tokens.
+2. **Grammatically accepted**: those tokens form an AST according to `parser.rs`.
+3. **Accepted by later analysis**: name lookup, arity, representations, pointer shapes, and other analysis pass the compiler's checks.
+4. **Safe and meaningful at runtime**: the program obeys foreign ABI contracts, pointer lifetimes, index bounds, and the contracts of the called code.
+
+A construct may be grammatically accepted but fail later analysis. Conversely, a construct can compile while being unsafe because the compiler cannot prove a foreign pointer valid. Whenever this guide says *parses as*, that statement is about syntax and grouping; it is not automatically a promise of type correctness or runtime safety.
+
+The implementation uses a Pratt-style expression parser. This matters because application, indexing, prefix operators, and infix operators are not all handled by one ordinary mathematical precedence table. Application and indexing are recognized in the parser loop before the infix operator table, and prefix operators parse an operand at a dedicated binding power.
+
+## 37. Complete lexical inventory
+
+### 37.1 Reserved words
+
+Exactly these spellings are lexed as keyword tokens:
+
+| Spelling | Parser role |
+|---|---|
+| `let` | Top-level binding, local binding, or external declaration introducer |
+| `fn` | Anonymous function introducer |
+| `case` | Pattern-match expression introducer |
+| `type` | Top-level type declaration introducer |
+| `extern` | External declaration introducer after top-level `let` |
+| `of` | Delimiter between a `case` scrutinee and its arm block |
+| `bring` | Top-level source-path declaration introducer |
+| `pass` | Reserved token, but no expression/declaration production in the parser |
+
+`external` is not a reserved keyword token. It is an ordinary identifier treated specially only immediately after `let` at top level or in the parser's external-declaration check. It cannot be used as a normal binding name in those specific declaration positions.
+
+`true` and `false` are ordinary identifiers in ordinary source expressions. The external descriptor parser special-cases `pure = <identifier>` and sets the purity flag only when the identifier's text is exactly `true`; every other identifier spelling sets it to false. Do not treat that descriptor special case as boolean literal syntax.
+
+### 37.2 Punctuation and operator tokens
+
+The lexer recognizes the following one- and two-byte punctuation/operator forms:
+
+```text
+{ } ( ) [ ] ; , : . \
+-> => = + - * / % & | ^ ~ !
+== /= < > <= >= << >> && ||
+```
+
+The foreign-type parser additionally recognizes three consecutive dot tokens as the variadic marker `...` inside foreign function argument lists. The lexer does not need a dedicated ellipsis token for that syntax.
+
+Notable lexical facts:
+
+- `/=` is the not-equal token.
+- `!=` is tokenized as `!` followed by `=` and is not a not-equal operator.
+- `=>` is a single arrow token, not an infix operator.
+- `->` is a single arrow token.
+- The lexer checks two-character forms before one-character forms where required (`==`, `=>`, `/=`, `<=`, `<<`, `>=`, `>>`, `&&`, `||`).
+- No assignment operators such as `+=`, `-=`, `*=`, `/=`, or `|=` are defined as assignment syntax. Note that `/=` is already the not-equal operator, so it cannot be used for compound assignment.
+
+### 37.3 Identifier bytes
+
+The scanner uses ASCII byte tables. An identifier's first byte must be `A`–`Z`, `a`–`z`, or `_`. Remaining bytes may also contain decimal digits. Thus:
 
 ```mak
+alpha
+Alpha
+_alpha
+item7
+A9_b
+```
+
+are lexically valid identifiers, while `7item` is an integer token followed by an identifier, not one identifier. Non-ASCII bytes are not valid identifier bytes in this scanner and may produce an unexpected-byte error.
+
+Names are case-sensitive: `value`, `Value`, and `VALUE` are three different spellings. The first character's case also has a second role in pattern parsing: an uppercase-leading pattern identifier is treated as a constructor pattern, while a lowercase-leading identifier is a binding pattern. This is a syntactic classification, not merely a naming convention.
+
+## 38. Integer-literal scanning in exact detail
+
+### 38.1 Forms recognized
+
+```mak
+0
+7
+42
+1_000_000
+0x2a
+0X2A
+0b101010
+0B101010
+```
+
+Decimal integer scanning accumulates digits in an unsigned 64-bit value with wrapping arithmetic. Underscores encountered in the decimal-digit run are skipped. The implementation does not validate underscore placement, so do not assume that underscores are limited to conventional digit separators.
+
+Hexadecimal literals begin with `0x` or `0X`; the scanner consumes hexadecimal digits after the prefix and accumulates them in `u64`. Binary literals begin with `0b` or `0B`; only `0` and `1` are consumed after that prefix.
+
+### 38.2 Important scanner edge cases
+
+The scanner implementation is permissive in ways that are easy to miss:
+
+- It does not require at least one valid digit after `0x`, `0X`, `0b`, or `0B` before producing an integer token. For example, the token boundary for `0x` is consumed as an integer value of zero; a following non-hex byte begins the next token.
+- Decimal underscore placement is not validated. The scanner skips underscores wherever they occur during the decimal digit scan, including repeated or leading-position underscores after the first digit has already triggered number scanning.
+- Hex and binary scanning do not treat underscores as part of the literal. The underscore ends the number token and begins a subsequent token, which is usually not what was intended.
+- Integer overflow uses the scanner's wrapping accumulator; a source integer does not necessarily fail lexing just because its mathematical value exceeds `u64`.
+- The leading minus sign is a separate unary operator. `-42` is not a negative integer token.
+
+For portable, readable source, use ordinary decimal digit separators and complete hexadecimal/binary digits even where the scanner accepts less conventional input.
+
+### 38.3 Integers are not intrinsically signed source tokens
+
+The lexer stores an integer token as `u64`. The later representation-selection logic may choose a compact integer representation according to the value and context. Therefore a literal token's lexical representation should not be mistaken for a fixed, user-declared source type. MAK has names such as `i32`, `u64`, and others in type/foreign declarations, but the expression grammar provides no suffix such as `42u32` and no expression-level `: u32` type annotation.
+
+## 39. Floating-point scanning in exact detail
+
+### 39.1 Forms recognized
+
+```mak
+0.0
+3.14159
+1e3
+1E-3
+6.02e+23
+12.0E8
+```
+
+The scanner first consumes a decimal digit run. A dot belongs to the float token only when the byte after the dot is a decimal digit. An exponent begins with `e` or `E`, may have one `+` or `-`, then consumes any following digits. The scanner does not require that an exponent contain at least one digit.
+Underscores are consumed by the integer-part digit loop only. The digits following the decimal point and exponent are scanned without underscore skipping, so do not use underscores in fractional or exponent portions.
+
+### 39.2 Deliberate consequences
+
+- `10.0` is one floating literal.
+- `10.` is an integer token `10` followed by the composition token `.`; it is not a complete float literal.
+- `.5` begins with the composition token `.` rather than a floating literal, because number scanning is entered only when the first byte is a digit.
+- `1e3` is a floating literal.
+- `1e` is consumed as a floating-literal spelling by the scanner; Rust's parsing of the collected text fails and the implementation falls back to `0.0`. This is an implementation quirk, not recommended syntax.
+- There is no `NaN` or `Infinity` literal token. Such spellings are ordinary identifiers unless provided as named values by some environment.
+
+For predictable code, always put a digit before and after a decimal point and provide exponent digits whenever an exponent marker appears.
+
+## 40. String decoding and byte semantics
+
+### 40.1 Quote delimiters
+
+Both single-quoted and double-quoted strings are accepted. The lexer uses the quote that opened the string as the closing delimiter.
+
+```mak
+"double quotes"
+'single quotes'
+"embedded ' single quote"
+'embedded " double quote'
+```
+
+### 40.2 Escape processing
+
+The escape decoder recognizes these conventional forms:
+
+| Source characters | Decoded byte/value |
+|---|---|
+| `\\` | Backslash (`0x5c`) |
+| `\n` | Newline (`0x0a`) |
+| `\r` | Carriage return (`0x0d`) |
+| `\t` | Tab (`0x09`) |
+| `\0` | NUL (`0x00`) |
+| `\"` | Double quote |
+| `\'` | Single quote |
+| `\xHH` | Byte produced by two hexadecimal digits, when the decoder sees a complete valid pair |
+| backslash followed by another character | The backslash is removed and that character is emitted, unless a specific escape rule applies |
+
+Strings are represented as byte vectors by the AST, not as a language-level Unicode scalar sequence. The lexer operates on bytes. If a source string contains a literal non-ASCII sequence, the bytes of that sequence are retained; no normalization or code-point escape syntax is provided by the grammar.
+
+An actual newline within a quoted string is permitted by the scanning loop as long as the matching closing quote eventually appears. A NUL byte marks end-of-input for the lexer, so an embedded NUL in the input buffer is not ordinary source text in the normal compiler entry path.
+
+An unterminated quoted string is a lexical error. Escape sequences do not make a missing closing quote acceptable.
+
+## 41. Comments and whitespace
+
+### 41.1 Line comments
+
+`//` begins a comment that continues until a newline or the scanner's end marker. The newline itself is processed as whitespace on the next iteration.
+
+### 41.2 Nested block comments
+
+`/*` begins a block comment. The scanner tracks nesting depth, so nested block comments are accepted:
+
+```mak
+/* outer
+   /* inner */
+   still outer
+*/
+42
+```
+
+A closing `*/` decrements the depth. The outer comment finishes when the depth returns to zero. Reaching end-of-input before that happens raises an unterminated-comment lexer error.
+
+### 41.3 Newlines are not separators with grammatical force
+
+Whitespace is ignored between tokens. A newline does not terminate a top-level declaration, end a `let`, finish a block expression, or implicitly insert a semicolon. Where the grammar requires `;`, supply it explicitly.
+
+```mak
+let answer =
+    40 +
+    2;
+answer
+```
+
+This works because the tokens still form one expression; it is not an indentation-sensitive language.
+
+## 42. Exact top-level parser behavior
+
+The parser first consumes as many top-level declarations as it can recognize from the leading token. The only top-level declaration starters are `let`, `type`, and `bring`. After declarations, it parses at most one expression as the program body. If input ends directly after declarations, the parser synthesizes integer `0` as the body.
+
+That gives the following shapes:
+
+```mak
+// Declarations plus a body expression.
+let n = 10;
+n + 2
+```
+
+```mak
+// A declaration-only file; parser body defaults to 0.
+let n = 10;
+```
+
+```mak
+// A body expression may be a block.
+{
+    let n = 10;
+    n + 2
+}
+```
+
+A semicolon is required after each top-level declaration. The final top-level expression is parsed as the body and generally must not be followed by a semicolon, because the parser expects end-of-input once the body has been parsed. There is no rule that turns several bare top-level expressions into a sequence.
+
+The parser has error recovery for malformed declarations and for some expression contexts, but error recovery is not a supported alternative syntax. A program should not rely on the fallback integer body installed after a parse error; the compiler reports the accumulated parser errors.
+
+## 43. `let` binding subtleties
+
+### 43.1 Top-level `let`
+
+```mak
+let value = expression;
+let function x y = expression;
+```
+
+The top-level parser reads an identifier after `let`, then any additional identifier tokens until it reaches `=`. If extra identifiers were collected, the value expression is wrapped in a function node with those parameters. The binding itself is a single declaration, closed by `;`.
+
+### 43.2 Local expression `let`
+
+```mak
+let value = expression; body
+let function x y = expression; body
+```
+
+In a local `let` expression, the mandatory semicolon divides the bound value from the body expression. It does not simply terminate a declaration and continue parsing a peer expression at the same grammar level.
+
+### 43.3 `let` inside a block
+
+```mak
+{
+    let value = expression;
+    body
+}
+```
+
+The block-specific parser reads the binding and then parses the remaining block contents as the body/scope of that binding. External declarations are explicitly rejected within a block. A local `let` is not a substitute for a C-style mutable-variable declaration: the grammar has no assignment statement.
+
+### 43.4 Parameters are bare names, not patterns
+
+The shortcut `let f x y = ...;` allows identifiers as parameters. It does not support annotations (`let f (x : i32) = ...`), defaults, destructuring parameters, named parameters at call sites, or a parameter type declaration after each identifier.
+
+## 44. Anonymous-function syntax and invocation
+
+All of these are parser-supported function introducers:
+
+```mak
+fn x -> x + 1
+fn x => x + 1
+\x -> x + 1
+\x => x + 1
+fn (x) -> x + 1
+fn (x, y) -> x + y
+fn (x y) { x + y }
+fn () -> 42
+```
+
+The `fn` and backslash forms share the same parameter/body parser. With a parenthesized parameter list, commas are optional separators after each parsed identifier; adjacent identifiers are also accepted. An empty parenthesized list is accepted. Without parentheses, the parser consumes consecutive identifiers as the parameter list until it sees an expression arrow or opening brace.
+
+`->` and `=>` both introduce the body expression. A braced body may be used instead of an arrow:
+
+```mak
+fn x {
+    let doubled = x * 2;
+    doubled + 1
+}
+```
+
+A zero-parameter callable is written with an empty parenthesized parameter list, and its call is written with the special empty-call syntax:
+
+```mak
+let answer = fn () -> 42;
+answer()
+```
+
+`answer ()` is not the same spelling. The argument parser only gives special treatment to the consecutive `()` token pair immediately following a callee. The parenthesized empty form by itself is not an ordinary expression value.
+
+### 44.1 Immediate invocation patterns
+
+```mak
+(\x -> x * x) 12
+(\x -> x * x)12
+(fn x -> x * x) 12
+(fn (x) -> x * x) (3 + 9)
+(\x y -> x + y) 20 22
+(\(x, y) -> x + y) pair_value
+```
+
+The first four examples show a parenthesized lambda expression used as the function expression of an application. The no-space spelling is accepted because juxtaposition, not whitespace itself, creates application. For reliable readability, include a space between the `)` that closes the lambda and the first argument.
+
+The last example is syntactically a lambda with one parameter named `(x, y)`? No: parameter-list patterns do **not** permit tuple destructuring. In a function parameter list, parentheses hold parameter identifiers only. `\(x, y) -> ...` declares two identifier parameters `x` and `y`; it does not declare one tuple parameter. The following argument `pair_value` is therefore the first argument and does not match a source-level tuple-destructuring parameter form. Use ordinary parameters, then pattern-match inside the body if the value being passed has a supported pattern representation.
+
+### 44.2 Curried-looking type arrows versus multiple declared parameters
+
+The type parser treats `A -> B -> C` as `A -> (B -> C)`. Function declarations and lambdas, however, can store a parameter vector with multiple entries. A binding declared as `let add x y = x + y;` is parsed as a function node with two named parameters, and a call written `add 2 3` is ordinarily analyzed as a two-argument call when the compiler flattens the application chain.
+
+Do not infer that this is interchangeable in every context with a value whose type is a chain of unary functions. The parsed parameter count, compiler function arity, and MAK arrow type syntax are distinct layers.
+
+## 45. Application, empty calls, and the absence of tuple calls
+
+### 45.1 Application by juxtaposition
+
+```mak
+f x
+f x y
+f (x + 1)
+f xs[i]
+f (g x)
+```
+
+The parser represents application as an application node and flattens adjacent ordinary application nodes when the compiler analyzes a call. Syntactically, a chain groups left-to-right: `f x y` has the structural grouping `(f x) y` before later call flattening.
+
+### 45.2 Indexing the argument of an application
+
+The parser deliberately parses index suffixes on the next atom before attaching that atom as an argument. Therefore:
+
+```mak
+f xs[i]
+```
+
+means a call to `f` with `xs[i]` as its argument, rather than an attempt to index the result of `f xs`. To index a call result, parenthesize it:
+
+```mak
+(f xs)[i]
+```
+
+### 45.3 Empty calls versus empty argument values
+
+```mak
+f()
+f ()
+```
+
+`f()` is recognized as a zero-argument call. `f ()` tries to parse an ordinary empty-parentheses expression as the argument; the ordinary expression-atom parser requires a nonempty expression between parentheses and rejects it. The whitespace is the difference in tokens consumed by the special case.
+
+### 45.4 Calls with multiple arguments
+
+The language does not use comma-separated source expression arguments. Write `f x y`, not `f(x, y)`. A parenthesized expression contains a single expression; the comma token is used in tuple types, tuple patterns, parameter lists, and foreign function type argument lists, not in general calls.
+
+## 46. Function composition: syntax, parser expansion, and use
+
+Composition `.` is not member access and it is not pointer field access. The parser rewrites `lhs . rhs` into an anonymous unary function equivalent to:
+
+```mak
+fn $x -> lhs (rhs $x)
+```
+
+The actual generated parameter name is an implementation detail; `$x` should be treated as explanatory pseudocode, not a recommended source identifier.
+
+### 46.1 Composition does not immediately execute either function
+
+```mak
+let square x = x * x;
 let increment x = x + 1;
-let double x = x * 2;
-
-increment . double
+let square_after_increment = square . increment;
+square_after_increment 4
 ```
 
-Because application binds tighter than dot, the parentheses in complicated compositions are important. When in doubt, define intermediate functions explicitly and test them.
+The final expression evaluates the composed callable on `4`; conceptually it computes `square (increment 4)`, which is `25` for ordinary arithmetic.
 
-### Dot associativity
-
-The parser's binding-power rules make dot right-associative:
+### 46.2 Composition is right-associative
 
 ```mak
 f . g . h
 ```
 
-is grouped as:
+parses as `f . (g . h)`. Under the expansion above, it acts as `f (g (h x))` when called on an input `x`.
+
+### 46.3 Application binds more tightly than composition
 
 ```mak
-f . (g . h)
+f . g x
 ```
 
-Its nested lambda desugaring can be non-obvious. Parenthesize compositions to make intent obvious.
-
-## 6.8 Prefix unary operators
-
-The prefix operators are:
-
-| Operator | AST operator | Conventional meaning |
-|---|---|---|
-| `-x` | `Neg` | Numeric negation |
-| `!x` | `Not` | Logical negation |
-| `~x` | `BitNot` | Bitwise complement |
-
-The unary operand includes an ordinary function application, while stopping before dot and binary operators. Thus the parser comments and behavior indicate these groupings:
-
-```mak
--f x       // -(f x)
-!f x       // !(f x)
-~f x       // ~(f x)
--(a + b)   // negation of the grouped sum
-!-x        // logical-not applied to the negated x
-```
-
-Parentheses should be used whenever an expression could be read in more than one way. The exact type-validity and runtime behavior of each unary operator depends on the operand and backend representation; syntax alone does not make an invalid operator/type combination meaningful.
-
-## 6.9 Binary operators
-
-MAK's AST contains the following binary operator groups:
-
-| Group | Spellings |
-|---|---|
-| Arithmetic | `+`, `-`, `*`, `/`, `%` |
-| Bitwise | `&`, `|`, `^`, `<<`, `>>` |
-| Equality | `==`, `/=` |
-| Ordering | `<`, `>`, `<=`, `>=` |
-| Logical | `&&`, `||` |
-
-Precedence and associativity are specified in §8. `=` is not included because it is not an expression-level equality operator.
-
-### Operator reminders
-
-- `==` is equality.
-- `/=` is not-equal.
-- `!` is prefix logical negation; it is not an infix operator.
-- `&`, `|`, and `^` are bitwise operators at the same precedence in this parser.
-- `&&` and `||` are separate logical operators at lower precedence than comparisons.
-- `<<` and `>>` are shift operators.
-- `%` is the remainder operator in the AST.
-
-The grammar defines the shape of these expressions, not an unrestricted set of operand types. Check the compiler's supported representations and write explicit conversions/FFI wrappers where required.
-
-## 6.10 Quoting and related syntax that are not ordinary expressions
-
-The AST has an internal `Quote` variant, but the supplied source parser has no normal expression-atom rule that creates a quote expression. A backtick is not a token in the listed punctuation grammar. A single quote begins a string literal; it is not quotation syntax.
-
-Similarly, the presence of type, array, tuple, function, or pointer-like forms in AST/type enums does not mean each of them has an expression-literal syntax. See §9 for the unsupported surface forms.
-
----
-
-# 7. Patterns
-
-Patterns are used in the arms of a `case` expression. The AST supports wildcards, variable bindings, integer literals, string literals, constructor patterns, and tuple patterns.
-
-## 7.1 Wildcard pattern
-
-```mak
-_
-```
-
-The underscore wildcard matches without introducing a named binding. It is the usual final/default arm:
-
-```mak
-case n of {
-    0 -> "zero";
-    _ -> "nonzero or other"
-}
-```
-
-A lone `_` is special in pattern position. In other expression contexts it is an identifier-shaped name unless later rules reject or reinterpret it.
-
-## 7.2 Variable-binding pattern
-
-A lowercase-leading identifier is parsed as a variable binding:
-
-```mak
-case value of {
-    x -> x
-}
-```
-
-The arm binds the scrutinee value to `x`, then the body may use `x`.
-
-The parser uses the first ASCII character to determine whether an identifier is a constructor pattern or a binding pattern. Uppercase-leading names do not act as ordinary pattern binders under this rule.
-
-The wildcard spelling `_` is special in pattern position only. In expression position it is parsed as an ordinary identifier-shaped variable name (which may or may not resolve later).
-
-## 7.3 Integer-literal pattern
-
-```mak
-case n of {
-    0 -> "zero";
-    1 -> "one";
-    42 -> "answer";
-    _ -> "other"
-}
-```
-
-Integer patterns use the integer literal token, whose AST value is unsigned. Negative patterns are not a supported direct pattern form:
-
-```mak
--1 -> "negative one"    // not accepted as an integer pattern
-```
-
-If a signed comparison is needed, bind the value and use an expression condition implemented through whatever comparison/case structure the program supports.
-
-## 7.4 String-literal pattern
-
-String patterns accept either quote style and the same expression-string escape decoder:
-
-```mak
-case text of {
-    "yes" -> 1;
-    'no' -> 0;
-    _ -> 2
-}
-```
-
-The pattern AST stores decoded bytes. String pattern matching is therefore a value-level operation, but its precise semantics depend on the backend's supported string representation.
-
-## 7.5 Constructor pattern
-
-A constructor pattern begins with an identifier whose first ASCII character is uppercase:
-
-```mak
-case value of {
-    None -> 0;
-    Some x -> x;
-    _ -> -1
-}
-```
-
-Multiple constructor fields are written as successive patterns, without commas:
-
-```mak
-case pair of {
-    Pair x y -> x + y;
-    _ -> 0
-}
-```
-
-Use parentheses to delimit nested structures:
-
-```mak
-case xs of {
-    Cons head (Cons second tail) -> head + second;
-    _ -> 0
-}
-```
-
-### Constructor-pattern arity
-
-The parser consumes successive pattern-starting tokens as arguments to an uppercase constructor. It does not necessarily know the constructor's declared arity at the parsing step; later semantic/backend processing resolves the constructor and its fields.
-
-Write the same number of patterns as the constructor declares fields. Incorrect arity may fail later or trigger behavior that is not a syntax guarantee.
-
-### Greedy argument parsing
-
-Because constructor arguments are adjacent and have no delimiter, this form:
-
-```mak
-Ctor a b
-```
-
-is read as a constructor pattern with two arguments. If a subpattern is structurally complex, group it:
-
-```mak
-Ctor (Other x) (Pair y z)
-```
-
-Commas are not constructor-pattern argument separators.
-
-### Uppercase heuristic caveat
-
-The parser accepts lowercase identifiers as constructor declarations, but pattern syntax classifies a lowercase-leading identifier as a binding. For example, a declaration named `some` cannot be relied on to parse as a constructor pattern `some x`; the pattern parser sees `some` as a binder. Use uppercase constructor names such as `Some`.
-
-### Float-pattern exception
-
-The expression grammar has float literals, but the pattern grammar does not. A float token is not accepted as a direct pattern. Patterns also have no comparison/range form such as `1..10`.
-
-## 7.6 Tuple patterns
-
-Tuple patterns use parentheses and comma separators:
-
-```mak
-case value of {
-    (left, right) -> left + right;
-    _ -> 0
-}
-```
-
-Nested tuple patterns are permitted:
-
-```mak
-case value of {
-    (x, (y, z)) -> x + y + z;
-    _ -> 0
-}
-```
-
-The parser supports the following precise distinctions:
-
-| Pattern spelling | Current parser interpretation |
-|---|---|
-| `()` | Empty tuple pattern (`Tuple([])`) |
-| `(x)` | Parenthesized pattern `x`, not a one-element tuple |
-| `(x, y)` | Two-element tuple pattern |
-| `(x, y, z)` | Three-element tuple pattern |
-| `(x,)` | Invalid: a pattern is required after the comma |
-
-Thus, the parser can represent an empty tuple pattern and tuples with two or more entries, but not a dedicated one-element tuple pattern.
-
-## 7.7 Pattern forms not provided
-
-There is no parser rule for these pattern forms:
-
-```text
-float literal pattern
-negative integer pattern
-range pattern (1..10)
-OR pattern (A | B)
-AND pattern (p & q)
-guarded pattern (p when condition)
-record/field pattern ({ field = x })
-list syntax pattern ([x, y])
-```
-
-A constructor can contain nested constructor and tuple patterns, but that is not the same as general pattern combinators or field-name destructuring.
-
-## 7.8 Pattern matching style
-
-Prefer arms separated by semicolons, put specific cases first, and use `_` only when a genuine fallback is intended:
-
-```mak
-case maybe_value of {
-    Some 0 -> "some zero";
-    Some n -> "some other integer";
-    None -> "nothing";
-    _ -> "fallback for any remaining supported case"
-}
-```
-
-The parser does not itself guarantee exhaustiveness or absence of unreachable arms. It also does not prove that all arm bodies have a compatible result representation. Treat those as separate correctness requirements.
-
----
-
-# 8. Operator precedence and associativity
-
-This table is based on the expression parser's binding-power rules. Rows higher in the table bind more tightly, subject to the explicit note that application is recognized before the infix-operator loop and is therefore available even while parsing the operand of a prefix operator.
-
-| Binding strength | Form | Associativity / grouping |
-|---:|---|---|
-| Strongest postfix form | `f()` | Repeated postfix zero-argument application |
-| Very high | `f x`, `f x y` | Left-associated application: `(f x) y` |
-| High | Prefix `-`, `!`, `~` | Operand includes ordinary application; stops before dot and binary operators |
-| 9 | `.` | Right-associative composition |
-| 7 | `*`, `/`, `%` | Left-associative |
-| 6 | `+`, `-` | Left-associative |
-| 5 | `<<`, `>>` | Left-associative |
-| 4 | `&`, `^`, `|` | Left-associative; all share this level |
-| 3 | `==`, `/=`, `<`, `>`, `<=`, `>=` | Left-associative in the parser |
-| 2 | `&&` | Left-associative |
-| 1 | `||` | Left-associative |
-
-Parentheses override these rules and are recommended for any nontrivial expression.
-
-## 8.1 Application wins over binary operators
-
-```mak
-f x + y
-```
-
-parses as:
-
-```mak
-(f x) + y
-```
-
-To make the sum the argument, write:
-
-```mak
-f (x + y)
-```
-
-Likewise:
-
-```mak
-f x * y       // (f x) * y
-f (x * y)     // f applied to the product x*y
-```
-
-## 8.2 Arithmetic grouping
-
-The usual arithmetic grouping follows the table:
-
-```mak
-a + b * c      // a + (b * c)
-a * b + c      // (a * b) + c
-a - b - c      // (a - b) - c
-a / b / c      // (a / b) / c
-```
-
-Do not assume integer division, floating division, overflow, or remainder behavior from the syntax alone; those depend on operand representation and generated operations.
-
-## 8.3 Shifts and bitwise operators
-
-```mak
-a << b
-x >> n
-mask & value
-flags | option
-x ^ y
-```
-
-Shifts bind more tightly than bitwise AND/XOR/OR in this parser. The three bitwise operators share a precedence level:
-
-```mak
-a & b ^ c | d
-```
-
-is parsed left-associated across that common level. Prefer explicit parentheses because many readers expect different precedence conventions from other languages.
-
-## 8.4 Comparisons
-
-```mak
-x == y
-x /= y
-x < y
-x > y
-x <= y
-x >= y
-```
-
-The parser associates comparisons from left to right. A chained comparison such as:
-
-```mak
-a < b < c
-```
-
-is not a special mathematical range comparison. It is grouped as `(a < b) < c`, which is likely not what you intend and may not be valid for the inferred result types. Write two comparisons in a structure supported by the language instead.
-
-## 8.5 Logical operators
-
-```mak
-a && b
-x || fallback
-```
-
-`&&` binds more tightly than `||`:
-
-```mak
-a || b && c
-```
-
-is grouped as:
-
-```mak
-a || (b && c)
-```
-
-The parser creates distinct logical operator nodes. The exact result values and evaluation/short-circuit behavior should be checked against the backend for the version being used; do not infer all operational guarantees from the punctuation alone.
-
-## 8.6 Unary operators versus application
-
-The parser's prefix rule explicitly lets application remain inside a unary operand:
-
-```mak
--f x        // -(f x)
-!f x        // !(f x)
-~f x        // ~(f x)
-```
-
-To negate a value and then pass it as an argument, group the unary expression:
-
-```mak
-f (-x)
-f (!(x == 0))
-```
-
-A leading `-` immediately after an already parsed left expression is recognized as the binary subtraction operator. Source whitespace does not change token identity:
-
-```mak
-x - y
-```
-
-is subtraction; if the desired right-hand value is a negated expression, make the grouping explicit:
-
-```mak
-x - (-y)
-```
-
-## 8.7 Composition grouping
-
-Dot binds less tightly than application and more tightly than binary arithmetic:
-
-```mak
-f . g x + y
-```
-
-must not be read intuitively as a sequence of function calls. Application is consumed first, composition is desugared, and addition is parsed outside the composition unless parentheses say otherwise. Prefer:
+parses as `f . (g x)`, because `g x` is an application inside the right side of the composition expression. That is not the same as `(f . g) x`. If the intention is to compose first and then apply the resulting function, write:
 
 ```mak
 (f . g) x
-f . (g x)
-(f . g) (x + y)
 ```
 
-according to the actual intent, remembering that `.` constructs a function. In particular, `f . (g x)` applies the value `g x` to the new composition parameter, which is often a mistake.
+### 46.4 Composition requires callable operands when used
 
-## 8.8 Binding powers, for readers who want the exact parser levels
+The parser can construct composition without proving that either side has a useful function type. Later analysis/runtime will determine whether the operands can actually be applied. A composition expression is not a general-purpose operator for fields, modules, values, or pointers.
 
-The supplied parser assigns these left/right binding powers to infix operators:
+## 47. Indexing is syntax sugar for a reserved intrinsic
 
-| Infix | Left binding power | Right binding power |
-|---|---:|---:|
-| `.` | 9 | 9 |
-| `*`, `/`, `%` | 7 | 8 |
-| `+`, `-` | 6 | 7 |
-| `<<`, `>>` | 5 | 6 |
-| `&`, `^`, `|` | 4 | 5 |
-| `==`, `/=`, `<`, `>`, `<=`, `>=` | 3 | 4 |
-| `&&` | 2 | 3 |
-| `||` | 1 | 2 |
-
-Different left/right values give the ordinary binary operators left-associative behavior. Dot uses equal left and right binding powers, allowing a same-precedence dot expression on the right and thereby making composition right-associative.
-
-Prefix expressions parse their operand at binding power 10. Since application is handled unconditionally in the expression loop, the operand can contain application but cannot absorb dot or a lower-precedence binary operator. This is the source of the `-f x` grouping described above.
-
----
-
-# 9. Forms that are not source syntax (or are only partial placeholders)
-
-This section is intentionally blunt. An AST node, a type form, a C backend helper, or a reserved token does not automatically mean there is a corresponding source expression.
-
-## 9.1 `pass`
-
-`pass` is tokenized as a keyword, but the supplied parser has no `pass` branch in its declaration or expression grammar. It is not a usable no-op statement in this snapshot.
-
-## 9.2 Arrays
-
-Array types are supported syntactically:
+The parser lowers every `base[index]` suffix to an application of an internal variable named `$mak.index`, with the base and index as arguments. Chained indexing is nested:
 
 ```mak
-[u8]
-[i64]
+base[i][j]
 ```
 
-Non-empty array value literals are not:
+is equivalent in shape to:
 
 ```mak
-[1, 2, 3]    // rejected by the current expression grammar
-[1]          // rejected by the current expression grammar
+$mak.index ($mak.index base i) j
 ```
 
-The odd exception is:
+This internal name is compiler syntax, not ordinary public source API. User code should use bracket indexing.
 
-```mak
-[]
-```
+Indexing supports a nonempty expression in brackets and can be chained. It is syntactically permitted on any expression, but the later representation analysis expects a pointer-like base (or a representation it has not yet resolved) and an integer index. A string/pointer may therefore be indexable, whereas a known integer scalar is not a sensible index base.
 
-The parser accepts `[]` as an atom and represents it as integer zero. It is **not** a real empty-array value. Do not use it as though it had an array type or array semantics.
+The language does not define an assignment form for an index. `buffer[i]` is a read expression. Do not assume `buffer[i] = value` mutates memory; the parser has no assignment expression production.
 
-## 9.3 Tuples
+## 48. Pointer and pointer-arithmetic model
 
-Tuple type syntax and tuple pattern syntax exist, but the expression parser does not accept tuple literals:
+### 48.1 Pointer support is a compiler representation/FFI facility, not a complete pointer expression language
 
-```mak
-(i32, i32)   // tuple type in type position
-(x, y)       // tuple pattern in pattern position
-(x, y)       // not a tuple value expression
-```
+MAK's source type syntax has named types, primitive spellings, array types, tuple types, arrow types, parameterized named types, and `!`. It does **not** declare a special MAK pointer type token in `ty_atom`; a bare spelling such as `ptr` in a MAK type annotation is parsed as a named type. By contrast, the foreign type parser gives `ptr` a dedicated C-opaque-pointer meaning and supports C-like stars such as `u8*` and `u8**`.
 
-The surrounding grammar determines which of these contexts is active.
+The compiler's internal representation inference recognizes pointer-like values obtained from strings, foreign data-pointer declarations/returns, generated algebraic-data-type values, and known bindings. This means pointer arithmetic is real at the expression/code-generation level, but its behavior depends on what the compiler knows about the left/right operands and, in particular, the foreign pointer shape.
 
-## 9.4 Unit value versus unit type
+### 48.2 Supported pointer arithmetic cases
 
-`()` is recognized as the unit type in type position. It is not parsed as a standalone unit expression. After an expression has already been parsed, `()` can instead act as postfix zero-argument application:
+The source parser uses the ordinary arithmetic tokens `+` and `-`; there are no special pointer arithmetic tokens.
 
-```mak
-()       // not a standalone expression value
-f()      // a zero-argument application form
-```
-
-The two spellings are not interchangeable across contexts.
-
-## 9.5 Booleans and control flow
-
-There are no built-in `true` and `false` expression literals, and no direct parser forms for `if`, `else`, `while`, `for`, `break`, `continue`, `return`, `try`, `catch`, `throw`, or `switch`.
-
-`true` and `false` parse as identifiers in an expression. `case` is the built-in conditional/matching expression form represented by the parser.
-
-## 9.6 Assignment and mutation
-
-There is no general assignment expression such as `x = y`. The `=` token is used in declarations and descriptor entries. The AST contains immutable-shaped `let` bindings; the parser does not define a conventional mutable-variable assignment statement.
-
-## 9.7 Access, indexing, records, and namespaces
-
-No source expression grammar is provided for:
-
-```text
-object.field
-array[index]
-Type { field = value }
-module::name
-```
-
-The dot operator is function composition, not field access. Brackets are type syntax and the `[]` placeholder, not indexing syntax. Braces create blocks or declaration/matching bodies; they are not general record literals.
-
-## 9.8 Quotation
-
-The AST includes `ExprKind::Quote`, but there is no parser rule that constructs it from ordinary MAK source in the supplied parser. Backtick quotation should not be assumed to work. Single quote is a string delimiter.
-
-## 9.9 Other absent operators and conveniences
-
-No syntax is provided for exponentiation `**`, concatenation `++`, pipelines such as `|>`, null coalescing `??`, optional chaining `?.`, type ascription, generic angle brackets, or comparison ranges. Do not copy these forms from another language and expect MAK to recognize them.
-
----
-
-# 10. Full compact grammar
-
-This grammar consolidates the source forms described above. It is a readable grammar sketch of the current parser, not a replacement implementation; the notes after it describe the most important parser-specific exceptions.
-
-## 10.1 Program and declarations
-
-```ebnf
-program              = { declaration }, [ expression ], EOF ;
-
-declaration          = let_declaration
-                     | external_declaration
-                     | type_declaration
-                     | bring_declaration ;
-
-let_declaration      = "let", identifier, { identifier }, "=", expression, ";" ;
-external_declaration = "let", ("extern" | "external"), external_body ;
-bring_declaration    = "bring", string_literal, { string_literal }, ";" ;
-
-type_declaration     = "type", identifier, { identifier }, ";"
-                     | "type", identifier, { identifier }, "{",
-                       { constructor_declaration }, "}", ";" ;
-
-constructor_declaration
-                     = identifier, { type }, [ ";" ] ;
-```
-
-`let_declaration` in this compact grammar represents ordinary top-level let declarations, not the separate external-declaration branch. The ordinary top-level declaration's identifiers after its name are function-sugar parameters. The final expression may be absent; the parser then supplies integer zero.
-
-## 10.2 External declarations and foreign types
-
-```ebnf
-external_body       = identifier, [ ":", type ], "=", [ "global" ],
-                      string_literal, [ ":", foreign_type ],
-                      [ "{", { descriptor_entry }, "}" ], ";" ;
-
-descriptor_entry    = "pure", "=", identifier, [ ";" ]
-                    | ("from" | "abi"), "=", string_literal, [ ";" ]
-                    | identifier, "=", expression, [ ";" ] ;
-
-foreign_type        = "(", [ foreign_arg, { ",", foreign_arg }, [ "," ] ], ")",
-                      "->", foreign_type
-                    | foreign_atom, [ "*" ] ;
-
-foreign_arg         = foreign_type | "..." ;
-foreign_atom        = identifier ;
-```
-
-This is the conceptual shape. Actual parser caveats: `pure`, `from`, and `abi` are checked by the text of identifiers; unknown descriptor entries parse and discard an expression; `...` is recognized as three dot tokens; only one star suffix is parsed after a foreign atom; and the parser is not a complete C ABI validator.
-
-## 10.3 Types
-
-```ebnf
-type                = type_atom, [ "->", type ] ;
-
-type_atom           = primitive_or_named_type
-                    | "[", type, "]"
-                    | "(", ")"
-                    | "(", type, ")"
-                    | "(", type, ",", type, { ",", type }, ")"
-                    | "(", named_type, type_atom, { type_atom }, ")"
-                    | "!" ;
-
-primitive_or_named_type
-                    = identifier ;
-```
-
-The right side of a function arrow recursively parses a full type, making function arrows right-associative. Type application is a special parenthesized form whose head is a named type. The primitive spellings are interpreted as primitives only in the ordinary type parser; `ptr` is a foreign type atom and is not the same rule.
-
-## 10.4 Expressions
-
-```ebnf
-expression          = infix_expression ;
-
-infix_expression    = prefix_expression,
-                      { application_or_infix_tail } ;
-
-prefix_expression   = ("-" | "!" | "~"), expression_at_binding_power_10
-                    | atom ;
-
-atom                = integer_literal
-                    | float_literal
-                    | string_literal
-                    | identifier
-                    | "(", expression, ")"
-                    | "[", "]"
-                    | block
-                    | let_expression
-                    | lambda_expression
-                    | case_expression ;
-
-application_or_infix_tail
-                    = "(", ")"                      (* zero-argument application *)
-                    | atom                            (* ordinary application *)
-                    | ".", expression_at_binding_power_9
-                    | binary_operator, expression_at_operator_right_binding_power ;
-
-binary_operator     = "*" | "/" | "%" | "+" | "-"
-                    | "<<" | ">>" | "&" | "^" | "|"
-                    | "==" | "/=" | "<" | ">" | "<=" | ">="
-                    | "&&" | "||" ;
-
-lambda_expression   = ("fn" | "\\"), parameter_list, lambda_body ;
-parameter_list      = { identifier }
-                    | "(", [ identifier, { [ "," ], identifier }, [ "," ] ], ")" ;
-lambda_body         = "->", expression
-                    | "=>", expression
-                    | block ;
-
-let_expression      = "let", identifier, { identifier }, "=", expression,
-                      ";", expression ;
-
-case_expression     = "case", expression, "of", "{", case_arm, { case_arm }, "}" ;
-case_arm            = pattern, ("->" | "=>"), expression, [ ";" ] ;
-
-block               = "{", block_body, "}" ;
-block_body          = empty_block
-                    | expression, [ ";" ]
-                    | expression, ";", block_body
-                    | local_let, block_body ;
-empty_block         = ;
-local_let           = "let", identifier, { identifier }, "=", expression, ";" ;
-```
-
-Several productions above are intentionally schematic: the real expression parser uses binding powers rather than a separate grammar production for each operator; block-local `let` is parsed recursively so it encloses the remaining block body; the parser has a special empty-bracket placeholder; and empty parentheses are only a postfix form after an existing expression, not an ordinary expression atom.
-
-## 10.5 Patterns
-
-```ebnf
-pattern             = "_"
-                    | identifier_as_binding
-                    | integer_literal
-                    | string_literal
-                    | constructor_identifier, { constructor_pattern_argument }
-                    | "(", ")"
-                    | "(", pattern, ")"
-                    | "(", pattern, ",", pattern, { ",", pattern }, ")" ;
-
-constructor_pattern_argument
-                    = pattern ;
-```
-
-The distinction between `identifier_as_binding` and `constructor_identifier` is made by initial ASCII case, not by a separate declaration namespace rule. A one-item parenthesized pattern is grouping, not a tuple. There is no float pattern, negative integer pattern, or pattern guard.
-
-## 10.6 Grammar caveat checklist
-
-Before treating the EBNF above as a specification for a long-lived language, retain these exceptions:
-
-1. The parser consumes top-level declarations only while the next token is `let`, `type`, or `bring`.
-2. External declarations are `let external ...` or `let extern ...` forms.
-3. An absent top-level body becomes integer `0`.
-4. Top-level and local let declarations require semicolons after their values.
-5. A block's last expression is its value; an empty block currently becomes integer `0`.
-6. `[]` is an integer-zero placeholder, not an array literal.
-7. `()` is a unit type or a zero-argument-call suffix depending on context; it is not a value literal.
-8. `pass` is a keyword token without an expression rule.
-9. The dot operator expands to a lambda, not field access or piping.
-10. Float literals are not patterns.
-11. Constructor-pattern recognition depends on uppercase initial spelling.
-12. Only `->` is a type arrow and foreign function result arrow; `=>` is only accepted for expression arrows.
-13. The foreign type grammar accepts more arrangements than all real C ABIs permit.
-14. Parsed type forms do not guarantee every corresponding runtime representation is complete.
-
----
-
-# 11. The three `ringest` programs: why their syntax differs
-
-These three examples look similar but express different programs. Their outputs were supplied alongside the MAK source dump. The comparison below explains their source-level grouping and the significant difference that survives optimization.
-
-## 11.1 Example A: composition where a print call was intended
-
-Source:
-
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-
-printf "%d\n" . ((\x -> x*x)4)
-```
-
-### What the source says
-
-The expression to the left of dot is already an application:
-
-```mak
-printf "%d\n"
-```
-
-The expression to the right of dot is a parenthesized application:
-
-```mak
-(\x -> x*x) 4
-```
-
-The lambda calculates the square of its argument. The optimizer can reduce this particular application to the integer `16` under the supplied example's optimization path.
-
-But dot does not mean “append another `printf` argument.” It means function composition. The conceptual desugaring is:
-
-```mak
-\z -> (printf "%d\n") (((\x -> x*x) 4) z)
-```
-
-After the arithmetic lambda application simplifies, that shape is conceptually close to:
-
-```mak
-\z -> (printf "%d\n") (16 z)
-```
-
-The problem is `16 z`: the source attempts to apply the integer `16` as if it were a function.
-
-### Why the supplied C is large and still prints nothing
-
-The supplied C artifact contains a generated lambda function and runtime function-dispatch support. It does not call that lambda from `main`; `main` merely casts its function name to `void` and returns. Therefore the shown artifact produces no output.
-
-This is the key lesson: the presence of `printf` inside a lambda does not mean that the lambda runs. The final top-level expression is a function value, and the supplied emitted `main` does not invoke it.
-
-### Correct source shape
-
-Use composition only when composing functions. To print the computed result, pass a format string and the computed value as ordinary arguments:
-
-```mak
-printf "%d\n" ((\x -> x * x) 4)
-```
-
-## 11.2 Example B: one argument passed to `printf`
-
-Source:
-
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-
-printf ((\x -> x*x)4)
-```
-
-The expression contains an ordinary application with only one argument. The lambda application reduces to `16`, leaving the equivalent call shape:
-
-```mak
-printf 16
-```
-
-That is syntactically a one-argument call, but the external declaration describes the first C argument as `ptr` (a pointer). It is therefore not a correct call to `printf` for printing an integer.
-
-The supplied C output illustrates the mismatch by converting the integer into a pointer-shaped value and passing it as the sole argument. It does not provide a format string and does not provide a second variadic integer argument.
-
-**Safety warning:** passing the value `16` as the format-string pointer is invalid for this intended use. The resulting C behavior is undefined; a crash is possible, but the language specification should not promise a particular failure mode.
-
-Correct printing needs the format argument first:
-
-```mak
-printf "%d\n" 16
-```
-
-or with the computation left visible:
-
-```mak
-printf "%d\n" ((\x -> x * x) 4)
-```
-
-## 11.3 Example C: correctly shaped variadic call
-
-Source:
-
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-
-printf "%d\n" ((\x -> x * x) 4)
-```
-
-This time the call has two arguments:
-
-1. The string `"%d\n"`, in the required first (format-string pointer) position.
-2. The computed integer value `16`, corresponding to `%d`.
-
-After constant reduction, the supplied C output has the essential shape:
-
-```c
-mak_ir_ext_0((const void *)("%d\n"), INT64_C(16));
-```
-
-The supplied mLIR similarly shows a direct call with a string constant followed by an integer constant. Assuming the external declaration and target ABI are correct, this is the intended program and should print:
-
-```text
-16
-```
-
-## 11.4 Comparison table
-
-| Source expression | Core source meaning | Main issue or expected intent |
+| Form | Compiler handling | Notes |
 |---|---|---|
-| `printf "%d\n" . ((\x -> x*x)4)` | Compose the function represented by `printf "%d\n"` with the value-producing expression on the right | Produces a lambda involving the invalid application `16 z`; the supplied `main` does not invoke that lambda |
-| `printf ((\x -> x*x)4)` | Call `printf` with one argument, the computed value `16` | The integer occupies the format-string/pointer position; unsafe and not a valid integer-printing call |
-| `printf "%d\n" ((\x -> x*x)4)` | Call `printf` with format string and computed integer | Correctly shaped call for the intended output `16` |
+| `p + n` | Supported when `p` is pointer-like and `n` is integer-like | Advances by `n` elements if a pointee type is known; otherwise byte steps |
+| `n + p` | Supported when `n` is integer-like and `p` is pointer-like | Code generator selects the pointer operand and applies the offset |
+| `p - n` | Supported when `p` is pointer-like and `n` is integer-like | Moves backward by `n` elements when pointee information is known |
+| `p - q` | Supported when both operands are pointer-like | Produces an integer difference; known typed pointers use element difference, opaque pointers use raw address difference in this code path |
+| `n - p` | Not a pointer-arithmetic case handled by the implementation | Do not use |
+| `p * n`, `p / n`, `p % n` | Not pointer arithmetic | These are numeric operator tokens; pointers are not valid numeric operands for these operations |
+| `p + q` | Not recognized as the supported pointer-plus-offset case unless one operand is integer-like | Two pointers are not defined as additive offsets |
 
-Whitespace between tokens does not turn application into composition or vice versa. The change from the first example to the others is the operator itself (`.` versus application); the change from the second to the third is the addition of the format-string argument.
+“Supported” above describes code-generation branches that explicitly recognize a pointer representation. It does not grant bounds safety, allocation validity, provenance validity, alignment, or lifetime guarantees.
 
-### The supplied mLIR shapes
+### 48.3 Typed pointers versus opaque `ptr`
 
-The first variant's supplied mLIR has a generated function and a runtime-call fallback, while the entry yields a function reference:
+A foreign pointer written as `u8*` carries an element type. Pointer stepping uses C-like element-scaled arithmetic with `uint8_t`-sized elements. A foreign pointer declared as `i32*` steps by `sizeof(i32)` for an integer offset. A repeated pointer such as `u8**` retains nested shape, which supports chained indexing where the source/compiler can recover the nested pointer information.
 
-```text
-functions {
-  fn @mak_ir_fn_0 ["<lambda>"] : (%a0: i64) -> i32 {
-    yield call @z0(const.str "%d\n", runtime-call : i32) : i32
-  }
-}
-entry {
-  yield @f0
-}
-```
+An opaque foreign `ptr` has no known element type. The implementation deliberately treats it as byte-addressed for pointer offsets and indexing. Therefore adding `1` to an untyped `ptr` means advancing one byte in that fallback path, not one `i32` or one arbitrary object. To obtain typed element stepping, declare the foreign signature with an appropriately typed pointer such as `i32*`, or use a foreign interface whose pointer return/argument shape preserves the element type.
 
-The second variant's supplied mLIR reduces to a single argument for the external call:
-
-```text
-entry {
-  yield call @z0(const.i64 16) : i32
-}
-```
-
-The third variant's supplied mLIR has the format string and integer value as two arguments:
-
-```text
-entry {
-  yield call @z0(const.str "%d\n", const.i64 16) : i32
-}
-```
-
-Here `@z0`, `@f0`, and the runtime-call marker are names/features of the supplied custom mLIR output, not source-level MAK identifiers. The examples demonstrate the distinction between a top-level function value, a one-argument external call, and a two-argument variadic call. They are descriptive snapshots supplied with the question, not freshly generated by a compiler run in this documentation step.
-
-## 11.5 The shortest practical rule
-
-For C-style variadic printing:
+### 48.4 Pointer indexing and dereference
 
 ```mak
-printf "%d\n" expression
+bytes[i]
+words[i]
+word_ptr + i
+word_ptr[i]
 ```
 
-The first argument is the format string. The expression after it is the value matched by the format specifier. Do not use dot composition as a substitute for supplying another argument.
+The parser turns `p[i]` into the reserved index intrinsic. The direct code generator emits a typed C indexing/dereference expression after it has established the base's pointer representation and inferred pointee information. For a pointer with a recovered C element type, indexing scales by that element type. For an opaque pointer, indexing is byte-addressed as `uint8_t` in the fallback path. For generated MAK algebraic-data-type pointers, a separate path indexes the generated C struct representation.
 
----
+The index expression must have an integer representation once checked. The base must be pointer-like, unless it is temporarily unresolved during analysis. An invalid known base or non-integer index can be rejected by the direct expression emitter.
 
-# 12. Readable MAK style rules
+### 48.5 Pointer subtraction is not necessarily byte-count subtraction
 
-These recommendations stay within the supplied syntax; they are style guidance rather than extra grammar requirements.
+The code generator distinguishes two situations for `p - q`:
 
-## 12.1 Prefer one declaration per line
+- If it has pointee metadata (or the pointer representation is a generated ADT pointer), it casts both operands to pointers to the known element C type and subtracts them. C pointer subtraction then returns an element count for pointers into the same array/object sequence.
+- If it only has opaque pointer representation and no pointer information, it converts addresses to integer-address representations and subtracts those addresses, yielding a raw address difference in the generated path. The unit is therefore effectively bytes, not a portable element count.
+
+Never compare results of these two modes as though they had identical units. The source syntax itself carries no operator-level annotation describing the unit. It depends on pointer-shape information recovered through the relevant external declaration or expression.
+
+### 48.6 No address-of operator or explicit unary dereference
+
+The unary-expression parser recognizes only `-`, `!`, and `~`. In particular:
+
+- `&x` is not address-of syntax. `&` is a binary bitwise operator and requires a left and right operand.
+- `*p` is not pointer dereference syntax. In an expression it is parsed as the binary multiplication operator when a left operand is present; a leading `*` is not an accepted prefix expression.
+- Use `p[i]` for indexed pointer reads. There is no equivalent of C's generic `*p` unary operator in the expression grammar.
+
+The source also has no explicit cast expression syntax such as `(u8*)p`, no `sizeof` keyword, no pointer literal, and no source-level `null` literal. A named value or foreign function has to supply pointer representations.
+
+### 48.7 Pointer arithmetic safety checklist
+
+Before using a pointer expression, verify all of the following outside the parser's mere syntax guarantee:
+
+1. The pointer is non-null if dereferenced.
+2. The pointer comes from a valid allocation/object with a lifetime that covers the read.
+3. The index/offset stays within the object or permitted one-past position.
+4. Arithmetic cannot overflow or wrap into a different allocation.
+5. A typed pointer's declared pointee shape matches the C object actually returned.
+6. A pointer returned by one foreign function is released by the allocator/deallocator required by its documented ABI.
+7. A pointer difference is computed only for pointers for which the relevant C pointer subtraction semantics are valid; the compiler's opaque-address fallback is not a substitute for a C object model proof.
+8. No memory writes are assumed from indexing: the source parser only supplies a read expression and does not define assignment syntax.
+
+### 48.8 Pointer arithmetic worked examples
 
 ```mak
-let add x y = x + y;
-let square x = x * x;
-let answer = add 20 22;
-
-square answer
+// For a foreign `u8*` binding: `p + 1` advances one byte.
+p + 1
 ```
 
-Avoid packing declarations into a single line while learning the language. A missing semicolon can otherwise make the diagnostic harder to interpret.
-
-## 12.2 Use semicolons consistently where they matter
-
-Always terminate top-level declarations, local let values, and `bring` declarations with semicolons. Put a semicolon after every `case` arm even though the parser permits some omitted separators.
-
 ```mak
-case result of {
-    Some x -> x;
-    None -> 0;
-}
+// For a foreign `i32*` binding: `p + 1` advances one i32 element.
+p + 1
 ```
 
-A final semicolon before a closing `}` is accepted in `case` and block bodies.
-
-## 12.3 Parenthesize application arguments that are not simple atoms
+The surface source is identical; the foreign declaration's shape determines the scaling. These snippets cannot be interpreted fully without knowing the foreign type associated with `p`.
 
 ```mak
-f (x + y)
-f (g x)
-printf "%d\n" (compute x)
+// Read element i through bracket indexing.
+p[i]
 ```
 
-A large percentage of difficult MAK expressions become clear once application and composition are explicitly parenthesized.
+```mak
+// Compute the pointer to element i, then read its value.
+(p + i)[0]
+```
 
-## 12.4 Use uppercase data constructors
+The latter uses both arithmetic and indexing. For a typed pointer, its offset scales by the known element C type. For an opaque `ptr`, the fallback uses bytes.
 
 ```mak
+// Integer-first addition is explicitly recognized.
+i + p
+```
+
+```mak
+// Pointer minus offset.
+p - i
+```
+
+```mak
+// Difference of pointer positions; unit depends on pointer metadata.
+end_ptr - start_ptr
+```
+
+Do not write `i - p`, `p * i`, `p / i`, or `p + q` expecting conventional C pointer arithmetic. The source/compiler does not define those as supported pointer-offset forms.
+
+## 49. Foreign declarations and C ABI boundaries
+
+### 49.1 Main declaration shape
+
+```mak
+let extern name : mak_type = "foreign_symbol" : foreign_type;
+```
+
+The `external` spelling is also accepted after `let`:
+
+```mak
+let external name : mak_type = "foreign_symbol" : foreign_type;
+```
+
+The `external` alternate is checked as an ordinary identifier's text in that position. `extern` is a reserved keyword.
+
+### 49.2 MAK-side type and foreign-side type are separate
+
+The optional type before `=` belongs to MAK's source-side declaration. The optional type after the quoted symbol belongs to the foreign/C-facing signature. The two are not the same grammar and have different purposes.
+
+```mak
+let extern puts : ptr -> i32 = "puts" : (ptr) -> i32;
+```
+
+This form is a syntax example, not a correct semantic signature for the standard C `puts`, which accepts a `const char *` and returns an `int`. The appropriate shape for a C string argument is more closely represented by `(ptr) -> i32` in this foreign grammar, but the source-side annotation also needs to agree with how the compiler treats strings/function calls in the installed runtime. Always validate the actual ABI against the real C declaration.
+
+### 49.3 Foreign atom types
+
+The foreign-type parser recognizes:
+
+`i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `f32`, `f64`, `ptr`, `void`, and arbitrary named identifiers.
+
+The parser also accepts pointer stars following a foreign atom or named type:
+
+```mak
+u8*
+i32*
+i32**
+u8***
+```
+
+Each `*` wraps another `PtrTo` layer in the parsed foreign type representation, preserving nested shape.
+
+### 49.4 Foreign function signatures
+
+```mak
+(i32) -> i32
+(i32, i32) -> i32
+(ptr, u64) -> ptr
+() -> i32
+(i32, ...) -> i32
+```
+
+The first parenthesized group is the comma-separated list of foreign arguments; `->` follows the closing `)` and introduces the return type. `...` is supported in an argument list as a variadic marker. A trailing comma is permitted in the argument list by the parser's loop behavior.
+
+Foreign function type arrows are parsed recursively on the return side, so nested return function types are syntactically representable. Whether a given foreign function-pointer shape can be emitted or called safely depends on later code generation and the target ABI.
+
+### 49.5 `global` external objects
+
+```mak
+let extern errno : i32 = global "errno" : i32;
+let extern raw_bytes : [u8] = global "raw_bytes" : u8*;
+```
+
+The soft identifier `global` immediately after `=` marks the declaration as a global object, not an ordinary function symbol. The string afterward is the linked symbol name. The C object's actual declaration and storage shape must match the generated external declaration. Do not declare a C array symbol when the generated interface expects a pointer variable, or vice versa, without accounting for the C-level declaration ABI.
+
+### 49.6 Descriptor blocks
+
+```mak
+let extern log_value : i32 -> i32 = "log_value" : (i32) -> i32 {
+    pure = false;
+    from = "stdint.h";
+    abi = "C";
+};
+```
+
+Descriptor blocks contain identifier keys, `=`, and descriptor values. `pure` is parsed specially as an identifier value. `from` and `abi` require quoted string values and populate dedicated fields. Other descriptor keys are accepted and their values are parsed as expressions, but do not acquire special behavior from the parser alone. A semicolon may follow each entry; the last entry may omit it. The external declaration still requires its terminating semicolon after the descriptor block.
+The shown C generator uses a `from` value to add a C header include: a value beginning with `<` or `"` is emitted after `#include` literally, while another value is wrapped in angle brackets. Thus `from = "stdio.h"` results in `#include <stdio.h>`; `from` is not a library-link directive by itself. The `abi` string is recorded as metadata by the parser; do not assume that the descriptor alone selects a compiler calling convention or validates the real ABI.
+
+Descriptor text records metadata; it does not automatically prove that a symbol exists, link a library by itself in every build mode, or validate ABI correctness. Inspect the build/link configuration and downstream compiler behavior before relying on `from` or `abi` metadata operationally.
+
+### 49.7 Foreign-call production checklist
+
+For each foreign declaration, verify:
+
+- The exact symbol name, including platform-specific spelling where relevant.
+- The C calling convention / ABI expected by the object and the target.
+- Argument count, order, representation, integer width, floating width, and variadic promotions.
+- Return type and whether the C function may return `void`.
+- Ownership: who allocates and who frees returned/received memory.
+- Nullability, bounds, alignment, encoding, and lifetime of every pointer.
+- Purity metadata only when the function truly has no observable side effects and can be safely treated as pure by optimization.
+- Whether a C global is an object, pointer object, array, thread-local value, or special macro (macros are not linkable symbols).
+
+## 50. User-defined types and constructor declarations
+
+### 50.1 Abstract/no-constructor declarations
+
+```mak
+type Opaque;
+type Handle state;
+```
+
+The semicolon ends the type declaration. The identifiers after the type name are type parameters in the declaration grammar. The parser stores a type declaration with no constructors.
+
+### 50.2 Algebraic data type declarations
+
+```mak
+type Maybe a {
+    None;
+    Some a;
+};
+
 type Result value error {
     Ok value;
     Error error;
 };
 ```
 
-This makes constructor declarations agree with pattern parsing's uppercase convention. Use lowercase identifiers for ordinary bindings:
+After the type name, consecutive identifiers before `{` are stored as type parameter names. Within the braces, each constructor starts with an identifier and is followed by zero or more type expressions until `;` or `}`. A constructor may omit its final semicolon when it is immediately followed by the closing brace. The type declaration itself requires `;` after `}`.
+
+Constructor names conventionally begin uppercase because the pattern parser uses that capitalization to classify constructor patterns. Keep constructor naming consistent across declarations, expressions, and patterns.
+
+### 50.3 Constructor fields are types, not source argument names
+
+In:
 
 ```mak
-case result of {
-    Ok value -> value;
-    Error problem -> fallback problem;
+type Node {
+    Node i64 Node;
+};
+```
+
+the tokens after `Node` in the declaration are parsed as field types (`i64`, `Node`), not as parameter names. In contrast, in an expression/pattern:
+
+```mak
+Node count child
+```
+
+`count` and `child` are expression values or subpatterns. The same surface identifier position means different things according to syntactic context.
+
+### 50.4 Parameterized type use
+
+Type application is parenthesized with the named constructor first:
+
+```mak
+(List u8)
+(Result (List u8) i32)
+(Tree key value)
+```
+
+A bare `List u8` is not the accepted type-application spelling in the type parser. Parenthesized type application requires the head to parse as a named type. For example, the parser reports a specific error when the head is a non-named type such as an array type.
+A further implementation boundary: while reading arguments inside a parenthesized type application, the parser accepts type-atom starters `identifier`, `(`, and `[`, but not a bare `!` token as the next type argument. Use a parenthesized form such as `(!)` if a bottom type must occupy a type-application argument position. Arguments that are function types should similarly be parenthesized so the application grammar sees them as one type atom.
+
+## 51. Type grammar: all accepted source forms
+
+The parser implements the following shape, with arrow recursion on the right:
+
+```ebnf
+type       ::= type-atom [ "->" type ]
+type-atom  ::= primitive-or-named-identifier
+             | "[" type "]"
+             | "("")"
+             | "(" type ")"
+             | "(" type "," type { "," type } ")"
+             | "(" named-type type-atom { type-atom } ")"
+             | "!"
+```
+
+Examples:
+
+```mak
+u8
+i64
+f64
+MyType
+[u8]
+[[i32]]
+()
+(i32)
+(i32, u8)
+(i32, u8, f64)
+i32 -> i32
+u8 -> u64 -> f64
+(i32 -> i32) -> i32
+(List u8)
+(Result (List u8) i32)
+!
+```
+
+Important exact boundaries:
+
+- `(T)` is grouping of a type, not a one-element tuple type.
+- `(T, U)` starts a tuple type. It requires a second type after the first comma; a one-element `(T,)` form is not accepted.
+- `()` is the unit type in a type expression, even though `()` is not a standalone ordinary expression.
+- `[T]` is a type form. It is not an array constructor or array literal.
+- `A -> B -> C` parses as `A -> (B -> C)` because the right side calls the full type parser recursively.
+- `(A -> B) -> C` requires parentheses around the function type on the left.
+- `!` is parsed as a bottom-type form.
+- The primitive spellings are recognized by identifier text. There is no separate lexical keyword token for primitive types.
+- Any other identifier can be a named type, including `ptr`; in MAK-side syntax `ptr` is not special in the way it is in foreign types.
+
+## 52. Pattern matching: precise behavior
+
+### 52.1 Scrutinee and arms
+
+```mak
+case scrutinee of {
+    pattern -> body;
+    other_pattern => other_body
 }
 ```
 
-## 12.5 Keep foreign declarations explicit
+The parser requires the keyword `of` after the scrutinee, then `{`, then zero or more arms, then `}`. Each arm requires a pattern followed by `->` or `=>`, then a body expression. The semicolon after an arm is optional.
+
+### 52.2 Supported pattern forms
+
+| Pattern | Parser behavior |
+|---|---|
+| `_` | Wildcard, no binding name |
+| `x` | Lowercase/non-uppercase identifier binds a value |
+| `0` | Unsigned integer literal pattern |
+| `"x"` | String literal pattern |
+| `Some x` | Uppercase constructor and one subpattern |
+| `Node left right` | Uppercase constructor and two subpatterns |
+| `()` | Empty tuple pattern node |
+| `(x)` | Parenthesized pattern, returned as `x` |
+| `(x, y)` | Tuple pattern with two entries |
+| `(x, y, z)` | Tuple pattern with three entries |
+
+Floating-point patterns are not supported. A pattern such as `x + 1` is not a pattern expression. There is no range pattern, alias pattern (`name @ pattern`), guard clause, type annotation pattern, or arbitrary nested operator syntax in the pattern grammar.
+
+### 52.3 Constructor classification uses first-byte capitalization
+
+For an identifier pattern, the parser checks whether the first byte is ASCII uppercase. If it is, the parser consumes subsequent pattern atoms as that constructor's arguments. Otherwise, it creates a variable binding. `_` is recognized specially as wildcard.
+
+As a consequence, constructor naming is syntactically meaningful:
 
 ```mak
-let external puts : ptr -> i32 = "puts" : (ptr) -> i32 {
-    from = "<stdio.h>";
+Some value    // constructor pattern with one subpattern
+some          // ordinary binding pattern
+_             // wildcard
+```
+
+### 52.4 Constructor subpattern greediness
+
+The constructor parser keeps consuming following pattern atoms as constructor arguments while `starts_atom()` is true. Parenthesize nested tuple patterns and be deliberate about arm boundaries when writing constructor patterns. The arrow token ends the constructor argument sequence because it is not a pattern atom.
+
+### 52.5 Exhaustiveness is not a grammar property
+
+The parser accepts the shape of a case expression; coverage, constructor arity, representation compatibility, and later pattern lowering are separate analysis/compiler responsibilities. Include a fallback wildcard when appropriate, but do not assume every case lacking `_` is automatically rejected or automatically safe—the answer depends on the later passes and actual subject type.
+
+## 53. Blocks: result values and sequencing
+
+A block is a braced sequence of expressions separated by semicolons, optionally ending in an expression without a semicolon. The final expression is the block result. When the block is empty, the parser represents it as integer zero. If a one-expression block closes after the semicolon, the parser's block-building logic returns that prior expression as the resulting expression kind rather than always retaining a distinct block node.
+
+```mak
+{
+    first;
+    second;
+    final_value
+}
+```
+
+Use semicolons for sequencing, not indentation. The block parser has a special local-binding path for `let`; the binding scopes over the remaining block contents.
+
+No loop construct is present in the parser. A block is not a loop. It does not repeat its statements, and a semicolon does not change evaluation into an imperative assignment statement.
+
+## 54. Operator reference: semantics at three layers
+
+### 54.1 Syntax-layer table
+
+| Operator | Syntactic category | Binding/association |
+|---|---|---|
+| `x[i]` | Postfix indexing | Tightest postfix form; chains leftward |
+| `f x` | Implicit application | Recognized before infix operators |
+| `()` after a callee | Special empty call | Recognized before infix operators |
+| `-x` | Prefix unary | Operand can include application; stops before composition and other infix operators |
+| `!x` | Prefix unary | Same prefix binding behavior |
+| `~x` | Prefix unary | Same prefix binding behavior |
+| `.` | Composition | Binding power 9/9; right-associative |
+| `* / %` | Multiplicative | 7/8; left-associative |
+| `+ -` | Additive | 6/7; left-associative |
+| `<< >>` | Shifts | 5/6; left-associative |
+| `& ^ |` | Bitwise | 4/5; left-associative at the same precedence level in this parser table |
+| `== /= < > <= >=` | Comparisons | 3/4; left-associative syntactically |
+| `&&` | Logical AND | 2/3; left-associative |
+| `||` | Logical OR | 1/2; left-associative |
+
+### 54.2 Meaning can depend on representation
+
+The operator token is parsed before the compiler knows the final integer width, pointer shape, or inferred representation. The same `+` token can become numeric addition or a recognized pointer offset. Similarly, `%` is a remainder operation and should be used with integer-like operands when integer remainder semantics are desired. Do not rely on operator spelling alone to establish a static type that the expression grammar itself does not encode.
+
+### 54.3 Comparison chains are not mathematical chain syntax
+
+Because the parser places `==`, `/=`, `<`, `>`, `<=`, and `>=` at one precedence level with left association, an expression such as:
+
+```mak
+a < b < c
+```
+
+is grouped as:
+
+```mak
+(a < b) < c
+```
+
+It is not a special mathematical range test. Use explicit conjunction and parenthesized comparisons for clarity:
+
+```mak
+(a < b) && (b < c)
+```
+
+Whether the latter's operands have compatible representations is then checked/lowered separately.
+
+### 54.4 Avoid relying on side-effect order without checking code generation
+
+The parser determines structural grouping, but evaluation order, short-circuit behavior, and optimization depend on the compiler's lowering of the particular expression. The generated direct C path emits `&&` and `||` as C logical operators in the corresponding paths, which generally short-circuit in C. Other optimized or interpreted paths may have separate implementations. For side-effecting foreign calls, prefer explicit sequencing in a block rather than using evaluation order hidden inside arithmetic or comparisons.
+
+## 55. Unsupported syntax: definitive checklist from the parser
+
+The expression/type/declaration parser has no ordinary production for the following forms. Some related syntax may be accepted in another context; that does not make the listed form a feature.
+
+| Unsupported form | Closest supported syntax or explanation |
+|---|---|
+| `if condition then a else b` | Use `case` on a condition result or a user-defined representation; no `if` keyword production exists |
+| `while`, `for`, `loop` | No loop grammar; recursion or a runtime helper must provide repetition |
+| `switch` | Use `case` for pattern matching |
+| `x = y` as assignment | `=` is used in bindings/declarations; no assignment-expression production |
+| `x += y` | No compound assignment tokens |
+| `x != y` | Use `/=` for not-equal |
+| `array = [1, 2, 3]` | No array literal production |
+| `(a, b)` as tuple value | Parentheses group one expression; comma tuples exist in type/pattern grammar, not value expression grammar |
+| `()` as unit expression | `()` is recognized as special call syntax only after a callee, and as unit in type/pattern contexts |
+| `object.field` | Dot is function composition |
+| `*pointer` unary dereference | No unary-star production; use supported indexing `pointer[0]` |
+| `&value` address-of | Ampersand is binary bitwise AND, not address-of |
+| `value as Type` | No cast expression production |
+| `x : Type` expression annotation | No general expression type-annotation production |
+| `fn (x : i32) -> ...` | Function parameters are identifier names only |
+| `f(a, b)` | Calls take arguments by juxtaposition: `f a b` |
+| `f(key = value)` | No named-argument syntax |
+| `x?` / optional chaining | No postfix question-mark grammar |
+| `x ?? fallback` | No null-coalescing token/production |
+| `...` in normal expression | Ellipsis is only collected as a foreign variadic marker in the foreign function type parser |
+| `case 1.0 of { ... }` with a float pattern | Float literal patterns are not accepted |
+| `name @ pattern` | No alias-pattern form |
+| type-level C stars in ordinary MAK `type` syntax | Stars are recognized in `foreign_ty`, not `ty_atom` |
+| `bring module as alias;` | Bring accepts one or more string paths only |
+| `import { x } from "file";` | No imported-name list form |
+| optional top-level declaration semicolon | Every ordinary top-level `let`, `type`, and `bring` declaration requires its semicolon |
+| semicolon after final program expression | Parser expects EOF after its one final expression |
+
+## 56. Error-oriented examples: read the diagnostic as a grammar boundary
+
+These intentionally invalid examples are included to make the grammar limits explicit. Do not paste them into a valid source file unchanged.
+
+### 56.1 Missing declaration semicolon
+
+```mak
+let x = 1
+x
+```
+
+The top-level binding grammar requires `;` after the bound expression. A newline does not replace it.
+
+### 56.2 Unsupported array literal
+
+```mak
+[1, 2, 3]
+```
+
+An expression atom cannot begin with `[`. Square brackets form an array type when the type parser is active, or an index suffix following an expression in expression parsing.
+
+### 56.3 Unsupported comma-separated call
+
+```mak
+sum(1, 2)
+```
+
+The parser sees `sum` and an opening parenthesis as an argument atom; expression parentheses accept one expression, and comma is not a source-call separator. Use `sum 1 2` when the function is declared to take two parameters.
+
+### 56.4 Unsupported member syntax
+
+```mak
+record.field
+```
+
+The dot token is parsed as composition, so it tries to compose the left and right expressions. It does not look up a record member.
+
+### 56.5 Unsupported expression tuple
+
+```mak
+let pair = (left, right);
+```
+
+The ordinary expression parser does not have comma tuples. Tuple types and tuple patterns do not imply tuple values can be constructed with the same comma syntax.
+
+### 56.6 Unsupported unary pointer operators
+
+```mak
+*p
+&x
+```
+
+Neither is parsed as a C-style pointer operator. A leading `*` is not a recognized prefix operator; `&` is a binary token. Use a pointer supplied by a foreign interface and read through a valid `p[index]` form when the representation is supported.
+
+## 57. Production-quality source habits for this grammar
+
+1. Use spaces in application and immediately-called lambdas: write `(\x -> x * x) 7` rather than the harder-to-scan `(\x -> x * x)7`.
+2. Parenthesize composition intentionally: prefer `(f . g) x` for applying a composition, and `f . (g x)` when that is the intended right operand.
+3. Keep top-level `let`, `type`, and `bring` declarations each on a semicolon-terminated statement.
+4. Use `case` explicitly rather than assuming conventional `if` syntax exists.
+5. Use the constructor capitalization consistently because parser classification relies on capitalization.
+6. Treat raw pointer values as foreign capabilities. The compiler does not infer allocation ownership from `ptr`.
+7. Specify typed foreign pointers when the C interface truly returns a pointer to a known element type; use opaque `ptr` when the pointee is genuinely opaque.
+8. For effectful calls, sequence them visibly in a block rather than hiding them in operand expressions.
+9. Validate FFI signatures against the platform's C headers and build/link options.
+10. Keep parser conformance separate from semantic testing; a successfully parsed program can still have a wrong ABI or unsafe memory access.
+
+## 58. Integrated systems-style sample: one source file exercising the language surface
+
+This is a deliberately broad integration sample, not a claim that MAK has C's entire syntax. It uses the documented syntax in one module: top-level bindings, a parameterized data type, external functions and a global pointer, descriptor metadata, function declarations, inline lambdas and immediate invocation, composition, local bindings, blocks, case patterns, indexing, pointer offsets/subtraction, numeric and bitwise operators, comparisons, logical operators, string/numeric literals, nested type forms in a type-only declaration, and comments.
+
+The example intentionally does **not** pretend unsupported forms exist: it does not use `if`, loops, assignment, array literals, tuple-expression construction, field access, unary pointer dereference, or address-of.
+
+```mak
+// All source declarations needed by this single module are local; the C helper
+// is supplied by the companion C translation unit below.
+
+// A parameterized algebraic data type, with a nullary constructor and two
+// unary constructors. Constructor capitalization is significant in patterns.
+type Result value error {
+    Ok value;
+    Error error;
+};
+
+// An opaque declaration: no constructor body is declared here.
+type RuntimeHandle state;
+
+// A nested parameterized type field documents a buffer-result shape.
+// The declaration introduces a constructor; it does not construct a value.
+type BufferEnvelope {
+    BufferEnvelope (Result [u8] i32);
+};
+
+// Standard C symbol. Check the target platform's real declaration and ABI.
+let extern putchar : i32 -> i32 = "putchar" : (i32) -> i32 {
     pure = false;
+    from = "stdio.h";
+    abi = "C";
+};
+
+// A C global variable named `sample_bytes` whose object value is a u8*.
+// The matching C shim below defines it as a pointer variable.
+let extern sample_bytes : [u8] = global "sample_bytes" : u8*;
+
+// An opaque pointer example. `ptr` has no pointee shape in the foreign type.
+let extern opaque_bytes : ptr = global "opaque_bytes" : ptr;
+
+// A pointer-taking C function. Its real C implementation is supplied in the
+// companion-shim example after this block; the signature is only a declaration.
+let extern c_byte_count : ptr -> u64 = "c_byte_count" : (ptr) -> u64 {
+    pure = true;
+    from = "stdint.h";
+    abi = "C";
+};
+
+// Arithmetic and bitwise operators with integer-like arguments.
+let negate x = -x;
+let logical_not x = !x;
+let float_probe x = (x + 0.5) * 2.0;
+let normalize_byte x = (x % 256 + 256) % 256;
+let mix_bits x = ((x << 1) | (x >> 1)) ^ 0x5a;
+let keep_low_bits x = x & ~0xff00;
+
+// All numeric operator categories shown explicitly. This helper assumes its
+// inputs are compatible integers; it is an operator reference, not a parser
+// promise about a particular inferred machine width.
+let arithmetic_probe a b = {
+    let add = a + b;
+    let sub = a - b;
+    let mul = a * b;
+    let div = a / b;
+    let rem = a % b;
+    let left_shift = a << b;
+    let right_shift = a >> b;
+    let bit_and = a & b;
+    let bit_xor = a ^ b;
+    let bit_or = a | b;
+    // Comparisons, not-equal, and logical operators.
+    let eq_flag = add == sub;
+    let ne_flag = add /= sub;
+    let lt_flag = add < mul;
+    let gt_flag = div > rem;
+    let le_flag = add <= mul;
+    let ge_flag = add >= mul;
+    let logical_and = (eq_flag == 1) && (ne_flag == 1);
+    let logical_or = (lt_flag == 1) || (gt_flag == 1);
+    // Use the computed names in a result so the block has a final value.
+    (bit_and ^ bit_xor ^ bit_or) + (left_shift - right_shift)
+};
+
+// Inline lambda, named lambda, multi-parameter lambda, immediate invocation,
+// and normal application are all demonstrated here.
+let square = fn x -> x * x;
+let increment = \x => x + 1;
+let square_after_increment = square . increment;
+let immediate_square = (\x -> x * x) 12;
+let immediate_add = (fn (x, y) -> x + y) 20 22;
+let composed_result = square_after_increment 4;
+
+// Application and composition are intentionally kept separate:
+// `transform value` calls transform; `transform . transform` builds a function.
+let transform x = normalize_byte (mix_bits x);
+let transform_twice = transform . transform;
+
+// Recursively walk a foreign byte pointer. The base case is expressed with
+// case rather than a nonexistent `if`. The pointer comes from a C shim and
+// must point to at least `remaining` readable bytes.
+let checksum_bytes p remaining =
+    case remaining == 0 of {
+        1 -> 0;
+        _ -> (p[0] + checksum_bytes (p + 1) (remaining - 1)) % 65521
+    };
+
+// Validate an integer range without a conditional keyword.
+let validate_byte x =
+    case (x >= 0) && (x < 256) of {
+        1 -> Ok x;
+        _ -> Error 1
+    };
+
+// A consumer of Result uses constructor patterns, a binding pattern, a
+// literal pattern, and wildcard fallback. The outer `case` is a data match;
+// the inner cases interpret the integer flags produced by comparisons.
+let render_status result =
+    case result of {
+        Ok x -> case x == 0 of {
+            1 => putchar 48;
+            _ -> putchar 49
+        };
+        Error code -> case code of {
+            0 -> putchar 69;
+            1 -> putchar 33;
+            _ -> putchar 63
+        }
+    };
+
+// Explicitly show typed versus opaque pointer stepping and pointer subtraction.
+// For sample_bytes (u8*), +1 is one byte. For opaque_bytes (ptr), +1 uses the
+// compiler's byte-addressed fallback. `opaque_bytes[index]` is a read.
+let inspect_pointers index = {
+    let typed_start = sample_bytes;
+    let typed_next = typed_start + index;
+    let typed_byte = typed_next[0];
+    let opaque_start = opaque_bytes;
+    let opaque_next = 1 + opaque_start;
+    let opaque_byte = opaque_next[0];
+    let typed_difference = typed_next - typed_start;
+    let opaque_difference = opaque_next - opaque_start;
+    normalize_byte (typed_byte + opaque_byte + typed_difference + opaque_difference)
+};
+
+// A pattern-only reference for tuple patterns. Since the expression grammar
+// has no ordinary tuple literal, `pair_value` must come from a real compatible
+// source/FFI binding in a project before this branch is used.
+let unpack_pair pair_value =
+    case pair_value of {
+        (left, right) -> left + right;
+        _ -> 0
+    };
+
+// Zero-argument functions use empty parameter parentheses and are called with
+// the special `function()` syntax, not `function ()`.
+let report_one_digit = fn () -> {
+    let count = c_byte_count sample_bytes;
+    let check = checksum_bytes sample_bytes count;
+    let transformed = transform_twice check;
+    let normalized = normalize_byte transformed;
+    // ASCII '0' is 48; one decimal digit is enough for a minimal smoke test.
+    putchar (48 + normalized % 10)
+};
+
+// The entrypoint name is recognized by the compiler's function discovery.
+// Its body sequences work in a block and returns the last expression value.
+let main = fn () -> {
+    let _banner = "MAK syntax tour\n";
+    let _float_demo = float_probe 1.25;
+    let _negative_demo = negate 8;
+    let _not_demo = logical_not 0;
+    let sample_count = c_byte_count sample_bytes;
+    let first = sample_bytes[0];
+    let next_pointer = sample_bytes + 1;
+    let second = next_pointer[0];
+    let gap = next_pointer - sample_bytes;
+    let raw_result = validate_byte (first + second + gap);
+    let _arithmetic = arithmetic_probe first second;
+    let _pointer_probe = inspect_pointers 1;
+    let _pattern_probe = render_status raw_result;
+    let _pair_demo = immediate_add;
+    let _composition_demo = composed_result;
+    let _lambda_demo = immediate_square;
+    let _transform_demo = transform_twice sample_count;
+    report_one_digit()
 };
 ```
 
-Use the actual linked symbol name, actual header, and accurate argument/return types. Mark a function pure only when that assertion is true. Keep every descriptor on a separate line and terminate every descriptor with a semicolon.
+### 58.1 Companion C-side contract for the integration sample
 
-## 12.6 Do not rely on parser recovery quirks
+The source above declares C symbols; it does not define them. The following is an illustrative C companion that defines the two global pointer variables and the helper function. Integrate it only after validating your compiler's emitted declarations against the target's ABI and build setup.
 
-Avoid malformed numeric literals, unknown FFI descriptor keys, invalid `\x` escapes, lowercase constructor patterns, `[]` as a pretend array, or malformed variadic signatures. If a malformed form happens to be tokenized or parsed, that does not make it a supported language feature.
+```c
+#include <stdint.h>
+#include <stddef.h>
 
-## 12.7 Test one language feature at a time
+static uint8_t sample_storage[] = { 3, 7, 11, 19, 23 };
+uint8_t *sample_bytes = sample_storage;
 
-For new syntax, create a minimal standalone file and record:
+static uint8_t opaque_storage[] = { 41, 43, 47, 53 };
+const void *opaque_bytes = opaque_storage;
 
-- Whether the parser accepts it.
-- The result you expect.
-- The result actually produced by the exact compiler build.
-- Whether the generated C matches the intended meaning.
-
-For example, test a one-argument function application separately from dot composition, and test an external function's correct format argument separately from a variadic integer argument. These small programs are easier to debug than a large example that combines many features.
-
----
-
-# 13. Common mistakes and their corrections
-
-| Mistake | Why it is wrong or surprising | Safer form |
-|---|---|---|
-| `printf "%d\n" . value` | Dot composes functions; it does not append an argument | `printf "%d\n" value` |
-| `printf 16` | `printf` interprets its first argument as a format-string pointer | `printf "%d\n" 16` |
-| `f x + y` when you intend `f (x+y)` | Application binds more tightly than addition | `f (x + y)` |
-| `f . (g x)` when both `f` and `g` are meant to be functions | The right expression becomes a value applied to the new composition parameter | `f . g`, or write the intended function explicitly |
-| `!=` | Not-equal is spelled `/=` | `a /= b` |
-| `()` as a value | Standalone empty parentheses are not an expression atom | Return/use a value the language currently supports; use `()` only as a type or after a callee for zero-arg application |
-| `[1, 2, 3]` | Non-empty array literals are unsupported | Use a supported ADT or an explicitly designed FFI allocation API |
-| `(x, y)` as a computed tuple | Tuple expressions are unsupported | Use an ADT with fields or another documented representation |
-| `pass` as a no-op | It is tokenized but has no parser rule | Use a supported block/body expression |
-| `type option { some a; };` followed by `some x` | Lowercase `some` is parsed as a binding pattern | Rename the constructor `Some` |
-| `let x: i32 = 1;` | Ordinary `let` has no type-ascription syntax | Let inference determine the representation, or express type information in a supported context |
-| `bring "file.mak"` without `;` | The import declaration requires a terminator | `bring "file.mak";` |
-| `type Color { Red; Green; }` without trailing `;` | A type with a body requires `;` after `}` | `type Color { Red; Green; };` |
-| A `case` arm body immediately followed by another arm without a separator | The next arm's first token may be absorbed into application | Terminate each arm with `;` |
-| `pure = "true";` | `pure` expects an identifier, not a string | `pure = true;` |
-| `from = stdio;` | `from` expects a string literal | `from = "<stdio.h>";` |
-| `i32**` as a foreign type | Only one pointer star suffix is parsed | Declare a C wrapper with a simpler supported signature when multiple indirections are required |
-| `1.` or `.5` as float syntax | Decimal points require digits on both sides in the forms recognized | `1.0` and `0.5` |
-| `1e+` as a valid exponent | The current conversion fallback may turn malformed input into `0.0` | Supply exponent digits, e.g. `1e+3` |
-
----
-
-# 14. Worked examples
-
-These examples illustrate the syntax forms rather than define a standard library. Names such as `print`, `fallback`, or `compute` work only if the program provides them or imports them.
-
-## 14.1 Arithmetic and precedence
-
-```mak
-let square x = x * x;
-let result = 2 + 3 * 4;
-
-square result
-```
-
-`3 * 4` groups before addition, so `result` is intended to be `14`; the final expression applies `square` to that value.
-
-## 14.2 Lambda and application
-
-```mak
-let twice = fn x -> x * 2;
-
-twice (10 + 11)
-```
-
-The explicit parentheses force the sum to be the one argument.
-
-## 14.3 Local values
-
-```mak
-let base = 10;
-let incremented = base + 1;
-incremented * 2
-```
-
-Each local `let` expression has a value expression followed by `;` and then a body expression.
-
-## 14.4 Blocks with a value at the end
-
-```mak
-{
-    let first = 3;
-    let second = 4;
-    first * first + second * second
+uint64_t c_byte_count(const void *p) {
+    (void)p;
+    return (uint64_t)sizeof sample_storage;
 }
 ```
 
-The last expression is the block's result. The local lets each end their value with a semicolon.
+**Integration caveats:** `opaque_bytes` is declared from MAK as a global foreign `ptr`; the code-generation declaration must match the C object's actual pointer type. `c_byte_count` returns the sample storage length regardless of its input because it is just a compact example of a linked helper; in a real library the function contract should be explicit. The recursive checksum assumes its pointer is readable for the requested count. `unpack_pair` demonstrates grammar for tuple patterns, but requires a real compatible tuple-valued binding to be useful; because MAK has no tuple-expression literal, this helper is intentionally an isolated pattern example. Before calling a sample *production-grade*, add tests, error handling, bounds checks, build integration, and verified C headers. The sample is comprehensive as a syntax tour, not a substitute for those engineering steps.
 
-## 14.5 ADT declarations and case patterns
+## 59. Syntax-review checklist for code review
 
-```mak
-type Maybe a {
-    None;
-    Some a;
-};
+Use this checklist when reviewing a large MAK source file.
 
-let get_or_zero value = case value of {
-    Some n -> n;
-    None -> 0;
-};
+### File shape
 
-get_or_zero (Some 42)
-```
+- [ ] Every ordinary top-level declaration begins with `let`, `type`, or `bring`.
+- [ ] Every ordinary top-level declaration ends with `;`.
+- [ ] There is at most one bare final program-body expression.
+- [ ] The final body expression has no trailing top-level semicolon.
 
-The example demonstrates the intended surface shape for an algebraic data type, construction, and pattern matching. Whether the exact generic ADT example is fully supported by a particular MAK backend revision should be verified in the actual compiler; the parser's type grammar alone does not guarantee complete generic representation support.
+### Names and tokens
 
-## 14.6 Nested constructor patterns
+- [ ] Identifiers use ASCII letters/underscore initially, then ASCII letters/digits/underscore.
+- [ ] Keyword spelling and capitalization are correct.
+- [ ] Constructor-pattern identifiers start uppercase; binding-pattern identifiers start lowercase where possible.
+- [ ] Not-equal is `/=`, not `!=`.
+- [ ] Dot is composition, not member access.
 
-```mak
-case input of {
-    Cons first (Cons second rest) -> first + second;
-    Cons only rest -> only;
-    Nil -> 0;
-}
-```
+### Expressions
 
-Constructor patterns use adjacent subpatterns. Parentheses make nested arguments explicit and reduce ambiguity.
+- [ ] Function arguments use juxtaposition, not commas.
+- [ ] Parentheses are used for grouping, not assumed tuple-value construction.
+- [ ] Inline lambdas are parenthesized before immediate application.
+- [ ] Composition is parenthesized where application grouping might be ambiguous.
+- [ ] Every index expression is nonempty and integer-like.
+- [ ] Unary operators are only `-`, `!`, and `~`.
+- [ ] There is no reliance on absent assignment, `if`, or loop syntax.
 
-## 14.7 Composition of functions
+### Types and constructors
 
-```mak
-let increment x = x + 1;
-let double x = x * 2;
+- [ ] Type applications use parenthesized forms such as `(List u8)`.
+- [ ] Tuple types have at least two members; `()` is unit type.
+- [ ] Array type notation `[T]` is not mistaken for an array literal.
+- [ ] Function arrows are read right-associatively.
+- [ ] Constructor declaration fields are types, not value parameters.
 
-increment . double
-```
+### Foreign interface and pointers
 
-The final expression is a composed function value. To calculate a result from input `21`, apply the composed function explicitly:
+- [ ] Each external foreign type matches the real foreign declaration.
+- [ ] `global` declarations match the C object type exactly.
+- [ ] The pointer star depth matches the actual C pointer depth.
+- [ ] Typed pointer arithmetic uses a pointer with correct pointee metadata.
+- [ ] Opaque `ptr` offsets are treated as byte offsets.
+- [ ] Every pointer's lifetime, bounds, alignment, nullability, and ownership are documented.
+- [ ] No code assumes indexing syntax can assign to an element.
+- [ ] Pointer difference units are known for the pointer type in question.
 
-```mak
-(increment . double) 21
-```
+## 60. Final rule of interpretation
 
-This is different from using dot after a call that has already produced a number.
+The safest way to understand any MAK fragment is to read it in this order:
 
-## 14.8 External declaration and a formatted print call
+1. Tokenize the characters and comments.
+2. Apply the grammar for the current context (top-level declaration, expression, type, foreign type, or pattern).
+3. Apply the parser's binding rules to determine grouping.
+4. Apply name lookup, function arity resolution, representation inference, and type/pointer metadata analysis.
+5. Inspect code generation and runtime/foreign contracts for observable behavior.
 
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-
-printf "%d\n" ((\x -> x * x) 4)
-```
-
-The call has a format string as its first argument. The arithmetic lambda is applied to `4`; the intended computed value is `16`, supplied as the second argument.
-
-This example relies on the foreign declaration being accurate for the target C environment. Foreign declarations should always be checked against the actual system prototype and target ABI.
-
-## 14.9 Imports
-
-```mak
-bring "numbers.mak" "formatting.mak";
-
-format_number (double_value 21)
-```
-
-The imported files need to define the names used below the declarations. The root file's body remains the expression following its own declarations.
+Do not jump from familiar-looking punctuation directly to familiar language semantics. MAK deliberately reuses characters such as `.`, `*`, `&`, `()`, and `[]` in a smaller or context-dependent grammar. The parser and code generator are the source of truth for what each form means.
 
 ---
 
-# 15. Accepted syntax versus semantic guarantees
+# Appendix A — Exhaustive parser-grouping gallery
 
-MAK's parser can accept a source shape even when a later phase cannot safely interpret it. This is especially important for a language whose backend has an FFI boundary and inferred representations.
+The gallery below is a syntax conformance catalogue, not a collection of type-checked programs. Its identifiers (`a`, `b`, `c`, `d`) are placeholders. Each example demonstrates how the parser groups a sequence of infix operators according to the current Pratt binding powers. Since each individual operator combination might be semantically ill-typed for arbitrary values, the guaranteed claim is the **syntactic grouping** only.
 
-| Feature | What syntax acceptance establishes | What it does not establish |
-|---|---|---|
-| Ordinary `let` | A binding name, value expression, and terminator were parsed | That every later type/representation choice is sound |
-| Type declaration | A named type and constructor forms were parsed | That every generic/nested type gets a correct C layout |
-| Constructor pattern | A constructor-shaped pattern and its subpatterns were parsed | That the constructor name/arity resolves to a valid declared constructor |
-| Function application | A callee expression and argument expressions were grouped | That the callee is actually callable or arity/type-compatible |
-| Function composition | A composition-shaped expression was desugared to a lambda | That both expressions are functions or that applying them is meaningful |
-| External declaration | MAK-side and optional foreign signature syntax was parsed | That the real foreign symbol has that signature or that calls are safe |
-| Variadic type | An ellipsis marker was parsed | That the C ABI, default argument promotions, or format string are correct |
-| `pure = true` | The descriptor flag was set | That the external function is genuinely pure; the programmer must ensure it |
-| Array type | The type form `[T]` was parsed | That an array value literal or complete array runtime is available |
-| `[]` | The parser emitted integer zero | That an array was created |
-| `()` | Depending on context, a unit type or zero-argument application token sequence was parsed | That there is a unit literal value |
+The gallery deliberately includes repeated operators, mixed precedence, comparisons, logical operators, and composition. For the most reliable reading, verify every expression's parenthesized parse tree rather than relying on the usual precedence table of another language.
 
-This distinction is central to writing safe MAK. Parseability is only the first step. A good program must also have sensible source semantics, representable values, accurate foreign signatures, and verified behavior in the emitted executable.
 
----
+## Appendix A.1 — Four-operand infix parser matrix
+Every entry uses four atom placeholders separated by three infix tokens. The grouping is derived from the Pratt binding powers in the source parser. It is a syntax result, not a claim that the arbitrary values satisfy operator type requirements. Composition nodes are shown as `.` in the parenthesized tree to make their operator grouping visible; operationally, each dot is lowered to a unary composed function.
+### A1.0001 — `a <= b - c / d`
+- **Source:** `a <= b - c / d`
+- **Grouping:** `(a <= (b - (c / d)))`
 
-# 16. Source-derived reference checklist
+### A1.0002 — `a && b + c ^ d`
+- **Source:** `a && b + c ^ d`
+- **Grouping:** `(a && ((b + c) ^ d))`
 
-Use this checklist when adding or reviewing a MAK syntax feature. It is deliberately focused on the visible source language.
+### A1.0003 — `a % b > c == d`
+- **Source:** `a % b > c == d`
+- **Grouping:** `(((a % b) > c) == d)`
 
-## File structure
+### A1.0004 — `a ^ b || c - d`
+- **Source:** `a ^ b || c - d`
+- **Grouping:** `((a ^ b) || (c - d))`
 
-- [ ] Declarations precede the final body expression.
-- [ ] Top-level declarations use `let`, `type`, or `bring` as their starter.
-- [ ] A top-level ordinary `let` ends with `;`.
-- [ ] A type declaration with a body ends with `};`.
-- [ ] An external declaration ends with `;` after any descriptor block.
-- [ ] A `bring` declaration contains at least one string and ends with `;`.
-- [ ] There is no accidental trailing token or top-level semicolon after the final expression.
+### A1.0005 — `a / b - c <= d`
+- **Source:** `a / b - c <= d`
+- **Grouping:** `(((a / b) - c) <= d)`
 
-## Expressions
+### A1.0006 — `a & b || c & d`
+- **Source:** `a & b || c & d`
+- **Grouping:** `((a & b) || (c & d))`
 
-- [ ] Application arguments that contain operators are parenthesized.
-- [ ] Dot is used only when composing functions, not to pass another argument.
-- [ ] Each block has a clear final expression.
-- [ ] Each local `let` has a value, required semicolon, and body.
-- [ ] Every `case` arm uses `->` or `=>` and has a body expression.
-- [ ] `case` arms are separated with semicolons.
-- [ ] Prefix operators are parenthesized when their interaction with application is not obvious.
-- [ ] `==` and `/=` are used for equality and inequality; `=` is not used as an expression operator.
+### A1.0007 — `a > b & c % d`
+- **Source:** `a > b & c % d`
+- **Grouping:** `(a > (b & (c % d)))`
 
-## Patterns and types
+### A1.0008 — `a | b & c . d`
+- **Source:** `a | b & c . d`
+- **Grouping:** `((a | b) & (c . d))`
 
-- [ ] Constructor names start uppercase.
-- [ ] Constructor patterns use the declared field count.
-- [ ] Float and negative integer patterns have not been used.
-- [ ] Tuple types/patterns are not mistakenly used as tuple value literals.
-- [ ] Unit `()` appears only in type context or as an empty-call suffix after a callee.
-- [ ] Generic type application uses the parser's parenthesized type-application syntax where required.
+### A1.0009 — `a . b > c + d`
+- **Source:** `a . b > c + d`
+- **Grouping:** `((a . b) > (c + d))`
 
-## Foreign declarations
+### A1.0010 — `a < b & c || d`
+- **Source:** `a < b & c || d`
+- **Grouping:** `((a < (b & c)) || d)`
 
-- [ ] The linked symbol string is correct.
-- [ ] The MAK-side type is appropriate for source calls.
-- [ ] The foreign type matches the real prototype.
-- [ ] The `from` header is correct.
-- [ ] A variadic marker is last and follows the fixed arguments conventionally.
-- [ ] Integer values are not supplied where a pointer is required.
-- [ ] Every `printf` call begins with a format string.
-- [ ] `pure = true` is not applied to side-effecting functions.
-- [ ] Every descriptor entry ends with `;`.
+### A1.0011 — `a + b ^ c ^ d`
+- **Source:** `a + b ^ c ^ d`
+- **Grouping:** `(((a + b) ^ c) ^ d)`
 
----
+### A1.0012 — `a && b || c >= d`
+- **Source:** `a && b || c >= d`
+- **Grouping:** `((a && b) || (c >= d))`
 
-# 17. Minimal language examples for a syntax smoke test
+### A1.0013 — `a << b < c & d`
+- **Source:** `a << b < c & d`
+- **Grouping:** `((a << b) < (c & d))`
 
-These cases are useful for checking a MAK build after a parser change. Expected parsing follows the current source grammar; do not infer backend correctness from parse acceptance alone.
+### A1.0014 — `a - b % c <= d`
+- **Source:** `a - b % c <= d`
+- **Grouping:** `((a - (b % c)) <= d)`
 
-## 17.1 Literals and names
+### A1.0015 — `a && b >= c <= d`
+- **Source:** `a && b >= c <= d`
+- **Grouping:** `(a && ((b >= c) <= d))`
 
-```mak
-0
-```
+### A1.0016 — `a % b >= c || d`
+- **Source:** `a % b >= c || d`
+- **Grouping:** `(((a % b) >= c) || d)`
 
-```mak
-42
-```
+### A1.0017 — `a / b ^ c . d`
+- **Source:** `a / b ^ c . d`
+- **Grouping:** `((a / b) ^ (c . d))`
 
-```mak
-0x2a
-```
+### A1.0018 — `a <= b >> c >> d`
+- **Source:** `a <= b >> c >> d`
+- **Grouping:** `(a <= ((b >> c) >> d))`
 
-```mak
-0b101010
-```
+### A1.0019 — `a + b | c <= d`
+- **Source:** `a + b | c <= d`
+- **Grouping:** `(((a + b) | c) <= d)`
 
-```mak
-3.5
-```
+### A1.0020 — `a && b % c % d`
+- **Source:** `a && b % c % d`
+- **Grouping:** `(a && ((b % c) % d))`
 
-```mak
-"hello\nworld"
-```
+### A1.0021 — `a % b /= c / d`
+- **Source:** `a % b /= c / d`
+- **Grouping:** `((a % b) /= (c / d))`
 
-## 17.2 Application and grouping
+### A1.0022 — `a ^ b && c && d`
+- **Source:** `a ^ b && c && d`
+- **Grouping:** `(((a ^ b) && c) && d)`
 
-```mak
-let add x y = x + y;
-add 2 3
-```
+### A1.0023 — `a * b - c /= d`
+- **Source:** `a * b - c /= d`
+- **Grouping:** `(((a * b) - c) /= d)`
 
-```mak
-let add x y = x + y;
-add (1 + 2) (3 + 4)
-```
+### A1.0024 — `a > b >= c <= d`
+- **Source:** `a > b >= c <= d`
+- **Grouping:** `(((a > b) >= c) <= d)`
 
-## 17.3 Lambdas
+### A1.0025 — `a /= b * c || d`
+- **Source:** `a /= b * c || d`
+- **Grouping:** `((a /= (b * c)) || d)`
 
-```mak
-(fn x -> x + 1) 4
-```
+### A1.0026 — `a << b >= c <= d`
+- **Source:** `a << b >= c <= d`
+- **Grouping:** `(((a << b) >= c) <= d)`
 
-```mak
-(fn (x, y) -> x + y) 2 3
-```
+### A1.0027 — `a || b > c << d`
+- **Source:** `a || b > c << d`
+- **Grouping:** `(a || (b > (c << d)))`
 
-This second form demonstrates syntax only. Exact multi-argument behavior depends on how the implementation handles the function's arity and application shape.
+### A1.0028 — `a >= b /= c + d`
+- **Source:** `a >= b /= c + d`
+- **Grouping:** `((a >= b) /= (c + d))`
 
-## 17.4 Local `let`
+### A1.0029 — `a + b && c << d`
+- **Source:** `a + b && c << d`
+- **Grouping:** `((a + b) && (c << d))`
 
-```mak
-let x = 40;
-x + 2
-```
+### A1.0030 — `a - b ^ c | d`
+- **Source:** `a - b ^ c | d`
+- **Grouping:** `(((a - b) ^ c) | d)`
 
-## 17.5 Block
+### A1.0031 — `a * b == c + d`
+- **Source:** `a * b == c + d`
+- **Grouping:** `((a * b) == (c + d))`
 
-```mak
-{
-    1;
-    2;
-    3
-}
-```
+### A1.0032 — `a % b % c || d`
+- **Source:** `a % b % c || d`
+- **Grouping:** `(((a % b) % c) || d)`
 
-The final expression `3` is the block tail.
+### A1.0033 — `a & b / c && d`
+- **Source:** `a & b / c && d`
+- **Grouping:** `((a & (b / c)) && d)`
 
-## 17.6 Case
+### A1.0034 — `a || b && c - d`
+- **Source:** `a || b && c - d`
+- **Grouping:** `(a || (b && (c - d)))`
 
-```mak
-case 1 of {
-    0 -> 10;
-    1 -> 20;
-    _ -> 30;
-}
-```
+### A1.0035 — `a | b | c && d`
+- **Source:** `a | b | c && d`
+- **Grouping:** `(((a | b) | c) && d)`
 
-## 17.7 Composition
+### A1.0036 — `a - b * c . d`
+- **Source:** `a - b * c . d`
+- **Grouping:** `(a - (b * (c . d)))`
 
-```mak
-let increment x = x + 1;
-let double x = x * 2;
-(increment . double) 10
-```
+### A1.0037 — `a << b % c || d`
+- **Source:** `a << b % c || d`
+- **Grouping:** `((a << (b % c)) || d)`
 
-## 17.8 External declaration
+### A1.0038 — `a % b /= c /= d`
+- **Source:** `a % b /= c /= d`
+- **Grouping:** `(((a % b) /= c) /= d)`
 
-```mak
-let external printf : i32 = "printf" : (ptr, ...) -> i32 {
-    from = "<stdio.h>";
-};
-printf "%d\n" 42
-```
+### A1.0039 — `a ^ b && c >> d`
+- **Source:** `a ^ b && c >> d`
+- **Grouping:** `((a ^ b) && (c >> d))`
 
-This is the canonical format for the intended `printf` use in the examples covered by this document.
+### A1.0040 — `a + b ^ c / d`
+- **Source:** `a + b ^ c / d`
+- **Grouping:** `((a + b) ^ (c / d))`
 
----
+### A1.0041 — `a == b /= c <= d`
+- **Source:** `a == b /= c <= d`
+- **Grouping:** `(((a == b) /= c) <= d)`
 
-# 18. Known uncertainty and version boundary
+### A1.0042 — `a . b == c >> d`
+- **Source:** `a . b == c >> d`
+- **Grouping:** `((a . b) == (c >> d))`
 
-This reference is grounded in the supplied MAK source snapshot dated 10 October 2026. It describes the parser and AST visible in that snapshot; it is not yet a formally ratified language standard.
+### A1.0043 — `a | b == c * d`
+- **Source:** `a | b == c * d`
+- **Grouping:** `((a | b) == (c * d))`
 
-Several aspects must remain explicitly implementation-defined until the language author chooses and documents a stronger contract:
+### A1.0044 — `a <= b >> c + d`
+- **Source:** `a <= b >> c + d`
+- **Grouping:** `(a <= (b >> (c + d)))`
 
-1. Whether malformed integer prefixes and malformed floating-point exponents should be errors or retain the current permissive behavior.
-2. Whether unknown string escapes should be errors, preserve their slash, or continue dropping the slash.
-3. Whether descriptor keys other than `pure`, `from`, and `abi` should be rejected rather than parsed and discarded.
-4. Whether empty blocks and empty array brackets should continue producing integer zero or be replaced by distinct unit/array semantics.
-5. Whether the `unit` identifier should become an alias for `()` or remain a named type.
-6. Whether lowercase constructor declaration names should be rejected to align declarations with constructor-pattern parsing.
-7. Whether comma-omission in parenthesized lambda parameters and optional `case` separators should remain part of the accepted grammar.
-8. Whether arbitrary generic type applications and nested function/tuple/array types are supported through the complete backend rather than only through the type AST.
-9. The exact semantic guarantees for comparison/logical operand types, evaluation order, overflow, division, and short-circuiting.
-10. The complete representation and call convention for zero-argument functions, closures, and external/global symbols.
-11. Whether the internal AST `Quote` node will receive public source syntax.
-12. The exact ABI and pointer-depth needs supported by the foreign type grammar.
+### A1.0045 — `a ^ b >> c * d`
+- **Source:** `a ^ b >> c * d`
+- **Grouping:** `(a ^ (b >> (c * d)))`
 
-Where the parser accepts a form due to a broad token loop, that acceptance should not automatically be treated as a designed feature. A language specification should either preserve that behavior intentionally and test it, or narrow the grammar and emit a clear error.
+### A1.0046 — `a || b | c && d`
+- **Source:** `a || b | c && d`
+- **Grouping:** `(a || ((b | c) && d))`
 
----
+### A1.0047 — `a + b <= c << d`
+- **Source:** `a + b <= c << d`
+- **Grouping:** `((a + b) <= (c << d))`
 
-# 19. The rules worth memorizing first
+### A1.0048 — `a | b . c > d`
+- **Source:** `a | b . c > d`
+- **Grouping:** `((a | (b . c)) > d)`
 
-If only a small part of this reference is needed while writing ordinary programs, start with these rules:
+### A1.0049 — `a ^ b % c - d`
+- **Source:** `a ^ b % c - d`
+- **Grouping:** `(a ^ ((b % c) - d))`
 
-1. A file consists of top-level declarations, then one final expression.
-2. Ordinary declarations start with `let`, type declarations with `type`, and imports with `bring`.
-3. Top-level `let`, local `let`, external declarations, and `bring` declarations require their specified semicolons.
-4. The standard external spelling is `let external name : MAK_TYPE = "symbol" : FOREIGN_TYPE { ... };`.
-5. A lambda begins with `fn` or `\`, followed by identifier parameters and then `->`, `=>`, or a braced body.
-6. Ordinary application is written with adjacent expressions: `f x y`.
-7. Application binds more tightly than ordinary infix operators: use `f (x + y)` when the grouped expression is the argument.
-8. Dot means composition: `f . g` desugars to a function shaped like `\x -> f (g x)`.
-9. Binary not-equal is `/=`, not `!=`.
-10. `case value of { pattern -> result; ... }` is the main built-in selection form.
-11. Constructor patterns are recognized by uppercase initial letters; binders are lowercase-leading identifiers.
-12. Tuple types and patterns do not imply tuple value literals.
-13. `[T]` is a type form; `[]` is only a parser placeholder that becomes integer zero, and `[1,2]` is not a supported array literal.
-14. `()` is not a standalone expression value; after a callee it denotes zero-argument application.
-15. Foreign type syntax must match the real ABI. In particular, `printf` needs a format-string pointer before the values it formats.
-16. When unsure, add parentheses and semicolons, use uppercase constructors, and keep external declarations explicit.
+### A1.0050 — `a & b || c | d`
+- **Source:** `a & b || c | d`
+- **Grouping:** `((a & b) || (c | d))`
 
----
+### A1.0051 — `a <= b == c % d`
+- **Source:** `a <= b == c % d`
+- **Grouping:** `((a <= b) == (c % d))`
 
-## Closing note
+### A1.0052 — `a * b >= c | d`
+- **Source:** `a * b >= c | d`
+- **Grouping:** `((a * b) >= (c | d))`
 
-The reliable way to write MAK is to distinguish three things: the syntax the parser accepts, the meaning you intend the program to have, and the behavior the generated executable actually demonstrates. This reference documents the first carefully, highlights where the second and third can diverge, and uses the three `ringest` examples as a compact demonstration of why those distinctions matter.
+### A1.0053 — `a >= b /= c || d`
+- **Source:** `a >= b /= c || d`
+- **Grouping:** `(((a >= b) /= c) || d)`
+
+### A1.0054 — `a > b | c > d`
+- **Source:** `a > b | c > d`
+- **Grouping:** `((a > (b | c)) > d)`
+
+### A1.0055 — `a - b ^ c < d`
+- **Source:** `a - b ^ c < d`
+- **Grouping:** `(((a - b) ^ c) < d)`
+
+### A1.0056 — `a * b >= c /= d`
+- **Source:** `a * b >= c /= d`
+- **Grouping:** `(((a * b) >= c) /= d)`
+
+### A1.0057 — `a && b ^ c <= d`
+- **Source:** `a && b ^ c <= d`
+- **Grouping:** `(a && ((b ^ c) <= d))`
+
+### A1.0058 — `a % b | c || d`
+- **Source:** `a % b | c || d`
+- **Grouping:** `(((a % b) | c) || d)`
+
+### A1.0059 — `a - b >= c == d`
+- **Source:** `a - b >= c == d`
+- **Grouping:** `(((a - b) >= c) == d)`
+
+### A1.0060 — `a / b >= c * d`
+- **Source:** `a / b >= c * d`
+- **Grouping:** `((a / b) >= (c * d))`
+
+### A1.0061 — `a >> b | c ^ d`
+- **Source:** `a >> b | c ^ d`
+- **Grouping:** `(((a >> b) | c) ^ d)`
+
+### A1.0062 — `a < b > c >> d`
+- **Source:** `a < b > c >> d`
+- **Grouping:** `((a < b) > (c >> d))`
+
+### A1.0063 — `a && b <= c || d`
+- **Source:** `a && b <= c || d`
+- **Grouping:** `((a && (b <= c)) || d)`
+
+### A1.0064 — `a /= b > c < d`
+- **Source:** `a /= b > c < d`
+- **Grouping:** `(((a /= b) > c) < d)`
+
+### A1.0065 — `a < b >= c >= d`
+- **Source:** `a < b >= c >= d`
+- **Grouping:** `(((a < b) >= c) >= d)`
+
+### A1.0066 — `a & b << c % d`
+- **Source:** `a & b << c % d`
+- **Grouping:** `(a & (b << (c % d)))`
+
+### A1.0067 — `a ^ b || c << d`
+- **Source:** `a ^ b || c << d`
+- **Grouping:** `((a ^ b) || (c << d))`
+
+### A1.0068 — `a * b / c >= d`
+- **Source:** `a * b / c >= d`
+- **Grouping:** `(((a * b) / c) >= d)`
+
+### A1.0069 — `a - b /= c * d`
+- **Source:** `a - b /= c * d`
+- **Grouping:** `((a - b) /= (c * d))`
+
+### A1.0070 — `a < b * c <= d`
+- **Source:** `a < b * c <= d`
+- **Grouping:** `((a < (b * c)) <= d)`
+
+### A1.0071 — `a + b && c | d`
+- **Source:** `a + b && c | d`
+- **Grouping:** `((a + b) && (c | d))`
+
+### A1.0072 — `a < b ^ c && d`
+- **Source:** `a < b ^ c && d`
+- **Grouping:** `((a < (b ^ c)) && d)`
+
+### A1.0073 — `a > b < c <= d`
+- **Source:** `a > b < c <= d`
+- **Grouping:** `(((a > b) < c) <= d)`
+
+### A1.0074 — `a /= b - c && d`
+- **Source:** `a /= b - c && d`
+- **Grouping:** `((a /= (b - c)) && d)`
+
+### A1.0075 — `a + b . c % d`
+- **Source:** `a + b . c % d`
+- **Grouping:** `(a + ((b . c) % d))`
+
+### A1.0076 — `a + b & c % d`
+- **Source:** `a + b & c % d`
+- **Grouping:** `((a + b) & (c % d))`
+
+### A1.0077 — `a || b == c % d`
+- **Source:** `a || b == c % d`
+- **Grouping:** `(a || (b == (c % d)))`
+
+### A1.0078 — `a - b - c & d`
+- **Source:** `a - b - c & d`
+- **Grouping:** `(((a - b) - c) & d)`
+
+### A1.0079 — `a < b - c >> d`
+- **Source:** `a < b - c >> d`
+- **Grouping:** `(a < ((b - c) >> d))`
+
+### A1.0080 — `a > b || c >= d`
+- **Source:** `a > b || c >= d`
+- **Grouping:** `((a > b) || (c >= d))`
+
+### A1.0081 — `a % b < c % d`
+- **Source:** `a % b < c % d`
+- **Grouping:** `((a % b) < (c % d))`
+
+### A1.0082 — `a | b <= c & d`
+- **Source:** `a | b <= c & d`
+- **Grouping:** `((a | b) <= (c & d))`
+
+### A1.0083 — `a | b ^ c ^ d`
+- **Source:** `a | b ^ c ^ d`
+- **Grouping:** `(((a | b) ^ c) ^ d)`
+
+### A1.0084 — `a >> b || c | d`
+- **Source:** `a >> b || c | d`
+- **Grouping:** `((a >> b) || (c | d))`
+
+### A1.0085 — `a & b & c / d`
+- **Source:** `a & b & c / d`
+- **Grouping:** `((a & b) & (c / d))`
+
+### A1.0086 — `a & b ^ c >> d`
+- **Source:** `a & b ^ c >> d`
+- **Grouping:** `((a & b) ^ (c >> d))`
+
+### A1.0087 — `a == b << c & d`
+- **Source:** `a == b << c & d`
+- **Grouping:** `(a == ((b << c) & d))`
+
+### A1.0088 — `a >> b . c + d`
+- **Source:** `a >> b . c + d`
+- **Grouping:** `(a >> ((b . c) + d))`
+
+### A1.0089 — `a + b == c * d`
+- **Source:** `a + b == c * d`
+- **Grouping:** `((a + b) == (c * d))`
+
+### A1.0090 — `a ^ b * c > d`
+- **Source:** `a ^ b * c > d`
+- **Grouping:** `((a ^ (b * c)) > d)`
+
+### A1.0091 — `a - b > c / d`
+- **Source:** `a - b > c / d`
+- **Grouping:** `((a - b) > (c / d))`
+
+### A1.0092 — `a . b & c > d`
+- **Source:** `a . b & c > d`
+- **Grouping:** `(((a . b) & c) > d)`
+
+### A1.0093 — `a && b ^ c == d`
+- **Source:** `a && b ^ c == d`
+- **Grouping:** `(a && ((b ^ c) == d))`
+
+### A1.0094 — `a < b /= c / d`
+- **Source:** `a < b /= c / d`
+- **Grouping:** `((a < b) /= (c / d))`
+
+### A1.0095 — `a <= b >= c || d`
+- **Source:** `a <= b >= c || d`
+- **Grouping:** `(((a <= b) >= c) || d)`
+
+### A1.0096 — `a % b | c <= d`
+- **Source:** `a % b | c <= d`
+- **Grouping:** `(((a % b) | c) <= d)`
+
+### A1.0097 — `a | b == c > d`
+- **Source:** `a | b == c > d`
+- **Grouping:** `(((a | b) == c) > d)`
+
+### A1.0098 — `a / b | c <= d`
+- **Source:** `a / b | c <= d`
+- **Grouping:** `(((a / b) | c) <= d)`
+
+### A1.0099 — `a % b - c % d`
+- **Source:** `a % b - c % d`
+- **Grouping:** `((a % b) - (c % d))`
+
+### A1.0100 — `a >= b . c ^ d`
+- **Source:** `a >= b . c ^ d`
+- **Grouping:** `(a >= ((b . c) ^ d))`
+
+### A1.0101 — `a << b == c ^ d`
+- **Source:** `a << b == c ^ d`
+- **Grouping:** `((a << b) == (c ^ d))`
+
+### A1.0102 — `a * b ^ c - d`
+- **Source:** `a * b ^ c - d`
+- **Grouping:** `((a * b) ^ (c - d))`
+
+### A1.0103 — `a <= b >> c /= d`
+- **Source:** `a <= b >> c /= d`
+- **Grouping:** `((a <= (b >> c)) /= d)`
+
+### A1.0104 — `a | b % c <= d`
+- **Source:** `a | b % c <= d`
+- **Grouping:** `((a | (b % c)) <= d)`
+
+### A1.0105 — `a > b >= c >> d`
+- **Source:** `a > b >= c >> d`
+- **Grouping:** `((a > b) >= (c >> d))`
+
+### A1.0106 — `a > b - c % d`
+- **Source:** `a > b - c % d`
+- **Grouping:** `(a > (b - (c % d)))`
+
+### A1.0107 — `a * b < c == d`
+- **Source:** `a * b < c == d`
+- **Grouping:** `(((a * b) < c) == d)`
+
+### A1.0108 — `a / b * c + d`
+- **Source:** `a / b * c + d`
+- **Grouping:** `(((a / b) * c) + d)`
+
+### A1.0109 — `a . b | c * d`
+- **Source:** `a . b | c * d`
+- **Grouping:** `((a . b) | (c * d))`
+
+### A1.0110 — `a - b > c || d`
+- **Source:** `a - b > c || d`
+- **Grouping:** `(((a - b) > c) || d)`
+
+### A1.0111 — `a << b || c * d`
+- **Source:** `a << b || c * d`
+- **Grouping:** `((a << b) || (c * d))`
+
+### A1.0112 — `a /= b < c == d`
+- **Source:** `a /= b < c == d`
+- **Grouping:** `(((a /= b) < c) == d)`
+
+### A1.0113 — `a || b % c >> d`
+- **Source:** `a || b % c >> d`
+- **Grouping:** `(a || ((b % c) >> d))`
+
+### A1.0114 — `a & b * c | d`
+- **Source:** `a & b * c | d`
+- **Grouping:** `((a & (b * c)) | d)`
+
+### A1.0115 — `a > b / c /= d`
+- **Source:** `a > b / c /= d`
+- **Grouping:** `((a > (b / c)) /= d)`
+
+### A1.0116 — `a * b . c | d`
+- **Source:** `a * b . c | d`
+- **Grouping:** `((a * (b . c)) | d)`
+
+### A1.0117 — `a + b + c && d`
+- **Source:** `a + b + c && d`
+- **Grouping:** `(((a + b) + c) && d)`
+
+### A1.0118 — `a << b <= c <= d`
+- **Source:** `a << b <= c <= d`
+- **Grouping:** `(((a << b) <= c) <= d)`
+
+### A1.0119 — `a . b & c << d`
+- **Source:** `a . b & c << d`
+- **Grouping:** `((a . b) & (c << d))`
+
+### A1.0120 — `a * b + c / d`
+- **Source:** `a * b + c / d`
+- **Grouping:** `((a * b) + (c / d))`
+
+### A1.0121 — `a >= b > c ^ d`
+- **Source:** `a >= b > c ^ d`
+- **Grouping:** `((a >= b) > (c ^ d))`
+
+### A1.0122 — `a > b ^ c >> d`
+- **Source:** `a > b ^ c >> d`
+- **Grouping:** `(a > (b ^ (c >> d)))`
+
+### A1.0123 — `a >> b <= c ^ d`
+- **Source:** `a >> b <= c ^ d`
+- **Grouping:** `((a >> b) <= (c ^ d))`
+
+### A1.0124 — `a % b - c /= d`
+- **Source:** `a % b - c /= d`
+- **Grouping:** `(((a % b) - c) /= d)`
+
+### A1.0125 — `a . b * c * d`
+- **Source:** `a . b * c * d`
+- **Grouping:** `(((a . b) * c) * d)`
+
+### A1.0126 — `a * b > c / d`
+- **Source:** `a * b > c / d`
+- **Grouping:** `((a * b) > (c / d))`
+
+### A1.0127 — `a > b % c >> d`
+- **Source:** `a > b % c >> d`
+- **Grouping:** `(a > ((b % c) >> d))`
+
+### A1.0128 — `a >= b && c % d`
+- **Source:** `a >= b && c % d`
+- **Grouping:** `((a >= b) && (c % d))`
+
+### A1.0129 — `a + b <= c <= d`
+- **Source:** `a + b <= c <= d`
+- **Grouping:** `(((a + b) <= c) <= d)`
+
+### A1.0130 — `a + b >= c * d`
+- **Source:** `a + b >= c * d`
+- **Grouping:** `((a + b) >= (c * d))`
+
+### A1.0131 — `a > b == c / d`
+- **Source:** `a > b == c / d`
+- **Grouping:** `((a > b) == (c / d))`
+
+### A1.0132 — `a - b | c / d`
+- **Source:** `a - b | c / d`
+- **Grouping:** `((a - b) | (c / d))`
+
+### A1.0133 — `a - b && c /= d`
+- **Source:** `a - b && c /= d`
+- **Grouping:** `((a - b) && (c /= d))`
+
+### A1.0134 — `a << b < c /= d`
+- **Source:** `a << b < c /= d`
+- **Grouping:** `(((a << b) < c) /= d)`
+
+### A1.0135 — `a | b < c <= d`
+- **Source:** `a | b < c <= d`
+- **Grouping:** `(((a | b) < c) <= d)`
+
+### A1.0136 — `a >= b <= c < d`
+- **Source:** `a >= b <= c < d`
+- **Grouping:** `(((a >= b) <= c) < d)`
+
+### A1.0137 — `a == b <= c || d`
+- **Source:** `a == b <= c || d`
+- **Grouping:** `(((a == b) <= c) || d)`
+
+### A1.0138 — `a == b & c > d`
+- **Source:** `a == b & c > d`
+- **Grouping:** `((a == (b & c)) > d)`
+
+### A1.0139 — `a <= b == c | d`
+- **Source:** `a <= b == c | d`
+- **Grouping:** `((a <= b) == (c | d))`
+
+### A1.0140 — `a /= b . c || d`
+- **Source:** `a /= b . c || d`
+- **Grouping:** `((a /= (b . c)) || d)`
+
+### A1.0141 — `a + b > c && d`
+- **Source:** `a + b > c && d`
+- **Grouping:** `(((a + b) > c) && d)`
+
+### A1.0142 — `a || b <= c && d`
+- **Source:** `a || b <= c && d`
+- **Grouping:** `(a || ((b <= c) && d))`
+
+### A1.0143 — `a >> b > c > d`
+- **Source:** `a >> b > c > d`
+- **Grouping:** `(((a >> b) > c) > d)`
+
+### A1.0144 — `a & b << c | d`
+- **Source:** `a & b << c | d`
+- **Grouping:** `((a & (b << c)) | d)`
+
+### A1.0145 — `a && b << c % d`
+- **Source:** `a && b << c % d`
+- **Grouping:** `(a && (b << (c % d)))`
+
+### A1.0146 — `a && b / c || d`
+- **Source:** `a && b / c || d`
+- **Grouping:** `((a && (b / c)) || d)`
+
+### A1.0147 — `a ^ b + c <= d`
+- **Source:** `a ^ b + c <= d`
+- **Grouping:** `((a ^ (b + c)) <= d)`
+
+### A1.0148 — `a > b <= c & d`
+- **Source:** `a > b <= c & d`
+- **Grouping:** `((a > b) <= (c & d))`
+
+### A1.0149 — `a | b | c . d`
+- **Source:** `a | b | c . d`
+- **Grouping:** `((a | b) | (c . d))`
+
+### A1.0150 — `a << b % c > d`
+- **Source:** `a << b % c > d`
+- **Grouping:** `((a << (b % c)) > d)`
+
+### A1.0151 — `a + b || c * d`
+- **Source:** `a + b || c * d`
+- **Grouping:** `((a + b) || (c * d))`
+
+### A1.0152 — `a <= b < c - d`
+- **Source:** `a <= b < c - d`
+- **Grouping:** `((a <= b) < (c - d))`
+
+### A1.0153 — `a ^ b >> c /= d`
+- **Source:** `a ^ b >> c /= d`
+- **Grouping:** `((a ^ (b >> c)) /= d)`
+
+### A1.0154 — `a | b << c || d`
+- **Source:** `a | b << c || d`
+- **Grouping:** `((a | (b << c)) || d)`
+
+### A1.0155 — `a + b /= c + d`
+- **Source:** `a + b /= c + d`
+- **Grouping:** `((a + b) /= (c + d))`
+
+### A1.0156 — `a >= b ^ c | d`
+- **Source:** `a >= b ^ c | d`
+- **Grouping:** `(a >= ((b ^ c) | d))`
+
+### A1.0157 — `a << b && c <= d`
+- **Source:** `a << b && c <= d`
+- **Grouping:** `((a << b) && (c <= d))`
+
+### A1.0158 — `a == b - c >= d`
+- **Source:** `a == b - c >= d`
+- **Grouping:** `((a == (b - c)) >= d)`
+
+### A1.0159 — `a /= b << c || d`
+- **Source:** `a /= b << c || d`
+- **Grouping:** `((a /= (b << c)) || d)`
+
+### A1.0160 — `a + b | c * d`
+- **Source:** `a + b | c * d`
+- **Grouping:** `((a + b) | (c * d))`
+
+### A1.0161 — `a <= b . c > d`
+- **Source:** `a <= b . c > d`
+- **Grouping:** `((a <= (b . c)) > d)`
+
+### A1.0162 — `a <= b / c /= d`
+- **Source:** `a <= b / c /= d`
+- **Grouping:** `((a <= (b / c)) /= d)`
+
+### A1.0163 — `a == b ^ c << d`
+- **Source:** `a == b ^ c << d`
+- **Grouping:** `(a == (b ^ (c << d)))`
+
+### A1.0164 — `a < b | c ^ d`
+- **Source:** `a < b | c ^ d`
+- **Grouping:** `(a < ((b | c) ^ d))`
+
+### A1.0165 — `a > b < c % d`
+- **Source:** `a > b < c % d`
+- **Grouping:** `((a > b) < (c % d))`
+
+### A1.0166 — `a || b || c + d`
+- **Source:** `a || b || c + d`
+- **Grouping:** `((a || b) || (c + d))`
+
+### A1.0167 — `a * b & c <= d`
+- **Source:** `a * b & c <= d`
+- **Grouping:** `(((a * b) & c) <= d)`
+
+### A1.0168 — `a < b < c | d`
+- **Source:** `a < b < c | d`
+- **Grouping:** `((a < b) < (c | d))`
+
+### A1.0169 — `a || b <= c / d`
+- **Source:** `a || b <= c / d`
+- **Grouping:** `(a || (b <= (c / d)))`
+
+### A1.0170 — `a && b % c <= d`
+- **Source:** `a && b % c <= d`
+- **Grouping:** `(a && ((b % c) <= d))`
+
+### A1.0171 — `a % b || c << d`
+- **Source:** `a % b || c << d`
+- **Grouping:** `((a % b) || (c << d))`
+
+### A1.0172 — `a / b && c ^ d`
+- **Source:** `a / b && c ^ d`
+- **Grouping:** `((a / b) && (c ^ d))`
+
+### A1.0173 — `a / b * c < d`
+- **Source:** `a / b * c < d`
+- **Grouping:** `(((a / b) * c) < d)`
+
+### A1.0174 — `a >> b . c >> d`
+- **Source:** `a >> b . c >> d`
+- **Grouping:** `((a >> (b . c)) >> d)`
+
+### A1.0175 — `a >> b % c /= d`
+- **Source:** `a >> b % c /= d`
+- **Grouping:** `((a >> (b % c)) /= d)`
+
+### A1.0176 — `a < b && c + d`
+- **Source:** `a < b && c + d`
+- **Grouping:** `((a < b) && (c + d))`
+
+### A1.0177 — `a <= b < c && d`
+- **Source:** `a <= b < c && d`
+- **Grouping:** `(((a <= b) < c) && d)`
+
+### A1.0178 — `a && b && c << d`
+- **Source:** `a && b && c << d`
+- **Grouping:** `((a && b) && (c << d))`
+
+### A1.0179 — `a & b > c > d`
+- **Source:** `a & b > c > d`
+- **Grouping:** `(((a & b) > c) > d)`
+
+### A1.0180 — `a % b <= c <= d`
+- **Source:** `a % b <= c <= d`
+- **Grouping:** `(((a % b) <= c) <= d)`
+
+### A1.0181 — `a / b % c - d`
+- **Source:** `a / b % c - d`
+- **Grouping:** `(((a / b) % c) - d)`
+
+### A1.0182 — `a * b /= c && d`
+- **Source:** `a * b /= c && d`
+- **Grouping:** `(((a * b) /= c) && d)`
+
+### A1.0183 — `a < b > c % d`
+- **Source:** `a < b > c % d`
+- **Grouping:** `((a < b) > (c % d))`
+
+### A1.0184 — `a < b | c <= d`
+- **Source:** `a < b | c <= d`
+- **Grouping:** `((a < (b | c)) <= d)`
+
+### A1.0185 — `a <= b == c ^ d`
+- **Source:** `a <= b == c ^ d`
+- **Grouping:** `((a <= b) == (c ^ d))`
+
+### A1.0186 — `a * b >> c > d`
+- **Source:** `a * b >> c > d`
+- **Grouping:** `(((a * b) >> c) > d)`
+
+### A1.0187 — `a . b | c | d`
+- **Source:** `a . b | c | d`
+- **Grouping:** `(((a . b) | c) | d)`
+
+### A1.0188 — `a && b > c & d`
+- **Source:** `a && b > c & d`
+- **Grouping:** `(a && (b > (c & d)))`
+
+### A1.0189 — `a - b == c | d`
+- **Source:** `a - b == c | d`
+- **Grouping:** `((a - b) == (c | d))`
+
+### A1.0190 — `a && b < c - d`
+- **Source:** `a && b < c - d`
+- **Grouping:** `(a && (b < (c - d)))`
+
+### A1.0191 — `a & b * c * d`
+- **Source:** `a & b * c * d`
+- **Grouping:** `(a & ((b * c) * d))`
+
+### A1.0192 — `a << b == c >> d`
+- **Source:** `a << b == c >> d`
+- **Grouping:** `((a << b) == (c >> d))`
+
+### A1.0193 — `a >> b >> c + d`
+- **Source:** `a >> b >> c + d`
+- **Grouping:** `((a >> b) >> (c + d))`
+
+### A1.0194 — `a < b && c > d`
+- **Source:** `a < b && c > d`
+- **Grouping:** `((a < b) && (c > d))`
+
+### A1.0195 — `a * b . c * d`
+- **Source:** `a * b . c * d`
+- **Grouping:** `((a * (b . c)) * d)`
+
+### A1.0196 — `a > b || c << d`
+- **Source:** `a > b || c << d`
+- **Grouping:** `((a > b) || (c << d))`
+
+### A1.0197 — `a >= b / c > d`
+- **Source:** `a >= b / c > d`
+- **Grouping:** `((a >= (b / c)) > d)`
+
+### A1.0198 — `a /= b . c > d`
+- **Source:** `a /= b . c > d`
+- **Grouping:** `((a /= (b . c)) > d)`
+
+### A1.0199 — `a + b * c << d`
+- **Source:** `a + b * c << d`
+- **Grouping:** `((a + (b * c)) << d)`
+
+### A1.0200 — `a > b || c >> d`
+- **Source:** `a > b || c >> d`
+- **Grouping:** `((a > b) || (c >> d))`
+
+### A1.0201 — `a >> b * c / d`
+- **Source:** `a >> b * c / d`
+- **Grouping:** `(a >> ((b * c) / d))`
+
+### A1.0202 — `a >> b == c == d`
+- **Source:** `a >> b == c == d`
+- **Grouping:** `(((a >> b) == c) == d)`
+
+### A1.0203 — `a && b == c && d`
+- **Source:** `a && b == c && d`
+- **Grouping:** `((a && (b == c)) && d)`
+
+### A1.0204 — `a - b || c * d`
+- **Source:** `a - b || c * d`
+- **Grouping:** `((a - b) || (c * d))`
+
+### A1.0205 — `a >> b * c <= d`
+- **Source:** `a >> b * c <= d`
+- **Grouping:** `((a >> (b * c)) <= d)`
+
+### A1.0206 — `a << b . c * d`
+- **Source:** `a << b . c * d`
+- **Grouping:** `(a << ((b . c) * d))`
+
+### A1.0207 — `a & b | c || d`
+- **Source:** `a & b | c || d`
+- **Grouping:** `(((a & b) | c) || d)`
+
+### A1.0208 — `a && b ^ c / d`
+- **Source:** `a && b ^ c / d`
+- **Grouping:** `(a && (b ^ (c / d)))`
+
+### A1.0209 — `a & b + c == d`
+- **Source:** `a & b + c == d`
+- **Grouping:** `((a & (b + c)) == d)`
+
+### A1.0210 — `a & b && c / d`
+- **Source:** `a & b && c / d`
+- **Grouping:** `((a & b) && (c / d))`
+
+### A1.0211 — `a >= b < c + d`
+- **Source:** `a >= b < c + d`
+- **Grouping:** `((a >= b) < (c + d))`
+
+### A1.0212 — `a . b ^ c >= d`
+- **Source:** `a . b ^ c >= d`
+- **Grouping:** `(((a . b) ^ c) >= d)`
+
+### A1.0213 — `a < b - c /= d`
+- **Source:** `a < b - c /= d`
+- **Grouping:** `((a < (b - c)) /= d)`
+
+### A1.0214 — `a > b && c /= d`
+- **Source:** `a > b && c /= d`
+- **Grouping:** `((a > b) && (c /= d))`
+
+### A1.0215 — `a >= b | c > d`
+- **Source:** `a >= b | c > d`
+- **Grouping:** `((a >= (b | c)) > d)`
+
+### A1.0216 — `a /= b /= c || d`
+- **Source:** `a /= b /= c || d`
+- **Grouping:** `(((a /= b) /= c) || d)`
+
+### A1.0217 — `a | b || c || d`
+- **Source:** `a | b || c || d`
+- **Grouping:** `(((a | b) || c) || d)`
+
+### A1.0218 — `a && b . c * d`
+- **Source:** `a && b . c * d`
+- **Grouping:** `(a && ((b . c) * d))`
+
+### A1.0219 — `a - b | c + d`
+- **Source:** `a - b | c + d`
+- **Grouping:** `((a - b) | (c + d))`
+
+### A1.0220 — `a == b && c & d`
+- **Source:** `a == b && c & d`
+- **Grouping:** `((a == b) && (c & d))`
+
+### A1.0221 — `a >= b <= c > d`
+- **Source:** `a >= b <= c > d`
+- **Grouping:** `(((a >= b) <= c) > d)`
+
+### A1.0222 — `a & b ^ c * d`
+- **Source:** `a & b ^ c * d`
+- **Grouping:** `((a & b) ^ (c * d))`
+
+### A1.0223 — `a | b && c << d`
+- **Source:** `a | b && c << d`
+- **Grouping:** `((a | b) && (c << d))`
+
+### A1.0224 — `a + b /= c ^ d`
+- **Source:** `a + b /= c ^ d`
+- **Grouping:** `((a + b) /= (c ^ d))`
+
+### A1.0225 — `a && b | c - d`
+- **Source:** `a && b | c - d`
+- **Grouping:** `(a && (b | (c - d)))`
+
+### A1.0226 — `a && b <= c + d`
+- **Source:** `a && b <= c + d`
+- **Grouping:** `(a && (b <= (c + d)))`
+
+### A1.0227 — `a / b << c <= d`
+- **Source:** `a / b << c <= d`
+- **Grouping:** `(((a / b) << c) <= d)`
+
+### A1.0228 — `a || b * c . d`
+- **Source:** `a || b * c . d`
+- **Grouping:** `(a || (b * (c . d)))`
+
+### A1.0229 — `a & b - c || d`
+- **Source:** `a & b - c || d`
+- **Grouping:** `((a & (b - c)) || d)`
+
+### A1.0230 — `a && b <= c * d`
+- **Source:** `a && b <= c * d`
+- **Grouping:** `(a && (b <= (c * d)))`
+
+### A1.0231 — `a | b >> c <= d`
+- **Source:** `a | b >> c <= d`
+- **Grouping:** `((a | (b >> c)) <= d)`
+
+### A1.0232 — `a - b / c * d`
+- **Source:** `a - b / c * d`
+- **Grouping:** `(a - ((b / c) * d))`
+
+### A1.0233 — `a / b || c >> d`
+- **Source:** `a / b || c >> d`
+- **Grouping:** `((a / b) || (c >> d))`
+
+### A1.0234 — `a < b + c % d`
+- **Source:** `a < b + c % d`
+- **Grouping:** `(a < (b + (c % d)))`
+
+### A1.0235 — `a & b || c - d`
+- **Source:** `a & b || c - d`
+- **Grouping:** `((a & b) || (c - d))`
+
+### A1.0236 — `a /= b * c < d`
+- **Source:** `a /= b * c < d`
+- **Grouping:** `((a /= (b * c)) < d)`
+
+### A1.0237 — `a | b < c >= d`
+- **Source:** `a | b < c >= d`
+- **Grouping:** `(((a | b) < c) >= d)`
+
+### A1.0238 — `a | b / c /= d`
+- **Source:** `a | b / c /= d`
+- **Grouping:** `((a | (b / c)) /= d)`
+
+### A1.0239 — `a >= b > c && d`
+- **Source:** `a >= b > c && d`
+- **Grouping:** `(((a >= b) > c) && d)`
+
+### A1.0240 — `a >> b || c % d`
+- **Source:** `a >> b || c % d`
+- **Grouping:** `((a >> b) || (c % d))`
+
+### A1.0241 — `a . b /= c - d`
+- **Source:** `a . b /= c - d`
+- **Grouping:** `((a . b) /= (c - d))`
+
+### A1.0242 — `a ^ b . c + d`
+- **Source:** `a ^ b . c + d`
+- **Grouping:** `(a ^ ((b . c) + d))`
+
+### A1.0243 — `a >= b && c | d`
+- **Source:** `a >= b && c | d`
+- **Grouping:** `((a >= b) && (c | d))`
+
+### A1.0244 — `a /= b == c | d`
+- **Source:** `a /= b == c | d`
+- **Grouping:** `((a /= b) == (c | d))`
+
+### A1.0245 — `a || b . c % d`
+- **Source:** `a || b . c % d`
+- **Grouping:** `(a || ((b . c) % d))`
+
+### A1.0246 — `a < b <= c >> d`
+- **Source:** `a < b <= c >> d`
+- **Grouping:** `((a < b) <= (c >> d))`
+
+### A1.0247 — `a >= b /= c <= d`
+- **Source:** `a >= b /= c <= d`
+- **Grouping:** `(((a >= b) /= c) <= d)`
+
+### A1.0248 — `a <= b <= c ^ d`
+- **Source:** `a <= b <= c ^ d`
+- **Grouping:** `((a <= b) <= (c ^ d))`
+
+### A1.0249 — `a || b > c >> d`
+- **Source:** `a || b > c >> d`
+- **Grouping:** `(a || (b > (c >> d)))`
+
+### A1.0250 — `a == b - c >> d`
+- **Source:** `a == b - c >> d`
+- **Grouping:** `(a == ((b - c) >> d))`
+
+### A1.0251 — `a <= b ^ c /= d`
+- **Source:** `a <= b ^ c /= d`
+- **Grouping:** `((a <= (b ^ c)) /= d)`
+
+### A1.0252 — `a | b - c + d`
+- **Source:** `a | b - c + d`
+- **Grouping:** `(a | ((b - c) + d))`
+
+### A1.0253 — `a / b || c ^ d`
+- **Source:** `a / b || c ^ d`
+- **Grouping:** `((a / b) || (c ^ d))`
+
+### A1.0254 — `a /= b >> c ^ d`
+- **Source:** `a /= b >> c ^ d`
+- **Grouping:** `(a /= ((b >> c) ^ d))`
+
+### A1.0255 — `a < b % c << d`
+- **Source:** `a < b % c << d`
+- **Grouping:** `(a < ((b % c) << d))`
+
+### A1.0256 — `a >= b || c / d`
+- **Source:** `a >= b || c / d`
+- **Grouping:** `((a >= b) || (c / d))`
+
+### A1.0257 — `a + b ^ c /= d`
+- **Source:** `a + b ^ c /= d`
+- **Grouping:** `(((a + b) ^ c) /= d)`
+
+### A1.0258 — `a /= b - c /= d`
+- **Source:** `a /= b - c /= d`
+- **Grouping:** `((a /= (b - c)) /= d)`
+
+### A1.0259 — `a * b < c ^ d`
+- **Source:** `a * b < c ^ d`
+- **Grouping:** `((a * b) < (c ^ d))`
+
+### A1.0260 — `a >= b <= c | d`
+- **Source:** `a >= b <= c | d`
+- **Grouping:** `((a >= b) <= (c | d))`
+
+### A1.0261 — `a ^ b /= c <= d`
+- **Source:** `a ^ b /= c <= d`
+- **Grouping:** `(((a ^ b) /= c) <= d)`
+
+### A1.0262 — `a /= b % c % d`
+- **Source:** `a /= b % c % d`
+- **Grouping:** `(a /= ((b % c) % d))`
+
+### A1.0263 — `a ^ b > c << d`
+- **Source:** `a ^ b > c << d`
+- **Grouping:** `((a ^ b) > (c << d))`
+
+### A1.0264 — `a <= b <= c << d`
+- **Source:** `a <= b <= c << d`
+- **Grouping:** `((a <= b) <= (c << d))`
+
+### A1.0265 — `a >> b == c || d`
+- **Source:** `a >> b == c || d`
+- **Grouping:** `(((a >> b) == c) || d)`
+
+### A1.0266 — `a - b && c % d`
+- **Source:** `a - b && c % d`
+- **Grouping:** `((a - b) && (c % d))`
+
+### A1.0267 — `a > b ^ c >= d`
+- **Source:** `a > b ^ c >= d`
+- **Grouping:** `((a > (b ^ c)) >= d)`
+
+### A1.0268 — `a < b / c < d`
+- **Source:** `a < b / c < d`
+- **Grouping:** `((a < (b / c)) < d)`
+
+### A1.0269 — `a / b % c < d`
+- **Source:** `a / b % c < d`
+- **Grouping:** `(((a / b) % c) < d)`
+
+### A1.0270 — `a > b < c == d`
+- **Source:** `a > b < c == d`
+- **Grouping:** `(((a > b) < c) == d)`
+
+### A1.0271 — `a == b | c || d`
+- **Source:** `a == b | c || d`
+- **Grouping:** `((a == (b | c)) || d)`
+
+### A1.0272 — `a << b / c > d`
+- **Source:** `a << b / c > d`
+- **Grouping:** `((a << (b / c)) > d)`
+
+### A1.0273 — `a && b | c ^ d`
+- **Source:** `a && b | c ^ d`
+- **Grouping:** `(a && ((b | c) ^ d))`
+
+### A1.0274 — `a * b + c <= d`
+- **Source:** `a * b + c <= d`
+- **Grouping:** `(((a * b) + c) <= d)`
+
+### A1.0275 — `a - b / c /= d`
+- **Source:** `a - b / c /= d`
+- **Grouping:** `((a - (b / c)) /= d)`
+
+### A1.0276 — `a && b < c == d`
+- **Source:** `a && b < c == d`
+- **Grouping:** `(a && ((b < c) == d))`
+
+### A1.0277 — `a - b - c /= d`
+- **Source:** `a - b - c /= d`
+- **Grouping:** `(((a - b) - c) /= d)`
+
+### A1.0278 — `a - b * c == d`
+- **Source:** `a - b * c == d`
+- **Grouping:** `((a - (b * c)) == d)`
+
+### A1.0279 — `a | b > c % d`
+- **Source:** `a | b > c % d`
+- **Grouping:** `((a | b) > (c % d))`
+
+### A1.0280 — `a <= b << c * d`
+- **Source:** `a <= b << c * d`
+- **Grouping:** `(a <= (b << (c * d)))`
+
+### A1.0281 — `a - b < c + d`
+- **Source:** `a - b < c + d`
+- **Grouping:** `((a - b) < (c + d))`
+
+### A1.0282 — `a <= b >= c <= d`
+- **Source:** `a <= b >= c <= d`
+- **Grouping:** `(((a <= b) >= c) <= d)`
+
+### A1.0283 — `a || b | c & d`
+- **Source:** `a || b | c & d`
+- **Grouping:** `(a || ((b | c) & d))`
+
+### A1.0284 — `a == b >= c % d`
+- **Source:** `a == b >= c % d`
+- **Grouping:** `((a == b) >= (c % d))`
+
+### A1.0285 — `a <= b ^ c & d`
+- **Source:** `a <= b ^ c & d`
+- **Grouping:** `(a <= ((b ^ c) & d))`
+
+### A1.0286 — `a * b || c | d`
+- **Source:** `a * b || c | d`
+- **Grouping:** `((a * b) || (c | d))`
+
+### A1.0287 — `a /= b - c ^ d`
+- **Source:** `a /= b - c ^ d`
+- **Grouping:** `(a /= ((b - c) ^ d))`
+
+### A1.0288 — `a <= b + c % d`
+- **Source:** `a <= b + c % d`
+- **Grouping:** `(a <= (b + (c % d)))`
+
+### A1.0289 — `a > b << c && d`
+- **Source:** `a > b << c && d`
+- **Grouping:** `((a > (b << c)) && d)`
+
+### A1.0290 — `a || b << c - d`
+- **Source:** `a || b << c - d`
+- **Grouping:** `(a || (b << (c - d)))`
+
+### A1.0291 — `a % b /= c && d`
+- **Source:** `a % b /= c && d`
+- **Grouping:** `(((a % b) /= c) && d)`
+
+### A1.0292 — `a == b >= c >> d`
+- **Source:** `a == b >= c >> d`
+- **Grouping:** `((a == b) >= (c >> d))`
+
+### A1.0293 — `a >> b - c /= d`
+- **Source:** `a >> b - c /= d`
+- **Grouping:** `((a >> (b - c)) /= d)`
+
+### A1.0294 — `a | b + c && d`
+- **Source:** `a | b + c && d`
+- **Grouping:** `((a | (b + c)) && d)`
+
+### A1.0295 — `a == b | c >= d`
+- **Source:** `a == b | c >= d`
+- **Grouping:** `((a == (b | c)) >= d)`
+
+### A1.0296 — `a < b << c - d`
+- **Source:** `a < b << c - d`
+- **Grouping:** `(a < (b << (c - d)))`
+
+### A1.0297 — `a >> b % c / d`
+- **Source:** `a >> b % c / d`
+- **Grouping:** `(a >> ((b % c) / d))`
+
+### A1.0298 — `a == b . c == d`
+- **Source:** `a == b . c == d`
+- **Grouping:** `((a == (b . c)) == d)`
+
+### A1.0299 — `a << b < c == d`
+- **Source:** `a << b < c == d`
+- **Grouping:** `(((a << b) < c) == d)`
+
+### A1.0300 — `a + b << c % d`
+- **Source:** `a + b << c % d`
+- **Grouping:** `((a + b) << (c % d))`
+
+### A1.0301 — `a ^ b >> c + d`
+- **Source:** `a ^ b >> c + d`
+- **Grouping:** `(a ^ (b >> (c + d)))`
+
+### A1.0302 — `a << b == c == d`
+- **Source:** `a << b == c == d`
+- **Grouping:** `(((a << b) == c) == d)`
+
+### A1.0303 — `a - b ^ c . d`
+- **Source:** `a - b ^ c . d`
+- **Grouping:** `((a - b) ^ (c . d))`
+
+### A1.0304 — `a == b - c > d`
+- **Source:** `a == b - c > d`
+- **Grouping:** `((a == (b - c)) > d)`
+
+### A1.0305 — `a < b ^ c - d`
+- **Source:** `a < b ^ c - d`
+- **Grouping:** `(a < (b ^ (c - d)))`
+
+### A1.0306 — `a >= b < c % d`
+- **Source:** `a >= b < c % d`
+- **Grouping:** `((a >= b) < (c % d))`
+
+### A1.0307 — `a /= b & c + d`
+- **Source:** `a /= b & c + d`
+- **Grouping:** `(a /= (b & (c + d)))`
+
+### A1.0308 — `a << b <= c * d`
+- **Source:** `a << b <= c * d`
+- **Grouping:** `((a << b) <= (c * d))`
+
+### A1.0309 — `a == b || c == d`
+- **Source:** `a == b || c == d`
+- **Grouping:** `((a == b) || (c == d))`
+
+### A1.0310 — `a & b >> c + d`
+- **Source:** `a & b >> c + d`
+- **Grouping:** `(a & (b >> (c + d)))`
+
+### A1.0311 — `a < b >= c % d`
+- **Source:** `a < b >= c % d`
+- **Grouping:** `((a < b) >= (c % d))`
+
+### A1.0312 — `a >= b / c % d`
+- **Source:** `a >= b / c % d`
+- **Grouping:** `(a >= ((b / c) % d))`
+
+### A1.0313 — `a << b % c * d`
+- **Source:** `a << b % c * d`
+- **Grouping:** `(a << ((b % c) * d))`
+
+### A1.0314 — `a / b << c . d`
+- **Source:** `a / b << c . d`
+- **Grouping:** `((a / b) << (c . d))`
+
+### A1.0315 — `a * b << c - d`
+- **Source:** `a * b << c - d`
+- **Grouping:** `((a * b) << (c - d))`
+
+### A1.0316 — `a - b ^ c || d`
+- **Source:** `a - b ^ c || d`
+- **Grouping:** `(((a - b) ^ c) || d)`
+
+### A1.0317 — `a * b & c /= d`
+- **Source:** `a * b & c /= d`
+- **Grouping:** `(((a * b) & c) /= d)`
+
+### A1.0318 — `a >= b . c < d`
+- **Source:** `a >= b . c < d`
+- **Grouping:** `((a >= (b . c)) < d)`
+
+### A1.0319 — `a && b > c . d`
+- **Source:** `a && b > c . d`
+- **Grouping:** `(a && (b > (c . d)))`
+
+### A1.0320 — `a . b >= c == d`
+- **Source:** `a . b >= c == d`
+- **Grouping:** `(((a . b) >= c) == d)`
+
+### A1.0321 — `a > b % c >= d`
+- **Source:** `a > b % c >= d`
+- **Grouping:** `((a > (b % c)) >= d)`
+
+### A1.0322 — `a >= b /= c /= d`
+- **Source:** `a >= b /= c /= d`
+- **Grouping:** `(((a >= b) /= c) /= d)`
+
+### A1.0323 — `a & b - c == d`
+- **Source:** `a & b - c == d`
+- **Grouping:** `((a & (b - c)) == d)`
+
+### A1.0324 — `a == b ^ c || d`
+- **Source:** `a == b ^ c || d`
+- **Grouping:** `((a == (b ^ c)) || d)`
+
+### A1.0325 — `a <= b ^ c && d`
+- **Source:** `a <= b ^ c && d`
+- **Grouping:** `((a <= (b ^ c)) && d)`
+
+### A1.0326 — `a >= b << c << d`
+- **Source:** `a >= b << c << d`
+- **Grouping:** `(a >= ((b << c) << d))`
+
+### A1.0327 — `a * b <= c & d`
+- **Source:** `a * b <= c & d`
+- **Grouping:** `((a * b) <= (c & d))`
+
+### A1.0328 — `a % b + c <= d`
+- **Source:** `a % b + c <= d`
+- **Grouping:** `(((a % b) + c) <= d)`
+
+### A1.0329 — `a && b > c << d`
+- **Source:** `a && b > c << d`
+- **Grouping:** `(a && (b > (c << d)))`
+
+### A1.0330 — `a - b >= c | d`
+- **Source:** `a - b >= c | d`
+- **Grouping:** `((a - b) >= (c | d))`
+
+### A1.0331 — `a << b >= c == d`
+- **Source:** `a << b >= c == d`
+- **Grouping:** `(((a << b) >= c) == d)`
+
+### A1.0332 — `a /= b | c /= d`
+- **Source:** `a /= b | c /= d`
+- **Grouping:** `((a /= (b | c)) /= d)`
+
+### A1.0333 — `a + b == c < d`
+- **Source:** `a + b == c < d`
+- **Grouping:** `(((a + b) == c) < d)`
+
+### A1.0334 — `a % b . c > d`
+- **Source:** `a % b . c > d`
+- **Grouping:** `((a % (b . c)) > d)`
+
+### A1.0335 — `a /= b | c >> d`
+- **Source:** `a /= b | c >> d`
+- **Grouping:** `(a /= (b | (c >> d)))`
+
+### A1.0336 — `a ^ b || c || d`
+- **Source:** `a ^ b || c || d`
+- **Grouping:** `(((a ^ b) || c) || d)`
+
+### A1.0337 — `a && b >= c || d`
+- **Source:** `a && b >= c || d`
+- **Grouping:** `((a && (b >= c)) || d)`
+
+### A1.0338 — `a ^ b == c && d`
+- **Source:** `a ^ b == c && d`
+- **Grouping:** `(((a ^ b) == c) && d)`
+
+### A1.0339 — `a - b - c == d`
+- **Source:** `a - b - c == d`
+- **Grouping:** `(((a - b) - c) == d)`
+
+### A1.0340 — `a - b - c <= d`
+- **Source:** `a - b - c <= d`
+- **Grouping:** `(((a - b) - c) <= d)`
+
+### A1.0341 — `a * b | c > d`
+- **Source:** `a * b | c > d`
+- **Grouping:** `(((a * b) | c) > d)`
+
+### A1.0342 — `a >= b /= c . d`
+- **Source:** `a >= b /= c . d`
+- **Grouping:** `((a >= b) /= (c . d))`
+
+### A1.0343 — `a && b . c /= d`
+- **Source:** `a && b . c /= d`
+- **Grouping:** `(a && ((b . c) /= d))`
+
+### A1.0344 — `a /= b & c << d`
+- **Source:** `a /= b & c << d`
+- **Grouping:** `(a /= (b & (c << d)))`
+
+### A1.0345 — `a ^ b ^ c == d`
+- **Source:** `a ^ b ^ c == d`
+- **Grouping:** `(((a ^ b) ^ c) == d)`
+
+### A1.0346 — `a % b || c == d`
+- **Source:** `a % b || c == d`
+- **Grouping:** `((a % b) || (c == d))`
+
+### A1.0347 — `a >> b >= c . d`
+- **Source:** `a >> b >= c . d`
+- **Grouping:** `((a >> b) >= (c . d))`
+
+### A1.0348 — `a || b ^ c >= d`
+- **Source:** `a || b ^ c >= d`
+- **Grouping:** `(a || ((b ^ c) >= d))`
+
+### A1.0349 — `a - b /= c | d`
+- **Source:** `a - b /= c | d`
+- **Grouping:** `((a - b) /= (c | d))`
+
+### A1.0350 — `a << b << c / d`
+- **Source:** `a << b << c / d`
+- **Grouping:** `((a << b) << (c / d))`
+
+### A1.0351 — `a == b + c / d`
+- **Source:** `a == b + c / d`
+- **Grouping:** `(a == (b + (c / d)))`
+
+### A1.0352 — `a << b / c + d`
+- **Source:** `a << b / c + d`
+- **Grouping:** `(a << ((b / c) + d))`
+
+### A1.0353 — `a / b % c % d`
+- **Source:** `a / b % c % d`
+- **Grouping:** `(((a / b) % c) % d)`
+
+### A1.0354 — `a & b & c | d`
+- **Source:** `a & b & c | d`
+- **Grouping:** `(((a & b) & c) | d)`
+
+### A1.0355 — `a . b + c * d`
+- **Source:** `a . b + c * d`
+- **Grouping:** `((a . b) + (c * d))`
+
+### A1.0356 — `a == b % c >> d`
+- **Source:** `a == b % c >> d`
+- **Grouping:** `(a == ((b % c) >> d))`
+
+### A1.0357 — `a + b < c > d`
+- **Source:** `a + b < c > d`
+- **Grouping:** `(((a + b) < c) > d)`
+
+### A1.0358 — `a > b /= c <= d`
+- **Source:** `a > b /= c <= d`
+- **Grouping:** `(((a > b) /= c) <= d)`
+
+### A1.0359 — `a << b >> c << d`
+- **Source:** `a << b >> c << d`
+- **Grouping:** `(((a << b) >> c) << d)`
+
+### A1.0360 — `a & b . c << d`
+- **Source:** `a & b . c << d`
+- **Grouping:** `(a & ((b . c) << d))`
+
+### A1.0361 — `a >= b + c + d`
+- **Source:** `a >= b + c + d`
+- **Grouping:** `(a >= ((b + c) + d))`
+
+### A1.0362 — `a >= b <= c . d`
+- **Source:** `a >= b <= c . d`
+- **Grouping:** `((a >= b) <= (c . d))`
+
+### A1.0363 — `a /= b % c << d`
+- **Source:** `a /= b % c << d`
+- **Grouping:** `(a /= ((b % c) << d))`
+
+### A1.0364 — `a || b % c <= d`
+- **Source:** `a || b % c <= d`
+- **Grouping:** `(a || ((b % c) <= d))`
+
+### A1.0365 — `a && b | c < d`
+- **Source:** `a && b | c < d`
+- **Grouping:** `(a && ((b | c) < d))`
+
+### A1.0366 — `a - b < c << d`
+- **Source:** `a - b < c << d`
+- **Grouping:** `((a - b) < (c << d))`
+
+### A1.0367 — `a / b & c * d`
+- **Source:** `a / b & c * d`
+- **Grouping:** `((a / b) & (c * d))`
+
+### A1.0368 — `a || b || c >> d`
+- **Source:** `a || b || c >> d`
+- **Grouping:** `((a || b) || (c >> d))`
+
+### A1.0369 — `a - b | c && d`
+- **Source:** `a - b | c && d`
+- **Grouping:** `(((a - b) | c) && d)`
+
+### A1.0370 — `a - b && c | d`
+- **Source:** `a - b && c | d`
+- **Grouping:** `((a - b) && (c | d))`
+
+### A1.0371 — `a << b >= c ^ d`
+- **Source:** `a << b >= c ^ d`
+- **Grouping:** `((a << b) >= (c ^ d))`
+
+### A1.0372 — `a /= b + c % d`
+- **Source:** `a /= b + c % d`
+- **Grouping:** `(a /= (b + (c % d)))`
+
+### A1.0373 — `a || b - c + d`
+- **Source:** `a || b - c + d`
+- **Grouping:** `(a || ((b - c) + d))`
+
+### A1.0374 — `a / b | c || d`
+- **Source:** `a / b | c || d`
+- **Grouping:** `(((a / b) | c) || d)`
+
+### A1.0375 — `a * b >= c . d`
+- **Source:** `a * b >= c . d`
+- **Grouping:** `((a * b) >= (c . d))`
+
+### A1.0376 — `a - b > c << d`
+- **Source:** `a - b > c << d`
+- **Grouping:** `((a - b) > (c << d))`
+
+### A1.0377 — `a + b < c | d`
+- **Source:** `a + b < c | d`
+- **Grouping:** `((a + b) < (c | d))`
+
+### A1.0378 — `a & b * c % d`
+- **Source:** `a & b * c % d`
+- **Grouping:** `(a & ((b * c) % d))`
+
+### A1.0379 — `a < b << c * d`
+- **Source:** `a < b << c * d`
+- **Grouping:** `(a < (b << (c * d)))`
+
+### A1.0380 — `a % b >> c == d`
+- **Source:** `a % b >> c == d`
+- **Grouping:** `(((a % b) >> c) == d)`
+
+### A1.0381 — `a >= b && c > d`
+- **Source:** `a >= b && c > d`
+- **Grouping:** `((a >= b) && (c > d))`
+
+### A1.0382 — `a & b >= c >= d`
+- **Source:** `a & b >= c >= d`
+- **Grouping:** `(((a & b) >= c) >= d)`
+
+### A1.0383 — `a /= b >= c + d`
+- **Source:** `a /= b >= c + d`
+- **Grouping:** `((a /= b) >= (c + d))`
+
+### A1.0384 — `a & b / c /= d`
+- **Source:** `a & b / c /= d`
+- **Grouping:** `((a & (b / c)) /= d)`
+
+### A1.0385 — `a < b <= c > d`
+- **Source:** `a < b <= c > d`
+- **Grouping:** `(((a < b) <= c) > d)`
+
+### A1.0386 — `a /= b * c % d`
+- **Source:** `a /= b * c % d`
+- **Grouping:** `(a /= ((b * c) % d))`
+
+### A1.0387 — `a >= b * c . d`
+- **Source:** `a >= b * c . d`
+- **Grouping:** `(a >= (b * (c . d)))`
+
+### A1.0388 — `a ^ b / c == d`
+- **Source:** `a ^ b / c == d`
+- **Grouping:** `((a ^ (b / c)) == d)`
+
+### A1.0389 — `a && b >= c - d`
+- **Source:** `a && b >= c - d`
+- **Grouping:** `(a && (b >= (c - d)))`
+
+### A1.0390 — `a <= b || c <= d`
+- **Source:** `a <= b || c <= d`
+- **Grouping:** `((a <= b) || (c <= d))`
+
+### A1.0391 — `a || b || c . d`
+- **Source:** `a || b || c . d`
+- **Grouping:** `((a || b) || (c . d))`
+
+### A1.0392 — `a * b > c < d`
+- **Source:** `a * b > c < d`
+- **Grouping:** `(((a * b) > c) < d)`
+
+### A1.0393 — `a | b && c <= d`
+- **Source:** `a | b && c <= d`
+- **Grouping:** `((a | b) && (c <= d))`
+
+### A1.0394 — `a - b || c > d`
+- **Source:** `a - b || c > d`
+- **Grouping:** `((a - b) || (c > d))`
+
+### A1.0395 — `a || b >> c % d`
+- **Source:** `a || b >> c % d`
+- **Grouping:** `(a || (b >> (c % d)))`
+
+### A1.0396 — `a < b >> c > d`
+- **Source:** `a < b >> c > d`
+- **Grouping:** `((a < (b >> c)) > d)`
+
+### A1.0397 — `a && b % c >= d`
+- **Source:** `a && b % c >= d`
+- **Grouping:** `(a && ((b % c) >= d))`
+
+### A1.0398 — `a || b || c ^ d`
+- **Source:** `a || b || c ^ d`
+- **Grouping:** `((a || b) || (c ^ d))`
+
+### A1.0399 — `a . b || c & d`
+- **Source:** `a . b || c & d`
+- **Grouping:** `((a . b) || (c & d))`
+
+### A1.0400 — `a & b > c . d`
+- **Source:** `a & b > c . d`
+- **Grouping:** `((a & b) > (c . d))`
+
+### A1.0401 — `a >= b || c || d`
+- **Source:** `a >= b || c || d`
+- **Grouping:** `(((a >= b) || c) || d)`
+
+### A1.0402 — `a /= b && c ^ d`
+- **Source:** `a /= b && c ^ d`
+- **Grouping:** `((a /= b) && (c ^ d))`
+
+### A1.0403 — `a ^ b >= c - d`
+- **Source:** `a ^ b >= c - d`
+- **Grouping:** `((a ^ b) >= (c - d))`
+
+### A1.0404 — `a && b . c % d`
+- **Source:** `a && b . c % d`
+- **Grouping:** `(a && ((b . c) % d))`
+
+### A1.0405 — `a ^ b | c / d`
+- **Source:** `a ^ b | c / d`
+- **Grouping:** `((a ^ b) | (c / d))`
+
+### A1.0406 — `a >= b >= c < d`
+- **Source:** `a >= b >= c < d`
+- **Grouping:** `(((a >= b) >= c) < d)`
+
+### A1.0407 — `a % b * c >= d`
+- **Source:** `a % b * c >= d`
+- **Grouping:** `(((a % b) * c) >= d)`
+
+### A1.0408 — `a . b <= c >> d`
+- **Source:** `a . b <= c >> d`
+- **Grouping:** `((a . b) <= (c >> d))`
+
+### A1.0409 — `a ^ b >> c & d`
+- **Source:** `a ^ b >> c & d`
+- **Grouping:** `((a ^ (b >> c)) & d)`
+
+### A1.0410 — `a * b << c & d`
+- **Source:** `a * b << c & d`
+- **Grouping:** `(((a * b) << c) & d)`
+
+### A1.0411 — `a - b > c % d`
+- **Source:** `a - b > c % d`
+- **Grouping:** `((a - b) > (c % d))`
+
+### A1.0412 — `a >= b >= c >> d`
+- **Source:** `a >= b >= c >> d`
+- **Grouping:** `((a >= b) >= (c >> d))`
+
+### A1.0413 — `a > b ^ c + d`
+- **Source:** `a > b ^ c + d`
+- **Grouping:** `(a > (b ^ (c + d)))`
+
+### A1.0414 — `a << b << c && d`
+- **Source:** `a << b << c && d`
+- **Grouping:** `(((a << b) << c) && d)`
+
+### A1.0415 — `a | b ^ c && d`
+- **Source:** `a | b ^ c && d`
+- **Grouping:** `(((a | b) ^ c) && d)`
+
+### A1.0416 — `a + b * c && d`
+- **Source:** `a + b * c && d`
+- **Grouping:** `((a + (b * c)) && d)`
+
+### A1.0417 — `a % b && c + d`
+- **Source:** `a % b && c + d`
+- **Grouping:** `((a % b) && (c + d))`
+
+### A1.0418 — `a >= b & c + d`
+- **Source:** `a >= b & c + d`
+- **Grouping:** `(a >= (b & (c + d)))`
+
+### A1.0419 — `a . b - c . d`
+- **Source:** `a . b - c . d`
+- **Grouping:** `((a . b) - (c . d))`
+
+### A1.0420 — `a + b == c & d`
+- **Source:** `a + b == c & d`
+- **Grouping:** `((a + b) == (c & d))`
+
+### A1.0421 — `a ^ b < c << d`
+- **Source:** `a ^ b < c << d`
+- **Grouping:** `((a ^ b) < (c << d))`
+
+### A1.0422 — `a == b >= c <= d`
+- **Source:** `a == b >= c <= d`
+- **Grouping:** `(((a == b) >= c) <= d)`
+
+### A1.0423 — `a | b >= c ^ d`
+- **Source:** `a | b >= c ^ d`
+- **Grouping:** `((a | b) >= (c ^ d))`
+
+### A1.0424 — `a % b | c < d`
+- **Source:** `a % b | c < d`
+- **Grouping:** `(((a % b) | c) < d)`
+
+### A1.0425 — `a & b >> c == d`
+- **Source:** `a & b >> c == d`
+- **Grouping:** `((a & (b >> c)) == d)`
+
+### A1.0426 — `a . b /= c << d`
+- **Source:** `a . b /= c << d`
+- **Grouping:** `((a . b) /= (c << d))`
+
+### A1.0427 — `a < b /= c + d`
+- **Source:** `a < b /= c + d`
+- **Grouping:** `((a < b) /= (c + d))`
+
+### A1.0428 — `a || b & c && d`
+- **Source:** `a || b & c && d`
+- **Grouping:** `(a || ((b & c) && d))`
+
+### A1.0429 — `a >= b < c << d`
+- **Source:** `a >= b < c << d`
+- **Grouping:** `((a >= b) < (c << d))`
+
+### A1.0430 — `a /= b * c | d`
+- **Source:** `a /= b * c | d`
+- **Grouping:** `(a /= ((b * c) | d))`
+
+### A1.0431 — `a || b < c & d`
+- **Source:** `a || b < c & d`
+- **Grouping:** `(a || (b < (c & d)))`
+
+### A1.0432 — `a < b . c & d`
+- **Source:** `a < b . c & d`
+- **Grouping:** `(a < ((b . c) & d))`
+
+### A1.0433 — `a | b - c / d`
+- **Source:** `a | b - c / d`
+- **Grouping:** `(a | (b - (c / d)))`
+
+### A1.0434 — `a >= b < c > d`
+- **Source:** `a >= b < c > d`
+- **Grouping:** `(((a >= b) < c) > d)`
+
+### A1.0435 — `a == b | c / d`
+- **Source:** `a == b | c / d`
+- **Grouping:** `(a == (b | (c / d)))`
+
+### A1.0436 — `a < b - c << d`
+- **Source:** `a < b - c << d`
+- **Grouping:** `(a < ((b - c) << d))`
+
+### A1.0437 — `a . b >= c /= d`
+- **Source:** `a . b >= c /= d`
+- **Grouping:** `(((a . b) >= c) /= d)`
+
+### A1.0438 — `a << b > c & d`
+- **Source:** `a << b > c & d`
+- **Grouping:** `((a << b) > (c & d))`
+
+### A1.0439 — `a ^ b | c & d`
+- **Source:** `a ^ b | c & d`
+- **Grouping:** `(((a ^ b) | c) & d)`
+
+### A1.0440 — `a <= b << c | d`
+- **Source:** `a <= b << c | d`
+- **Grouping:** `(a <= ((b << c) | d))`
+
+### A1.0441 — `a >= b == c == d`
+- **Source:** `a >= b == c == d`
+- **Grouping:** `(((a >= b) == c) == d)`
+
+### A1.0442 — `a | b << c << d`
+- **Source:** `a | b << c << d`
+- **Grouping:** `(a | ((b << c) << d))`
+
+### A1.0443 — `a & b >> c && d`
+- **Source:** `a & b >> c && d`
+- **Grouping:** `((a & (b >> c)) && d)`
+
+### A1.0444 — `a . b / c | d`
+- **Source:** `a . b / c | d`
+- **Grouping:** `(((a . b) / c) | d)`
+
+### A1.0445 — `a || b > c ^ d`
+- **Source:** `a || b > c ^ d`
+- **Grouping:** `(a || (b > (c ^ d)))`
+
+### A1.0446 — `a % b | c << d`
+- **Source:** `a % b | c << d`
+- **Grouping:** `((a % b) | (c << d))`
+
+### A1.0447 — `a & b <= c >> d`
+- **Source:** `a & b <= c >> d`
+- **Grouping:** `((a & b) <= (c >> d))`
+
+### A1.0448 — `a > b >= c ^ d`
+- **Source:** `a > b >= c ^ d`
+- **Grouping:** `((a > b) >= (c ^ d))`
+
+### A1.0449 — `a >= b / c << d`
+- **Source:** `a >= b / c << d`
+- **Grouping:** `(a >= ((b / c) << d))`
+
+### A1.0450 — `a ^ b || c == d`
+- **Source:** `a ^ b || c == d`
+- **Grouping:** `((a ^ b) || (c == d))`
+
+### A1.0451 — `a * b | c == d`
+- **Source:** `a * b | c == d`
+- **Grouping:** `(((a * b) | c) == d)`
+
+### A1.0452 — `a >= b ^ c /= d`
+- **Source:** `a >= b ^ c /= d`
+- **Grouping:** `((a >= (b ^ c)) /= d)`
+
+### A1.0453 — `a >> b && c >= d`
+- **Source:** `a >> b && c >= d`
+- **Grouping:** `((a >> b) && (c >= d))`
+
+### A1.0454 — `a + b && c % d`
+- **Source:** `a + b && c % d`
+- **Grouping:** `((a + b) && (c % d))`
+
+### A1.0455 — `a / b >= c . d`
+- **Source:** `a / b >= c . d`
+- **Grouping:** `((a / b) >= (c . d))`
+
+### A1.0456 — `a < b /= c || d`
+- **Source:** `a < b /= c || d`
+- **Grouping:** `(((a < b) /= c) || d)`
+
+### A1.0457 — `a < b < c < d`
+- **Source:** `a < b < c < d`
+- **Grouping:** `(((a < b) < c) < d)`
+
+### A1.0458 — `a < b || c % d`
+- **Source:** `a < b || c % d`
+- **Grouping:** `((a < b) || (c % d))`
+
+### A1.0459 — `a & b <= c - d`
+- **Source:** `a & b <= c - d`
+- **Grouping:** `((a & b) <= (c - d))`
+
+### A1.0460 — `a && b < c >> d`
+- **Source:** `a && b < c >> d`
+- **Grouping:** `(a && (b < (c >> d)))`
+
+### A1.0461 — `a << b || c <= d`
+- **Source:** `a << b || c <= d`
+- **Grouping:** `((a << b) || (c <= d))`
+
+### A1.0462 — `a >= b && c ^ d`
+- **Source:** `a >= b && c ^ d`
+- **Grouping:** `((a >= b) && (c ^ d))`
+
+### A1.0463 — `a == b < c < d`
+- **Source:** `a == b < c < d`
+- **Grouping:** `(((a == b) < c) < d)`
+
+### A1.0464 — `a >> b >= c ^ d`
+- **Source:** `a >> b >= c ^ d`
+- **Grouping:** `((a >> b) >= (c ^ d))`
+
+### A1.0465 — `a == b && c > d`
+- **Source:** `a == b && c > d`
+- **Grouping:** `((a == b) && (c > d))`
+
+### A1.0466 — `a . b / c >> d`
+- **Source:** `a . b / c >> d`
+- **Grouping:** `(((a . b) / c) >> d)`
+
+### A1.0467 — `a < b . c || d`
+- **Source:** `a < b . c || d`
+- **Grouping:** `((a < (b . c)) || d)`
+
+### A1.0468 — `a >= b - c & d`
+- **Source:** `a >= b - c & d`
+- **Grouping:** `(a >= ((b - c) & d))`
+
+### A1.0469 — `a /= b << c == d`
+- **Source:** `a /= b << c == d`
+- **Grouping:** `((a /= (b << c)) == d)`
+
+### A1.0470 — `a || b ^ c << d`
+- **Source:** `a || b ^ c << d`
+- **Grouping:** `(a || (b ^ (c << d)))`
+
+### A1.0471 — `a ^ b << c - d`
+- **Source:** `a ^ b << c - d`
+- **Grouping:** `(a ^ (b << (c - d)))`
+
+### A1.0472 — `a & b . c < d`
+- **Source:** `a & b . c < d`
+- **Grouping:** `((a & (b . c)) < d)`
+
+### A1.0473 — `a <= b || c * d`
+- **Source:** `a <= b || c * d`
+- **Grouping:** `((a <= b) || (c * d))`
+
+### A1.0474 — `a + b . c /= d`
+- **Source:** `a + b . c /= d`
+- **Grouping:** `((a + (b . c)) /= d)`
+
+### A1.0475 — `a ^ b << c & d`
+- **Source:** `a ^ b << c & d`
+- **Grouping:** `((a ^ (b << c)) & d)`
+
+### A1.0476 — `a || b || c /= d`
+- **Source:** `a || b || c /= d`
+- **Grouping:** `((a || b) || (c /= d))`
+
+### A1.0477 — `a < b & c >> d`
+- **Source:** `a < b & c >> d`
+- **Grouping:** `(a < (b & (c >> d)))`
+
+### A1.0478 — `a >= b || c . d`
+- **Source:** `a >= b || c . d`
+- **Grouping:** `((a >= b) || (c . d))`
+
+### A1.0479 — `a << b > c * d`
+- **Source:** `a << b > c * d`
+- **Grouping:** `((a << b) > (c * d))`
+
+### A1.0480 — `a ^ b + c >= d`
+- **Source:** `a ^ b + c >= d`
+- **Grouping:** `((a ^ (b + c)) >= d)`
+
+### A1.0481 — `a - b * c < d`
+- **Source:** `a - b * c < d`
+- **Grouping:** `((a - (b * c)) < d)`
+
+### A1.0482 — `a % b || c + d`
+- **Source:** `a % b || c + d`
+- **Grouping:** `((a % b) || (c + d))`
+
+### A1.0483 — `a || b | c < d`
+- **Source:** `a || b | c < d`
+- **Grouping:** `(a || ((b | c) < d))`
+
+### A1.0484 — `a % b < c == d`
+- **Source:** `a % b < c == d`
+- **Grouping:** `(((a % b) < c) == d)`
+
+### A1.0485 — `a <= b * c | d`
+- **Source:** `a <= b * c | d`
+- **Grouping:** `(a <= ((b * c) | d))`
+
+### A1.0486 — `a > b . c ^ d`
+- **Source:** `a > b . c ^ d`
+- **Grouping:** `(a > ((b . c) ^ d))`
+
+### A1.0487 — `a || b | c + d`
+- **Source:** `a || b | c + d`
+- **Grouping:** `(a || (b | (c + d)))`
+
+### A1.0488 — `a <= b & c - d`
+- **Source:** `a <= b & c - d`
+- **Grouping:** `(a <= (b & (c - d)))`
+
+### A1.0489 — `a * b || c - d`
+- **Source:** `a * b || c - d`
+- **Grouping:** `((a * b) || (c - d))`
+
+### A1.0490 — `a ^ b ^ c >= d`
+- **Source:** `a ^ b ^ c >= d`
+- **Grouping:** `(((a ^ b) ^ c) >= d)`
+
+### A1.0491 — `a & b <= c + d`
+- **Source:** `a & b <= c + d`
+- **Grouping:** `((a & b) <= (c + d))`
+
+### A1.0492 — `a || b % c - d`
+- **Source:** `a || b % c - d`
+- **Grouping:** `(a || ((b % c) - d))`
+
+### A1.0493 — `a % b && c == d`
+- **Source:** `a % b && c == d`
+- **Grouping:** `((a % b) && (c == d))`
+
+### A1.0494 — `a < b > c . d`
+- **Source:** `a < b > c . d`
+- **Grouping:** `((a < b) > (c . d))`
+
+### A1.0495 — `a >> b == c % d`
+- **Source:** `a >> b == c % d`
+- **Grouping:** `((a >> b) == (c % d))`
+
+### A1.0496 — `a /= b - c - d`
+- **Source:** `a /= b - c - d`
+- **Grouping:** `(a /= ((b - c) - d))`
+
+### A1.0497 — `a > b == c >= d`
+- **Source:** `a > b == c >= d`
+- **Grouping:** `(((a > b) == c) >= d)`
+
+### A1.0498 — `a == b - c | d`
+- **Source:** `a == b - c | d`
+- **Grouping:** `(a == ((b - c) | d))`
+
+### A1.0499 — `a >> b - c <= d`
+- **Source:** `a >> b - c <= d`
+- **Grouping:** `((a >> (b - c)) <= d)`
+
+### A1.0500 — `a && b * c % d`
+- **Source:** `a && b * c % d`
+- **Grouping:** `(a && ((b * c) % d))`
+
+### A1.0501 — `a % b . c * d`
+- **Source:** `a % b . c * d`
+- **Grouping:** `((a % (b . c)) * d)`
+
+### A1.0502 — `a . b && c <= d`
+- **Source:** `a . b && c <= d`
+- **Grouping:** `((a . b) && (c <= d))`
+
+### A1.0503 — `a / b /= c + d`
+- **Source:** `a / b /= c + d`
+- **Grouping:** `((a / b) /= (c + d))`
+
+### A1.0504 — `a % b + c . d`
+- **Source:** `a % b + c . d`
+- **Grouping:** `((a % b) + (c . d))`
+
+### A1.0505 — `a << b / c << d`
+- **Source:** `a << b / c << d`
+- **Grouping:** `((a << (b / c)) << d)`
+
+### A1.0506 — `a >> b && c || d`
+- **Source:** `a >> b && c || d`
+- **Grouping:** `(((a >> b) && c) || d)`
+
+### A1.0507 — `a - b & c && d`
+- **Source:** `a - b & c && d`
+- **Grouping:** `(((a - b) & c) && d)`
+
+### A1.0508 — `a << b /= c + d`
+- **Source:** `a << b /= c + d`
+- **Grouping:** `((a << b) /= (c + d))`
+
+### A1.0509 — `a && b / c >= d`
+- **Source:** `a && b / c >= d`
+- **Grouping:** `(a && ((b / c) >= d))`
+
+### A1.0510 — `a / b + c < d`
+- **Source:** `a / b + c < d`
+- **Grouping:** `(((a / b) + c) < d)`
+
+### A1.0511 — `a . b > c <= d`
+- **Source:** `a . b > c <= d`
+- **Grouping:** `(((a . b) > c) <= d)`
+
+### A1.0512 — `a && b - c == d`
+- **Source:** `a && b - c == d`
+- **Grouping:** `(a && ((b - c) == d))`
+
+### A1.0513 — `a && b . c ^ d`
+- **Source:** `a && b . c ^ d`
+- **Grouping:** `(a && ((b . c) ^ d))`
+
+### A1.0514 — `a > b /= c - d`
+- **Source:** `a > b /= c - d`
+- **Grouping:** `((a > b) /= (c - d))`
+
+### A1.0515 — `a >> b | c || d`
+- **Source:** `a >> b | c || d`
+- **Grouping:** `(((a >> b) | c) || d)`
+
+### A1.0516 — `a | b | c == d`
+- **Source:** `a | b | c == d`
+- **Grouping:** `(((a | b) | c) == d)`
+
+### A1.0517 — `a + b * c . d`
+- **Source:** `a + b * c . d`
+- **Grouping:** `(a + (b * (c . d)))`
+
+### A1.0518 — `a >> b + c >> d`
+- **Source:** `a >> b + c >> d`
+- **Grouping:** `((a >> (b + c)) >> d)`
+
+### A1.0519 — `a | b | c << d`
+- **Source:** `a | b | c << d`
+- **Grouping:** `((a | b) | (c << d))`
+
+### A1.0520 — `a % b / c >> d`
+- **Source:** `a % b / c >> d`
+- **Grouping:** `(((a % b) / c) >> d)`
+
+### A1.0521 — `a & b + c > d`
+- **Source:** `a & b + c > d`
+- **Grouping:** `((a & (b + c)) > d)`
+
+### A1.0522 — `a >> b && c << d`
+- **Source:** `a >> b && c << d`
+- **Grouping:** `((a >> b) && (c << d))`
+
+### A1.0523 — `a | b | c | d`
+- **Source:** `a | b | c | d`
+- **Grouping:** `(((a | b) | c) | d)`
+
+### A1.0524 — `a /= b * c >> d`
+- **Source:** `a /= b * c >> d`
+- **Grouping:** `(a /= ((b * c) >> d))`
+
+### A1.0525 — `a << b <= c == d`
+- **Source:** `a << b <= c == d`
+- **Grouping:** `(((a << b) <= c) == d)`
+
+### A1.0526 — `a ^ b >> c && d`
+- **Source:** `a ^ b >> c && d`
+- **Grouping:** `((a ^ (b >> c)) && d)`
+
+### A1.0527 — `a <= b /= c | d`
+- **Source:** `a <= b /= c | d`
+- **Grouping:** `((a <= b) /= (c | d))`
+
+### A1.0528 — `a >> b + c /= d`
+- **Source:** `a >> b + c /= d`
+- **Grouping:** `((a >> (b + c)) /= d)`
+
+### A1.0529 — `a - b ^ c /= d`
+- **Source:** `a - b ^ c /= d`
+- **Grouping:** `(((a - b) ^ c) /= d)`
+
+### A1.0530 — `a - b == c /= d`
+- **Source:** `a - b == c /= d`
+- **Grouping:** `(((a - b) == c) /= d)`
+
+### A1.0531 — `a && b && c & d`
+- **Source:** `a && b && c & d`
+- **Grouping:** `((a && b) && (c & d))`
+
+### A1.0532 — `a >> b < c >> d`
+- **Source:** `a >> b < c >> d`
+- **Grouping:** `((a >> b) < (c >> d))`
+
+### A1.0533 — `a / b & c + d`
+- **Source:** `a / b & c + d`
+- **Grouping:** `((a / b) & (c + d))`
+
+### A1.0534 — `a >> b || c << d`
+- **Source:** `a >> b || c << d`
+- **Grouping:** `((a >> b) || (c << d))`
+
+### A1.0535 — `a <= b + c ^ d`
+- **Source:** `a <= b + c ^ d`
+- **Grouping:** `(a <= ((b + c) ^ d))`
+
+### A1.0536 — `a . b /= c + d`
+- **Source:** `a . b /= c + d`
+- **Grouping:** `((a . b) /= (c + d))`
+
+### A1.0537 — `a * b << c * d`
+- **Source:** `a * b << c * d`
+- **Grouping:** `((a * b) << (c * d))`
+
+### A1.0538 — `a >= b % c / d`
+- **Source:** `a >= b % c / d`
+- **Grouping:** `(a >= ((b % c) / d))`
+
+### A1.0539 — `a >= b || c | d`
+- **Source:** `a >= b || c | d`
+- **Grouping:** `((a >= b) || (c | d))`
+
+### A1.0540 — `a > b > c << d`
+- **Source:** `a > b > c << d`
+- **Grouping:** `((a > b) > (c << d))`
+
+### A1.0541 — `a <= b | c / d`
+- **Source:** `a <= b | c / d`
+- **Grouping:** `(a <= (b | (c / d)))`
+
+### A1.0542 — `a < b == c >> d`
+- **Source:** `a < b == c >> d`
+- **Grouping:** `((a < b) == (c >> d))`
+
+### A1.0543 — `a - b || c ^ d`
+- **Source:** `a - b || c ^ d`
+- **Grouping:** `((a - b) || (c ^ d))`
+
+### A1.0544 — `a / b /= c - d`
+- **Source:** `a / b /= c - d`
+- **Grouping:** `((a / b) /= (c - d))`
+
+### A1.0545 — `a < b < c == d`
+- **Source:** `a < b < c == d`
+- **Grouping:** `(((a < b) < c) == d)`
+
+### A1.0546 — `a - b & c < d`
+- **Source:** `a - b & c < d`
+- **Grouping:** `(((a - b) & c) < d)`
+
+### A1.0547 — `a == b << c == d`
+- **Source:** `a == b << c == d`
+- **Grouping:** `((a == (b << c)) == d)`
+
+### A1.0548 — `a - b / c >= d`
+- **Source:** `a - b / c >= d`
+- **Grouping:** `((a - (b / c)) >= d)`
+
+### A1.0549 — `a * b || c == d`
+- **Source:** `a * b || c == d`
+- **Grouping:** `((a * b) || (c == d))`
+
+### A1.0550 — `a >= b - c | d`
+- **Source:** `a >= b - c | d`
+- **Grouping:** `(a >= ((b - c) | d))`
+
+### A1.0551 — `a * b == c / d`
+- **Source:** `a * b == c / d`
+- **Grouping:** `((a * b) == (c / d))`
+
+### A1.0552 — `a /= b <= c && d`
+- **Source:** `a /= b <= c && d`
+- **Grouping:** `(((a /= b) <= c) && d)`
+
+### A1.0553 — `a % b . c % d`
+- **Source:** `a % b . c % d`
+- **Grouping:** `((a % (b . c)) % d)`
+
+### A1.0554 — `a <= b >> c || d`
+- **Source:** `a <= b >> c || d`
+- **Grouping:** `((a <= (b >> c)) || d)`
+
+### A1.0555 — `a ^ b << c * d`
+- **Source:** `a ^ b << c * d`
+- **Grouping:** `(a ^ (b << (c * d)))`
+
+### A1.0556 — `a / b ^ c + d`
+- **Source:** `a / b ^ c + d`
+- **Grouping:** `((a / b) ^ (c + d))`
+
+### A1.0557 — `a & b >> c >> d`
+- **Source:** `a & b >> c >> d`
+- **Grouping:** `(a & ((b >> c) >> d))`
+
+### A1.0558 — `a * b || c / d`
+- **Source:** `a * b || c / d`
+- **Grouping:** `((a * b) || (c / d))`
+
+### A1.0559 — `a >= b /= c & d`
+- **Source:** `a >= b /= c & d`
+- **Grouping:** `((a >= b) /= (c & d))`
+
+### A1.0560 — `a | b . c << d`
+- **Source:** `a | b . c << d`
+- **Grouping:** `(a | ((b . c) << d))`
+
+### A1.0561 — `a >= b <= c & d`
+- **Source:** `a >= b <= c & d`
+- **Grouping:** `((a >= b) <= (c & d))`
+
+### A1.0562 — `a * b - c >= d`
+- **Source:** `a * b - c >= d`
+- **Grouping:** `(((a * b) - c) >= d)`
+
+### A1.0563 — `a >> b >> c - d`
+- **Source:** `a >> b >> c - d`
+- **Grouping:** `((a >> b) >> (c - d))`
+
+### A1.0564 — `a & b . c == d`
+- **Source:** `a & b . c == d`
+- **Grouping:** `((a & (b . c)) == d)`
+
+### A1.0565 — `a + b << c < d`
+- **Source:** `a + b << c < d`
+- **Grouping:** `(((a + b) << c) < d)`
+
+### A1.0566 — `a * b << c || d`
+- **Source:** `a * b << c || d`
+- **Grouping:** `(((a * b) << c) || d)`
+
+### A1.0567 — `a . b > c /= d`
+- **Source:** `a . b > c /= d`
+- **Grouping:** `(((a . b) > c) /= d)`
+
+### A1.0568 — `a | b ^ c << d`
+- **Source:** `a | b ^ c << d`
+- **Grouping:** `((a | b) ^ (c << d))`
+
+### A1.0569 — `a > b < c & d`
+- **Source:** `a > b < c & d`
+- **Grouping:** `((a > b) < (c & d))`
+
+### A1.0570 — `a % b * c && d`
+- **Source:** `a % b * c && d`
+- **Grouping:** `(((a % b) * c) && d)`
+
+### A1.0571 — `a >= b << c >> d`
+- **Source:** `a >= b << c >> d`
+- **Grouping:** `(a >= ((b << c) >> d))`
+
+### A1.0572 — `a - b * c + d`
+- **Source:** `a - b * c + d`
+- **Grouping:** `((a - (b * c)) + d)`
+
+### A1.0573 — `a - b < c >= d`
+- **Source:** `a - b < c >= d`
+- **Grouping:** `(((a - b) < c) >= d)`
+
+### A1.0574 — `a . b / c || d`
+- **Source:** `a . b / c || d`
+- **Grouping:** `(((a . b) / c) || d)`
+
+### A1.0575 — `a & b == c < d`
+- **Source:** `a & b == c < d`
+- **Grouping:** `(((a & b) == c) < d)`
+
+### A1.0576 — `a << b % c & d`
+- **Source:** `a << b % c & d`
+- **Grouping:** `((a << (b % c)) & d)`
+
+### A1.0577 — `a > b - c - d`
+- **Source:** `a > b - c - d`
+- **Grouping:** `(a > ((b - c) - d))`
+
+### A1.0578 — `a & b << c && d`
+- **Source:** `a & b << c && d`
+- **Grouping:** `((a & (b << c)) && d)`
+
+### A1.0579 — `a + b + c << d`
+- **Source:** `a + b + c << d`
+- **Grouping:** `(((a + b) + c) << d)`
+
+### A1.0580 — `a || b == c / d`
+- **Source:** `a || b == c / d`
+- **Grouping:** `(a || (b == (c / d)))`
+
+### A1.0581 — `a - b + c || d`
+- **Source:** `a - b + c || d`
+- **Grouping:** `(((a - b) + c) || d)`
+
+### A1.0582 — `a <= b || c && d`
+- **Source:** `a <= b || c && d`
+- **Grouping:** `((a <= b) || (c && d))`
+
+### A1.0583 — `a ^ b / c >= d`
+- **Source:** `a ^ b / c >= d`
+- **Grouping:** `((a ^ (b / c)) >= d)`
+
+### A1.0584 — `a || b == c >> d`
+- **Source:** `a || b == c >> d`
+- **Grouping:** `(a || (b == (c >> d)))`
+
+### A1.0585 — `a | b /= c >= d`
+- **Source:** `a | b /= c >= d`
+- **Grouping:** `(((a | b) /= c) >= d)`
+
+### A1.0586 — `a . b >= c & d`
+- **Source:** `a . b >= c & d`
+- **Grouping:** `((a . b) >= (c & d))`
+
+### A1.0587 — `a && b / c | d`
+- **Source:** `a && b / c | d`
+- **Grouping:** `(a && ((b / c) | d))`
+
+### A1.0588 — `a % b >> c - d`
+- **Source:** `a % b >> c - d`
+- **Grouping:** `((a % b) >> (c - d))`
+
+### A1.0589 — `a & b /= c + d`
+- **Source:** `a & b /= c + d`
+- **Grouping:** `((a & b) /= (c + d))`
+
+### A1.0590 — `a < b < c >> d`
+- **Source:** `a < b < c >> d`
+- **Grouping:** `((a < b) < (c >> d))`
+
+### A1.0591 — `a && b < c << d`
+- **Source:** `a && b < c << d`
+- **Grouping:** `(a && (b < (c << d)))`
+
+### A1.0592 — `a /= b >> c >= d`
+- **Source:** `a /= b >> c >= d`
+- **Grouping:** `((a /= (b >> c)) >= d)`
+
+### A1.0593 — `a . b - c + d`
+- **Source:** `a . b - c + d`
+- **Grouping:** `(((a . b) - c) + d)`
+
+### A1.0594 — `a > b /= c ^ d`
+- **Source:** `a > b /= c ^ d`
+- **Grouping:** `((a > b) /= (c ^ d))`
+
+### A1.0595 — `a - b >= c ^ d`
+- **Source:** `a - b >= c ^ d`
+- **Grouping:** `((a - b) >= (c ^ d))`
+
+### A1.0596 — `a * b * c > d`
+- **Source:** `a * b * c > d`
+- **Grouping:** `(((a * b) * c) > d)`
+
+### A1.0597 — `a << b && c % d`
+- **Source:** `a << b && c % d`
+- **Grouping:** `((a << b) && (c % d))`
+
+### A1.0598 — `a . b % c % d`
+- **Source:** `a . b % c % d`
+- **Grouping:** `(((a . b) % c) % d)`
+
+### A1.0599 — `a >= b | c * d`
+- **Source:** `a >= b | c * d`
+- **Grouping:** `(a >= (b | (c * d)))`
+
+### A1.0600 — `a - b - c . d`
+- **Source:** `a - b - c . d`
+- **Grouping:** `((a - b) - (c . d))`
+
+### A1.0601 — `a /= b >= c ^ d`
+- **Source:** `a /= b >= c ^ d`
+- **Grouping:** `((a /= b) >= (c ^ d))`
+
+### A1.0602 — `a | b /= c + d`
+- **Source:** `a | b /= c + d`
+- **Grouping:** `((a | b) /= (c + d))`
+
+### A1.0603 — `a || b && c . d`
+- **Source:** `a || b && c . d`
+- **Grouping:** `(a || (b && (c . d)))`
+
+### A1.0604 — `a * b % c | d`
+- **Source:** `a * b % c | d`
+- **Grouping:** `(((a * b) % c) | d)`
+
+### A1.0605 — `a - b >= c >> d`
+- **Source:** `a - b >= c >> d`
+- **Grouping:** `((a - b) >= (c >> d))`
+
+### A1.0606 — `a && b > c * d`
+- **Source:** `a && b > c * d`
+- **Grouping:** `(a && (b > (c * d)))`
+
+### A1.0607 — `a == b > c + d`
+- **Source:** `a == b > c + d`
+- **Grouping:** `((a == b) > (c + d))`
+
+### A1.0608 — `a >> b - c / d`
+- **Source:** `a >> b - c / d`
+- **Grouping:** `(a >> (b - (c / d)))`
+
+### A1.0609 — `a && b * c <= d`
+- **Source:** `a && b * c <= d`
+- **Grouping:** `(a && ((b * c) <= d))`
+
+### A1.0610 — `a >= b % c | d`
+- **Source:** `a >= b % c | d`
+- **Grouping:** `(a >= ((b % c) | d))`
+
+### A1.0611 — `a < b % c / d`
+- **Source:** `a < b % c / d`
+- **Grouping:** `(a < ((b % c) / d))`
+
+### A1.0612 — `a >> b && c - d`
+- **Source:** `a >> b && c - d`
+- **Grouping:** `((a >> b) && (c - d))`
+
+### A1.0613 — `a /= b == c == d`
+- **Source:** `a /= b == c == d`
+- **Grouping:** `(((a /= b) == c) == d)`
+
+### A1.0614 — `a % b / c / d`
+- **Source:** `a % b / c / d`
+- **Grouping:** `(((a % b) / c) / d)`
+
+### A1.0615 — `a * b + c >= d`
+- **Source:** `a * b + c >= d`
+- **Grouping:** `(((a * b) + c) >= d)`
+
+### A1.0616 — `a & b / c > d`
+- **Source:** `a & b / c > d`
+- **Grouping:** `((a & (b / c)) > d)`
+
+### A1.0617 — `a ^ b < c % d`
+- **Source:** `a ^ b < c % d`
+- **Grouping:** `((a ^ b) < (c % d))`
+
+### A1.0618 — `a < b >> c == d`
+- **Source:** `a < b >> c == d`
+- **Grouping:** `((a < (b >> c)) == d)`
+
+### A1.0619 — `a * b % c && d`
+- **Source:** `a * b % c && d`
+- **Grouping:** `(((a * b) % c) && d)`
+
+### A1.0620 — `a <= b | c >> d`
+- **Source:** `a <= b | c >> d`
+- **Grouping:** `(a <= (b | (c >> d)))`
+
+### A1.0621 — `a < b % c % d`
+- **Source:** `a < b % c % d`
+- **Grouping:** `(a < ((b % c) % d))`
+
+### A1.0622 — `a | b . c / d`
+- **Source:** `a | b . c / d`
+- **Grouping:** `(a | ((b . c) / d))`
+
+### A1.0623 — `a . b <= c == d`
+- **Source:** `a . b <= c == d`
+- **Grouping:** `(((a . b) <= c) == d)`
+
+### A1.0624 — `a < b . c < d`
+- **Source:** `a < b . c < d`
+- **Grouping:** `((a < (b . c)) < d)`
+
+### A1.0625 — `a % b == c == d`
+- **Source:** `a % b == c == d`
+- **Grouping:** `(((a % b) == c) == d)`
+
+### A1.0626 — `a | b << c <= d`
+- **Source:** `a | b << c <= d`
+- **Grouping:** `((a | (b << c)) <= d)`
+
+### A1.0627 — `a && b <= c . d`
+- **Source:** `a && b <= c . d`
+- **Grouping:** `(a && (b <= (c . d)))`
+
+### A1.0628 — `a || b & c == d`
+- **Source:** `a || b & c == d`
+- **Grouping:** `(a || ((b & c) == d))`
+
+### A1.0629 — `a >> b < c /= d`
+- **Source:** `a >> b < c /= d`
+- **Grouping:** `(((a >> b) < c) /= d)`
+
+### A1.0630 — `a > b < c + d`
+- **Source:** `a > b < c + d`
+- **Grouping:** `((a > b) < (c + d))`
+
+### A1.0631 — `a < b << c + d`
+- **Source:** `a < b << c + d`
+- **Grouping:** `(a < (b << (c + d)))`
+
+### A1.0632 — `a || b / c | d`
+- **Source:** `a || b / c | d`
+- **Grouping:** `(a || ((b / c) | d))`
+
+### A1.0633 — `a >> b && c > d`
+- **Source:** `a >> b && c > d`
+- **Grouping:** `((a >> b) && (c > d))`
+
+### A1.0634 — `a + b || c . d`
+- **Source:** `a + b || c . d`
+- **Grouping:** `((a + b) || (c . d))`
+
+### A1.0635 — `a ^ b && c ^ d`
+- **Source:** `a ^ b && c ^ d`
+- **Grouping:** `((a ^ b) && (c ^ d))`
+
+### A1.0636 — `a ^ b ^ c ^ d`
+- **Source:** `a ^ b ^ c ^ d`
+- **Grouping:** `(((a ^ b) ^ c) ^ d)`
+
+### A1.0637 — `a >> b >> c <= d`
+- **Source:** `a >> b >> c <= d`
+- **Grouping:** `(((a >> b) >> c) <= d)`
+
+### A1.0638 — `a == b > c <= d`
+- **Source:** `a == b > c <= d`
+- **Grouping:** `(((a == b) > c) <= d)`
+
+### A1.0639 — `a || b . c | d`
+- **Source:** `a || b . c | d`
+- **Grouping:** `(a || ((b . c) | d))`
+
+### A1.0640 — `a == b >= c >= d`
+- **Source:** `a == b >= c >= d`
+- **Grouping:** `(((a == b) >= c) >= d)`
+
+### A1.0641 — `a && b || c && d`
+- **Source:** `a && b || c && d`
+- **Grouping:** `((a && b) || (c && d))`
+
+### A1.0642 — `a > b & c - d`
+- **Source:** `a > b & c - d`
+- **Grouping:** `(a > (b & (c - d)))`
+
+### A1.0643 — `a - b | c & d`
+- **Source:** `a - b | c & d`
+- **Grouping:** `(((a - b) | c) & d)`
+
+### A1.0644 — `a < b % c || d`
+- **Source:** `a < b % c || d`
+- **Grouping:** `((a < (b % c)) || d)`
+
+### A1.0645 — `a > b || c - d`
+- **Source:** `a > b || c - d`
+- **Grouping:** `((a > b) || (c - d))`
+
+### A1.0646 — `a * b % c >= d`
+- **Source:** `a * b % c >= d`
+- **Grouping:** `(((a * b) % c) >= d)`
+
+### A1.0647 — `a - b <= c % d`
+- **Source:** `a - b <= c % d`
+- **Grouping:** `((a - b) <= (c % d))`
+
+### A1.0648 — `a * b - c + d`
+- **Source:** `a * b - c + d`
+- **Grouping:** `(((a * b) - c) + d)`
+
+### A1.0649 — `a >= b == c + d`
+- **Source:** `a >= b == c + d`
+- **Grouping:** `((a >= b) == (c + d))`
+
+### A1.0650 — `a && b + c || d`
+- **Source:** `a && b + c || d`
+- **Grouping:** `((a && (b + c)) || d)`
+
+### A1.0651 — `a <= b . c >> d`
+- **Source:** `a <= b . c >> d`
+- **Grouping:** `(a <= ((b . c) >> d))`
+
+### A1.0652 — `a << b + c > d`
+- **Source:** `a << b + c > d`
+- **Grouping:** `((a << (b + c)) > d)`
+
+### A1.0653 — `a || b == c <= d`
+- **Source:** `a || b == c <= d`
+- **Grouping:** `(a || ((b == c) <= d))`
+
+### A1.0654 — `a > b ^ c << d`
+- **Source:** `a > b ^ c << d`
+- **Grouping:** `(a > (b ^ (c << d)))`
+
+### A1.0655 — `a - b | c . d`
+- **Source:** `a - b | c . d`
+- **Grouping:** `((a - b) | (c . d))`
+
+### A1.0656 — `a << b <= c / d`
+- **Source:** `a << b <= c / d`
+- **Grouping:** `((a << b) <= (c / d))`
+
+### A1.0657 — `a >= b | c | d`
+- **Source:** `a >= b | c | d`
+- **Grouping:** `(a >= ((b | c) | d))`
+
+### A1.0658 — `a / b > c - d`
+- **Source:** `a / b > c - d`
+- **Grouping:** `((a / b) > (c - d))`
+
+### A1.0659 — `a <= b >> c & d`
+- **Source:** `a <= b >> c & d`
+- **Grouping:** `(a <= ((b >> c) & d))`
+
+### A1.0660 — `a % b / c - d`
+- **Source:** `a % b / c - d`
+- **Grouping:** `(((a % b) / c) - d)`
+
+### A1.0661 — `a > b >> c . d`
+- **Source:** `a > b >> c . d`
+- **Grouping:** `(a > (b >> (c . d)))`
+
+### A1.0662 — `a >= b % c + d`
+- **Source:** `a >= b % c + d`
+- **Grouping:** `(a >= ((b % c) + d))`
+
+### A1.0663 — `a /= b && c <= d`
+- **Source:** `a /= b && c <= d`
+- **Grouping:** `((a /= b) && (c <= d))`
+
+### A1.0664 — `a <= b - c - d`
+- **Source:** `a <= b - c - d`
+- **Grouping:** `(a <= ((b - c) - d))`
+
+### A1.0665 — `a > b . c /= d`
+- **Source:** `a > b . c /= d`
+- **Grouping:** `((a > (b . c)) /= d)`
+
+### A1.0666 — `a * b < c . d`
+- **Source:** `a * b < c . d`
+- **Grouping:** `((a * b) < (c . d))`
+
+### A1.0667 — `a <= b || c >> d`
+- **Source:** `a <= b || c >> d`
+- **Grouping:** `((a <= b) || (c >> d))`
+
+### A1.0668 — `a < b && c | d`
+- **Source:** `a < b && c | d`
+- **Grouping:** `((a < b) && (c | d))`
+
+### A1.0669 — `a < b >= c > d`
+- **Source:** `a < b >= c > d`
+- **Grouping:** `(((a < b) >= c) > d)`
+
+### A1.0670 — `a % b / c | d`
+- **Source:** `a % b / c | d`
+- **Grouping:** `(((a % b) / c) | d)`
+
+### A1.0671 — `a . b & c >> d`
+- **Source:** `a . b & c >> d`
+- **Grouping:** `((a . b) & (c >> d))`
+
+### A1.0672 — `a ^ b * c / d`
+- **Source:** `a ^ b * c / d`
+- **Grouping:** `(a ^ ((b * c) / d))`
+
+### A1.0673 — `a >= b + c >= d`
+- **Source:** `a >= b + c >= d`
+- **Grouping:** `((a >= (b + c)) >= d)`
+
+### A1.0674 — `a << b > c > d`
+- **Source:** `a << b > c > d`
+- **Grouping:** `(((a << b) > c) > d)`
+
+### A1.0675 — `a || b - c > d`
+- **Source:** `a || b - c > d`
+- **Grouping:** `(a || ((b - c) > d))`
+
+### A1.0676 — `a == b == c /= d`
+- **Source:** `a == b == c /= d`
+- **Grouping:** `(((a == b) == c) /= d)`
+
+### A1.0677 — `a << b - c == d`
+- **Source:** `a << b - c == d`
+- **Grouping:** `((a << (b - c)) == d)`
+
+### A1.0678 — `a - b || c | d`
+- **Source:** `a - b || c | d`
+- **Grouping:** `((a - b) || (c | d))`
+
+### A1.0679 — `a % b - c << d`
+- **Source:** `a % b - c << d`
+- **Grouping:** `(((a % b) - c) << d)`
+
+### A1.0680 — `a | b <= c . d`
+- **Source:** `a | b <= c . d`
+- **Grouping:** `((a | b) <= (c . d))`
+
+### A1.0681 — `a & b | c >= d`
+- **Source:** `a & b | c >= d`
+- **Grouping:** `(((a & b) | c) >= d)`
+
+### A1.0682 — `a + b + c >= d`
+- **Source:** `a + b + c >= d`
+- **Grouping:** `(((a + b) + c) >= d)`
+
+### A1.0683 — `a << b & c == d`
+- **Source:** `a << b & c == d`
+- **Grouping:** `(((a << b) & c) == d)`
+
+### A1.0684 — `a /= b & c - d`
+- **Source:** `a /= b & c - d`
+- **Grouping:** `(a /= (b & (c - d)))`
+
+### A1.0685 — `a >> b <= c & d`
+- **Source:** `a >> b <= c & d`
+- **Grouping:** `((a >> b) <= (c & d))`
+
+### A1.0686 — `a || b - c * d`
+- **Source:** `a || b - c * d`
+- **Grouping:** `(a || (b - (c * d)))`
+
+### A1.0687 — `a - b - c >= d`
+- **Source:** `a - b - c >= d`
+- **Grouping:** `(((a - b) - c) >= d)`
+
+### A1.0688 — `a | b >= c < d`
+- **Source:** `a | b >= c < d`
+- **Grouping:** `(((a | b) >= c) < d)`
+
+### A1.0689 — `a || b == c + d`
+- **Source:** `a || b == c + d`
+- **Grouping:** `(a || (b == (c + d)))`
+
+### A1.0690 — `a <= b >> c - d`
+- **Source:** `a <= b >> c - d`
+- **Grouping:** `(a <= (b >> (c - d)))`
+
+### A1.0691 — `a < b / c || d`
+- **Source:** `a < b / c || d`
+- **Grouping:** `((a < (b / c)) || d)`
+
+### A1.0692 — `a >> b || c || d`
+- **Source:** `a >> b || c || d`
+- **Grouping:** `(((a >> b) || c) || d)`
+
+### A1.0693 — `a || b < c % d`
+- **Source:** `a || b < c % d`
+- **Grouping:** `(a || (b < (c % d)))`
+
+### A1.0694 — `a || b >= c && d`
+- **Source:** `a || b >= c && d`
+- **Grouping:** `(a || ((b >= c) && d))`
+
+### A1.0695 — `a << b . c / d`
+- **Source:** `a << b . c / d`
+- **Grouping:** `(a << ((b . c) / d))`
+
+### A1.0696 — `a << b && c << d`
+- **Source:** `a << b && c << d`
+- **Grouping:** `((a << b) && (c << d))`
+
+### A1.0697 — `a << b % c . d`
+- **Source:** `a << b % c . d`
+- **Grouping:** `(a << (b % (c . d)))`
+
+### A1.0698 — `a >> b > c == d`
+- **Source:** `a >> b > c == d`
+- **Grouping:** `(((a >> b) > c) == d)`
+
+### A1.0699 — `a % b + c >= d`
+- **Source:** `a % b + c >= d`
+- **Grouping:** `(((a % b) + c) >= d)`
+
+### A1.0700 — `a - b & c == d`
+- **Source:** `a - b & c == d`
+- **Grouping:** `(((a - b) & c) == d)`
+
+### A1.0701 — `a >> b < c >= d`
+- **Source:** `a >> b < c >= d`
+- **Grouping:** `(((a >> b) < c) >= d)`
+
+### A1.0702 — `a <= b * c >= d`
+- **Source:** `a <= b * c >= d`
+- **Grouping:** `((a <= (b * c)) >= d)`
+
+### A1.0703 — `a > b < c * d`
+- **Source:** `a > b < c * d`
+- **Grouping:** `((a > b) < (c * d))`
+
+### A1.0704 — `a - b || c || d`
+- **Source:** `a - b || c || d`
+- **Grouping:** `(((a - b) || c) || d)`
+
+### A1.0705 — `a >> b . c /= d`
+- **Source:** `a >> b . c /= d`
+- **Grouping:** `((a >> (b . c)) /= d)`
+
+### A1.0706 — `a / b >> c >> d`
+- **Source:** `a / b >> c >> d`
+- **Grouping:** `(((a / b) >> c) >> d)`
+
+### A1.0707 — `a && b << c / d`
+- **Source:** `a && b << c / d`
+- **Grouping:** `(a && (b << (c / d)))`
+
+### A1.0708 — `a <= b % c /= d`
+- **Source:** `a <= b % c /= d`
+- **Grouping:** `((a <= (b % c)) /= d)`
+
+### A1.0709 — `a == b < c ^ d`
+- **Source:** `a == b < c ^ d`
+- **Grouping:** `((a == b) < (c ^ d))`
+
+### A1.0710 — `a /= b & c < d`
+- **Source:** `a /= b & c < d`
+- **Grouping:** `((a /= (b & c)) < d)`
+
+### A1.0711 — `a && b + c | d`
+- **Source:** `a && b + c | d`
+- **Grouping:** `(a && ((b + c) | d))`
+
+### A1.0712 — `a + b / c > d`
+- **Source:** `a + b / c > d`
+- **Grouping:** `((a + (b / c)) > d)`
+
+### A1.0713 — `a % b | c >= d`
+- **Source:** `a % b | c >= d`
+- **Grouping:** `(((a % b) | c) >= d)`
+
+### A1.0714 — `a % b + c << d`
+- **Source:** `a % b + c << d`
+- **Grouping:** `(((a % b) + c) << d)`
+
+### A1.0715 — `a / b <= c / d`
+- **Source:** `a / b <= c / d`
+- **Grouping:** `((a / b) <= (c / d))`
+
+### A1.0716 — `a / b + c << d`
+- **Source:** `a / b + c << d`
+- **Grouping:** `(((a / b) + c) << d)`
+
+### A1.0717 — `a <= b >= c + d`
+- **Source:** `a <= b >= c + d`
+- **Grouping:** `((a <= b) >= (c + d))`
+
+### A1.0718 — `a - b >= c << d`
+- **Source:** `a - b >= c << d`
+- **Grouping:** `((a - b) >= (c << d))`
+
+### A1.0719 — `a || b . c & d`
+- **Source:** `a || b . c & d`
+- **Grouping:** `(a || ((b . c) & d))`
+
+### A1.0720 — `a ^ b >= c <= d`
+- **Source:** `a ^ b >= c <= d`
+- **Grouping:** `(((a ^ b) >= c) <= d)`
+
+### A1.0721 — `a <= b * c >> d`
+- **Source:** `a <= b * c >> d`
+- **Grouping:** `(a <= ((b * c) >> d))`
+
+### A1.0722 — `a + b | c & d`
+- **Source:** `a + b | c & d`
+- **Grouping:** `(((a + b) | c) & d)`
+
+### A1.0723 — `a + b / c == d`
+- **Source:** `a + b / c == d`
+- **Grouping:** `((a + (b / c)) == d)`
+
+### A1.0724 — `a <= b /= c << d`
+- **Source:** `a <= b /= c << d`
+- **Grouping:** `((a <= b) /= (c << d))`
+
+### A1.0725 — `a << b <= c && d`
+- **Source:** `a << b <= c && d`
+- **Grouping:** `(((a << b) <= c) && d)`
+
+### A1.0726 — `a /= b == c . d`
+- **Source:** `a /= b == c . d`
+- **Grouping:** `((a /= b) == (c . d))`
+
+### A1.0727 — `a && b * c . d`
+- **Source:** `a && b * c . d`
+- **Grouping:** `(a && (b * (c . d)))`
+
+### A1.0728 — `a ^ b <= c & d`
+- **Source:** `a ^ b <= c & d`
+- **Grouping:** `((a ^ b) <= (c & d))`
+
+### A1.0729 — `a >= b ^ c >= d`
+- **Source:** `a >= b ^ c >= d`
+- **Grouping:** `((a >= (b ^ c)) >= d)`
+
+### A1.0730 — `a /= b * c . d`
+- **Source:** `a /= b * c . d`
+- **Grouping:** `(a /= (b * (c . d)))`
+
+### A1.0731 — `a || b ^ c / d`
+- **Source:** `a || b ^ c / d`
+- **Grouping:** `(a || (b ^ (c / d)))`
+
+### A1.0732 — `a | b / c + d`
+- **Source:** `a | b / c + d`
+- **Grouping:** `(a | ((b / c) + d))`
+
+### A1.0733 — `a <= b || c >= d`
+- **Source:** `a <= b || c >= d`
+- **Grouping:** `((a <= b) || (c >= d))`
+
+### A1.0734 — `a || b * c && d`
+- **Source:** `a || b * c && d`
+- **Grouping:** `(a || ((b * c) && d))`
+
+### A1.0735 — `a & b & c & d`
+- **Source:** `a & b & c & d`
+- **Grouping:** `(((a & b) & c) & d)`
+
+### A1.0736 — `a <= b ^ c || d`
+- **Source:** `a <= b ^ c || d`
+- **Grouping:** `((a <= (b ^ c)) || d)`
+
+### A1.0737 — `a /= b ^ c || d`
+- **Source:** `a /= b ^ c || d`
+- **Grouping:** `((a /= (b ^ c)) || d)`
+
+### A1.0738 — `a . b & c && d`
+- **Source:** `a . b & c && d`
+- **Grouping:** `(((a . b) & c) && d)`
+
+### A1.0739 — `a <= b ^ c >= d`
+- **Source:** `a <= b ^ c >= d`
+- **Grouping:** `((a <= (b ^ c)) >= d)`
+
+### A1.0740 — `a || b <= c == d`
+- **Source:** `a || b <= c == d`
+- **Grouping:** `(a || ((b <= c) == d))`
+
+### A1.0741 — `a * b <= c <= d`
+- **Source:** `a * b <= c <= d`
+- **Grouping:** `(((a * b) <= c) <= d)`
+
+### A1.0742 — `a || b . c && d`
+- **Source:** `a || b . c && d`
+- **Grouping:** `(a || ((b . c) && d))`
+
+### A1.0743 — `a < b == c << d`
+- **Source:** `a < b == c << d`
+- **Grouping:** `((a < b) == (c << d))`
+
+### A1.0744 — `a > b >= c > d`
+- **Source:** `a > b >= c > d`
+- **Grouping:** `(((a > b) >= c) > d)`
+
+### A1.0745 — `a || b >= c < d`
+- **Source:** `a || b >= c < d`
+- **Grouping:** `(a || ((b >= c) < d))`
+
+### A1.0746 — `a + b < c / d`
+- **Source:** `a + b < c / d`
+- **Grouping:** `((a + b) < (c / d))`
+
+### A1.0747 — `a * b * c < d`
+- **Source:** `a * b * c < d`
+- **Grouping:** `(((a * b) * c) < d)`
+
+### A1.0748 — `a & b || c % d`
+- **Source:** `a & b || c % d`
+- **Grouping:** `((a & b) || (c % d))`
+
+### A1.0749 — `a - b >> c <= d`
+- **Source:** `a - b >> c <= d`
+- **Grouping:** `(((a - b) >> c) <= d)`
+
+### A1.0750 — `a > b == c && d`
+- **Source:** `a > b == c && d`
+- **Grouping:** `(((a > b) == c) && d)`
+
+### A1.0751 — `a == b <= c ^ d`
+- **Source:** `a == b <= c ^ d`
+- **Grouping:** `((a == b) <= (c ^ d))`
+
+### A1.0752 — `a << b && c - d`
+- **Source:** `a << b && c - d`
+- **Grouping:** `((a << b) && (c - d))`
+
+### A1.0753 — `a /= b && c < d`
+- **Source:** `a /= b && c < d`
+- **Grouping:** `((a /= b) && (c < d))`
+
+### A1.0754 — `a + b & c | d`
+- **Source:** `a + b & c | d`
+- **Grouping:** `(((a + b) & c) | d)`
+
+### A1.0755 — `a < b < c << d`
+- **Source:** `a < b < c << d`
+- **Grouping:** `((a < b) < (c << d))`
+
+### A1.0756 — `a >= b < c - d`
+- **Source:** `a >= b < c - d`
+- **Grouping:** `((a >= b) < (c - d))`
+
+### A1.0757 — `a . b / c << d`
+- **Source:** `a . b / c << d`
+- **Grouping:** `(((a . b) / c) << d)`
+
+### A1.0758 — `a . b - c == d`
+- **Source:** `a . b - c == d`
+- **Grouping:** `(((a . b) - c) == d)`
+
+### A1.0759 — `a / b && c % d`
+- **Source:** `a / b && c % d`
+- **Grouping:** `((a / b) && (c % d))`
+
+### A1.0760 — `a /= b ^ c < d`
+- **Source:** `a /= b ^ c < d`
+- **Grouping:** `((a /= (b ^ c)) < d)`
+
+### A1.0761 — `a || b <= c < d`
+- **Source:** `a || b <= c < d`
+- **Grouping:** `(a || ((b <= c) < d))`
+
+### A1.0762 — `a / b <= c >= d`
+- **Source:** `a / b <= c >= d`
+- **Grouping:** `(((a / b) <= c) >= d)`
+
+### A1.0763 — `a | b & c <= d`
+- **Source:** `a | b & c <= d`
+- **Grouping:** `(((a | b) & c) <= d)`
+
+### A1.0764 — `a . b ^ c <= d`
+- **Source:** `a . b ^ c <= d`
+- **Grouping:** `(((a . b) ^ c) <= d)`
+
+### A1.0765 — `a | b - c - d`
+- **Source:** `a | b - c - d`
+- **Grouping:** `(a | ((b - c) - d))`
+
+### A1.0766 — `a * b << c . d`
+- **Source:** `a * b << c . d`
+- **Grouping:** `((a * b) << (c . d))`
+
+### A1.0767 — `a + b << c << d`
+- **Source:** `a + b << c << d`
+- **Grouping:** `(((a + b) << c) << d)`
+
+### A1.0768 — `a && b / c * d`
+- **Source:** `a && b / c * d`
+- **Grouping:** `(a && ((b / c) * d))`
+
+### A1.0769 — `a / b & c . d`
+- **Source:** `a / b & c . d`
+- **Grouping:** `((a / b) & (c . d))`
+
+### A1.0770 — `a == b < c * d`
+- **Source:** `a == b < c * d`
+- **Grouping:** `((a == b) < (c * d))`
+
+### A1.0771 — `a | b == c >= d`
+- **Source:** `a | b == c >= d`
+- **Grouping:** `(((a | b) == c) >= d)`
+
+### A1.0772 — `a <= b * c << d`
+- **Source:** `a <= b * c << d`
+- **Grouping:** `(a <= ((b * c) << d))`
+
+### A1.0773 — `a % b >> c << d`
+- **Source:** `a % b >> c << d`
+- **Grouping:** `(((a % b) >> c) << d)`
+
+### A1.0774 — `a % b & c * d`
+- **Source:** `a % b & c * d`
+- **Grouping:** `((a % b) & (c * d))`
+
+### A1.0775 — `a | b & c == d`
+- **Source:** `a | b & c == d`
+- **Grouping:** `(((a | b) & c) == d)`
+
+### A1.0776 — `a . b % c >> d`
+- **Source:** `a . b % c >> d`
+- **Grouping:** `(((a . b) % c) >> d)`
+
+### A1.0777 — `a < b && c % d`
+- **Source:** `a < b && c % d`
+- **Grouping:** `((a < b) && (c % d))`
+
+### A1.0778 — `a . b / c >= d`
+- **Source:** `a . b / c >= d`
+- **Grouping:** `(((a . b) / c) >= d)`
+
+### A1.0779 — `a == b + c < d`
+- **Source:** `a == b + c < d`
+- **Grouping:** `((a == (b + c)) < d)`
+
+### A1.0780 — `a . b & c || d`
+- **Source:** `a . b & c || d`
+- **Grouping:** `(((a . b) & c) || d)`
+
+### A1.0781 — `a - b + c >= d`
+- **Source:** `a - b + c >= d`
+- **Grouping:** `(((a - b) + c) >= d)`
+
+### A1.0782 — `a < b && c . d`
+- **Source:** `a < b && c . d`
+- **Grouping:** `((a < b) && (c . d))`
+
+### A1.0783 — `a / b . c - d`
+- **Source:** `a / b . c - d`
+- **Grouping:** `((a / (b . c)) - d)`
+
+### A1.0784 — `a <= b . c - d`
+- **Source:** `a <= b . c - d`
+- **Grouping:** `(a <= ((b . c) - d))`
+
+### A1.0785 — `a * b ^ c || d`
+- **Source:** `a * b ^ c || d`
+- **Grouping:** `(((a * b) ^ c) || d)`
+
+### A1.0786 — `a - b . c /= d`
+- **Source:** `a - b . c /= d`
+- **Grouping:** `((a - (b . c)) /= d)`
+
+### A1.0787 — `a & b == c - d`
+- **Source:** `a & b == c - d`
+- **Grouping:** `((a & b) == (c - d))`
+
+### A1.0788 — `a << b << c | d`
+- **Source:** `a << b << c | d`
+- **Grouping:** `(((a << b) << c) | d)`
+
+### A1.0789 — `a || b < c ^ d`
+- **Source:** `a || b < c ^ d`
+- **Grouping:** `(a || (b < (c ^ d)))`
+
+### A1.0790 — `a && b | c >> d`
+- **Source:** `a && b | c >> d`
+- **Grouping:** `(a && (b | (c >> d)))`
+
+### A1.0791 — `a && b << c && d`
+- **Source:** `a && b << c && d`
+- **Grouping:** `((a && (b << c)) && d)`
+
+### A1.0792 — `a - b - c || d`
+- **Source:** `a - b - c || d`
+- **Grouping:** `(((a - b) - c) || d)`
+
+### A1.0793 — `a << b /= c >> d`
+- **Source:** `a << b /= c >> d`
+- **Grouping:** `((a << b) /= (c >> d))`
+
+### A1.0794 — `a ^ b - c /= d`
+- **Source:** `a ^ b - c /= d`
+- **Grouping:** `((a ^ (b - c)) /= d)`
+
+### A1.0795 — `a >> b /= c ^ d`
+- **Source:** `a >> b /= c ^ d`
+- **Grouping:** `((a >> b) /= (c ^ d))`
+
+### A1.0796 — `a - b /= c /= d`
+- **Source:** `a - b /= c /= d`
+- **Grouping:** `(((a - b) /= c) /= d)`
+
+### A1.0797 — `a * b & c > d`
+- **Source:** `a * b & c > d`
+- **Grouping:** `(((a * b) & c) > d)`
+
+### A1.0798 — `a < b == c . d`
+- **Source:** `a < b == c . d`
+- **Grouping:** `((a < b) == (c . d))`
+
+### A1.0799 — `a >> b * c * d`
+- **Source:** `a >> b * c * d`
+- **Grouping:** `(a >> ((b * c) * d))`
+
+### A1.0800 — `a <= b >= c && d`
+- **Source:** `a <= b >= c && d`
+- **Grouping:** `(((a <= b) >= c) && d)`
+
+### A1.0801 — `a . b >= c % d`
+- **Source:** `a . b >= c % d`
+- **Grouping:** `((a . b) >= (c % d))`
+
+### A1.0802 — `a - b . c % d`
+- **Source:** `a - b . c % d`
+- **Grouping:** `(a - ((b . c) % d))`
+
+### A1.0803 — `a % b >= c % d`
+- **Source:** `a % b >= c % d`
+- **Grouping:** `((a % b) >= (c % d))`
+
+### A1.0804 — `a >> b | c < d`
+- **Source:** `a >> b | c < d`
+- **Grouping:** `(((a >> b) | c) < d)`
+
+### A1.0805 — `a >= b + c >> d`
+- **Source:** `a >= b + c >> d`
+- **Grouping:** `(a >= ((b + c) >> d))`
+
+### A1.0806 — `a / b /= c << d`
+- **Source:** `a / b /= c << d`
+- **Grouping:** `((a / b) /= (c << d))`
+
+### A1.0807 — `a * b <= c / d`
+- **Source:** `a * b <= c / d`
+- **Grouping:** `((a * b) <= (c / d))`
+
+### A1.0808 — `a == b - c / d`
+- **Source:** `a == b - c / d`
+- **Grouping:** `(a == (b - (c / d)))`
+
+### A1.0809 — `a == b && c . d`
+- **Source:** `a == b && c . d`
+- **Grouping:** `((a == b) && (c . d))`
+
+### A1.0810 — `a /= b ^ c && d`
+- **Source:** `a /= b ^ c && d`
+- **Grouping:** `((a /= (b ^ c)) && d)`
+
+### A1.0811 — `a < b < c >= d`
+- **Source:** `a < b < c >= d`
+- **Grouping:** `(((a < b) < c) >= d)`
+
+### A1.0812 — `a && b == c + d`
+- **Source:** `a && b == c + d`
+- **Grouping:** `(a && (b == (c + d)))`
+
+### A1.0813 — `a << b + c * d`
+- **Source:** `a << b + c * d`
+- **Grouping:** `(a << (b + (c * d)))`
+
+### A1.0814 — `a / b - c < d`
+- **Source:** `a / b - c < d`
+- **Grouping:** `(((a / b) - c) < d)`
+
+### A1.0815 — `a /= b >> c == d`
+- **Source:** `a /= b >> c == d`
+- **Grouping:** `((a /= (b >> c)) == d)`
+
+### A1.0816 — `a << b & c | d`
+- **Source:** `a << b & c | d`
+- **Grouping:** `(((a << b) & c) | d)`
+
+### A1.0817 — `a > b % c . d`
+- **Source:** `a > b % c . d`
+- **Grouping:** `(a > (b % (c . d)))`
+
+### A1.0818 — `a <= b == c /= d`
+- **Source:** `a <= b == c /= d`
+- **Grouping:** `(((a <= b) == c) /= d)`
+
+### A1.0819 — `a + b < c /= d`
+- **Source:** `a + b < c /= d`
+- **Grouping:** `(((a + b) < c) /= d)`
+
+### A1.0820 — `a > b && c >> d`
+- **Source:** `a > b && c >> d`
+- **Grouping:** `((a > b) && (c >> d))`
+
+### A1.0821 — `a && b == c * d`
+- **Source:** `a && b == c * d`
+- **Grouping:** `(a && (b == (c * d)))`
+
+### A1.0822 — `a & b /= c == d`
+- **Source:** `a & b /= c == d`
+- **Grouping:** `(((a & b) /= c) == d)`
+
+### A1.0823 — `a >> b || c . d`
+- **Source:** `a >> b || c . d`
+- **Grouping:** `((a >> b) || (c . d))`
+
+### A1.0824 — `a + b > c < d`
+- **Source:** `a + b > c < d`
+- **Grouping:** `(((a + b) > c) < d)`
+
+### A1.0825 — `a == b >= c || d`
+- **Source:** `a == b >= c || d`
+- **Grouping:** `(((a == b) >= c) || d)`
+
+### A1.0826 — `a && b && c || d`
+- **Source:** `a && b && c || d`
+- **Grouping:** `(((a && b) && c) || d)`
+
+### A1.0827 — `a || b & c . d`
+- **Source:** `a || b & c . d`
+- **Grouping:** `(a || (b & (c . d)))`
+
+### A1.0828 — `a << b >> c >> d`
+- **Source:** `a << b >> c >> d`
+- **Grouping:** `(((a << b) >> c) >> d)`
+
+### A1.0829 — `a + b + c /= d`
+- **Source:** `a + b + c /= d`
+- **Grouping:** `(((a + b) + c) /= d)`
+
+### A1.0830 — `a / b /= c | d`
+- **Source:** `a / b /= c | d`
+- **Grouping:** `((a / b) /= (c | d))`
+
+### A1.0831 — `a << b + c + d`
+- **Source:** `a << b + c + d`
+- **Grouping:** `(a << ((b + c) + d))`
+
+### A1.0832 — `a | b | c ^ d`
+- **Source:** `a | b | c ^ d`
+- **Grouping:** `(((a | b) | c) ^ d)`
+
+### A1.0833 — `a || b * c | d`
+- **Source:** `a || b * c | d`
+- **Grouping:** `(a || ((b * c) | d))`
+
+### A1.0834 — `a << b + c << d`
+- **Source:** `a << b + c << d`
+- **Grouping:** `((a << (b + c)) << d)`
+
+### A1.0835 — `a <= b & c % d`
+- **Source:** `a <= b & c % d`
+- **Grouping:** `(a <= (b & (c % d)))`
+
+### A1.0836 — `a /= b - c > d`
+- **Source:** `a /= b - c > d`
+- **Grouping:** `((a /= (b - c)) > d)`
+
+### A1.0837 — `a > b < c || d`
+- **Source:** `a > b < c || d`
+- **Grouping:** `(((a > b) < c) || d)`
+
+### A1.0838 — `a . b == c | d`
+- **Source:** `a . b == c | d`
+- **Grouping:** `((a . b) == (c | d))`
+
+### A1.0839 — `a == b + c . d`
+- **Source:** `a == b + c . d`
+- **Grouping:** `(a == (b + (c . d)))`
+
+### A1.0840 — `a | b / c || d`
+- **Source:** `a | b / c || d`
+- **Grouping:** `((a | (b / c)) || d)`
+
+### A1.0841 — `a | b && c >> d`
+- **Source:** `a | b && c >> d`
+- **Grouping:** `((a | b) && (c >> d))`
+
+### A1.0842 — `a ^ b << c >= d`
+- **Source:** `a ^ b << c >= d`
+- **Grouping:** `((a ^ (b << c)) >= d)`
+
+### A1.0843 — `a /= b + c && d`
+- **Source:** `a /= b + c && d`
+- **Grouping:** `((a /= (b + c)) && d)`
+
+### A1.0844 — `a + b * c >> d`
+- **Source:** `a + b * c >> d`
+- **Grouping:** `((a + (b * c)) >> d)`
+
+### A1.0845 — `a + b == c % d`
+- **Source:** `a + b == c % d`
+- **Grouping:** `((a + b) == (c % d))`
+
+### A1.0846 — `a ^ b . c && d`
+- **Source:** `a ^ b . c && d`
+- **Grouping:** `((a ^ (b . c)) && d)`
+
+### A1.0847 — `a || b /= c /= d`
+- **Source:** `a || b /= c /= d`
+- **Grouping:** `(a || ((b /= c) /= d))`
+
+### A1.0848 — `a ^ b + c || d`
+- **Source:** `a ^ b + c || d`
+- **Grouping:** `((a ^ (b + c)) || d)`
+
+### A1.0849 — `a > b + c & d`
+- **Source:** `a > b + c & d`
+- **Grouping:** `(a > ((b + c) & d))`
+
+### A1.0850 — `a & b /= c / d`
+- **Source:** `a & b /= c / d`
+- **Grouping:** `((a & b) /= (c / d))`
+
+### A1.0851 — `a ^ b && c || d`
+- **Source:** `a ^ b && c || d`
+- **Grouping:** `(((a ^ b) && c) || d)`
+
+### A1.0852 — `a < b ^ c /= d`
+- **Source:** `a < b ^ c /= d`
+- **Grouping:** `((a < (b ^ c)) /= d)`
+
+### A1.0853 — `a <= b % c >> d`
+- **Source:** `a <= b % c >> d`
+- **Grouping:** `(a <= ((b % c) >> d))`
+
+### A1.0854 — `a << b - c >= d`
+- **Source:** `a << b - c >= d`
+- **Grouping:** `((a << (b - c)) >= d)`
+
+### A1.0855 — `a . b | c /= d`
+- **Source:** `a . b | c /= d`
+- **Grouping:** `(((a . b) | c) /= d)`
+
+### A1.0856 — `a && b ^ c ^ d`
+- **Source:** `a && b ^ c ^ d`
+- **Grouping:** `(a && ((b ^ c) ^ d))`
+
+### A1.0857 — `a + b - c * d`
+- **Source:** `a + b - c * d`
+- **Grouping:** `((a + b) - (c * d))`
+
+### A1.0858 — `a ^ b >> c > d`
+- **Source:** `a ^ b >> c > d`
+- **Grouping:** `((a ^ (b >> c)) > d)`
+
+### A1.0859 — `a && b /= c >> d`
+- **Source:** `a && b /= c >> d`
+- **Grouping:** `(a && (b /= (c >> d)))`
+
+### A1.0860 — `a > b << c - d`
+- **Source:** `a > b << c - d`
+- **Grouping:** `(a > (b << (c - d)))`
+
+### A1.0861 — `a >= b << c / d`
+- **Source:** `a >= b << c / d`
+- **Grouping:** `(a >= (b << (c / d)))`
+
+### A1.0862 — `a - b >> c && d`
+- **Source:** `a - b >> c && d`
+- **Grouping:** `(((a - b) >> c) && d)`
+
+### A1.0863 — `a < b * c / d`
+- **Source:** `a < b * c / d`
+- **Grouping:** `(a < ((b * c) / d))`
+
+### A1.0864 — `a * b / c | d`
+- **Source:** `a * b / c | d`
+- **Grouping:** `(((a * b) / c) | d)`
+
+### A1.0865 — `a | b . c - d`
+- **Source:** `a | b . c - d`
+- **Grouping:** `(a | ((b . c) - d))`
+
+### A1.0866 — `a % b || c || d`
+- **Source:** `a % b || c || d`
+- **Grouping:** `(((a % b) || c) || d)`
+
+### A1.0867 — `a - b >> c ^ d`
+- **Source:** `a - b >> c ^ d`
+- **Grouping:** `(((a - b) >> c) ^ d)`
+
+### A1.0868 — `a - b * c ^ d`
+- **Source:** `a - b * c ^ d`
+- **Grouping:** `((a - (b * c)) ^ d)`
+
+### A1.0869 — `a + b >> c == d`
+- **Source:** `a + b >> c == d`
+- **Grouping:** `(((a + b) >> c) == d)`
+
+### A1.0870 — `a & b / c || d`
+- **Source:** `a & b / c || d`
+- **Grouping:** `((a & (b / c)) || d)`
+
+### A1.0871 — `a && b >> c || d`
+- **Source:** `a && b >> c || d`
+- **Grouping:** `((a && (b >> c)) || d)`
+
+### A1.0872 — `a . b % c /= d`
+- **Source:** `a . b % c /= d`
+- **Grouping:** `(((a . b) % c) /= d)`
+
+### A1.0873 — `a << b % c % d`
+- **Source:** `a << b % c % d`
+- **Grouping:** `(a << ((b % c) % d))`
+
+### A1.0874 — `a /= b << c && d`
+- **Source:** `a /= b << c && d`
+- **Grouping:** `((a /= (b << c)) && d)`
+
+### A1.0875 — `a << b >> c > d`
+- **Source:** `a << b >> c > d`
+- **Grouping:** `(((a << b) >> c) > d)`
+
+### A1.0876 — `a || b /= c & d`
+- **Source:** `a || b /= c & d`
+- **Grouping:** `(a || (b /= (c & d)))`
+
+### A1.0877 — `a | b >= c > d`
+- **Source:** `a | b >= c > d`
+- **Grouping:** `(((a | b) >= c) > d)`
+
+### A1.0878 — `a * b . c /= d`
+- **Source:** `a * b . c /= d`
+- **Grouping:** `((a * (b . c)) /= d)`
+
+### A1.0879 — `a >> b < c == d`
+- **Source:** `a >> b < c == d`
+- **Grouping:** `(((a >> b) < c) == d)`
+
+### A1.0880 — `a + b << c /= d`
+- **Source:** `a + b << c /= d`
+- **Grouping:** `(((a + b) << c) /= d)`
+
+### A1.0881 — `a <= b ^ c == d`
+- **Source:** `a <= b ^ c == d`
+- **Grouping:** `((a <= (b ^ c)) == d)`
+
+### A1.0882 — `a || b >= c - d`
+- **Source:** `a || b >= c - d`
+- **Grouping:** `(a || (b >= (c - d)))`
+
+### A1.0883 — `a << b && c < d`
+- **Source:** `a << b && c < d`
+- **Grouping:** `((a << b) && (c < d))`
+
+### A1.0884 — `a < b >> c - d`
+- **Source:** `a < b >> c - d`
+- **Grouping:** `(a < (b >> (c - d)))`
+
+### A1.0885 — `a ^ b == c == d`
+- **Source:** `a ^ b == c == d`
+- **Grouping:** `(((a ^ b) == c) == d)`
+
+### A1.0886 — `a >= b >> c | d`
+- **Source:** `a >= b >> c | d`
+- **Grouping:** `(a >= ((b >> c) | d))`
+
+### A1.0887 — `a >> b - c >= d`
+- **Source:** `a >> b - c >= d`
+- **Grouping:** `((a >> (b - c)) >= d)`
+
+### A1.0888 — `a <= b | c /= d`
+- **Source:** `a <= b | c /= d`
+- **Grouping:** `((a <= (b | c)) /= d)`
+
+### A1.0889 — `a & b % c % d`
+- **Source:** `a & b % c % d`
+- **Grouping:** `(a & ((b % c) % d))`
+
+### A1.0890 — `a <= b < c > d`
+- **Source:** `a <= b < c > d`
+- **Grouping:** `(((a <= b) < c) > d)`
+
+### A1.0891 — `a > b . c & d`
+- **Source:** `a > b . c & d`
+- **Grouping:** `(a > ((b . c) & d))`
+
+### A1.0892 — `a * b >> c ^ d`
+- **Source:** `a * b >> c ^ d`
+- **Grouping:** `(((a * b) >> c) ^ d)`
+
+### A1.0893 — `a * b /= c ^ d`
+- **Source:** `a * b /= c ^ d`
+- **Grouping:** `((a * b) /= (c ^ d))`
+
+### A1.0894 — `a /= b && c | d`
+- **Source:** `a /= b && c | d`
+- **Grouping:** `((a /= b) && (c | d))`
+
+### A1.0895 — `a ^ b <= c && d`
+- **Source:** `a ^ b <= c && d`
+- **Grouping:** `(((a ^ b) <= c) && d)`
+
+### A1.0896 — `a | b ^ c & d`
+- **Source:** `a | b ^ c & d`
+- **Grouping:** `(((a | b) ^ c) & d)`
+
+### A1.0897 — `a > b > c . d`
+- **Source:** `a > b > c . d`
+- **Grouping:** `((a > b) > (c . d))`
+
+### A1.0898 — `a < b * c /= d`
+- **Source:** `a < b * c /= d`
+- **Grouping:** `((a < (b * c)) /= d)`
+
+### A1.0899 — `a * b | c < d`
+- **Source:** `a * b | c < d`
+- **Grouping:** `(((a * b) | c) < d)`
+
+### A1.0900 — `a % b == c >= d`
+- **Source:** `a % b == c >= d`
+- **Grouping:** `(((a % b) == c) >= d)`
+
+### A1.0901 — `a * b <= c >= d`
+- **Source:** `a * b <= c >= d`
+- **Grouping:** `(((a * b) <= c) >= d)`
+
+### A1.0902 — `a == b | c - d`
+- **Source:** `a == b | c - d`
+- **Grouping:** `(a == (b | (c - d)))`
+
+### A1.0903 — `a . b % c || d`
+- **Source:** `a . b % c || d`
+- **Grouping:** `(((a . b) % c) || d)`
+
+### A1.0904 — `a & b + c < d`
+- **Source:** `a & b + c < d`
+- **Grouping:** `((a & (b + c)) < d)`
+
+### A1.0905 — `a << b / c | d`
+- **Source:** `a << b / c | d`
+- **Grouping:** `((a << (b / c)) | d)`
+
+### A1.0906 — `a & b << c < d`
+- **Source:** `a & b << c < d`
+- **Grouping:** `((a & (b << c)) < d)`
+
+### A1.0907 — `a == b + c || d`
+- **Source:** `a == b + c || d`
+- **Grouping:** `((a == (b + c)) || d)`
+
+### A1.0908 — `a . b >= c || d`
+- **Source:** `a . b >= c || d`
+- **Grouping:** `(((a . b) >= c) || d)`
+
+### A1.0909 — `a && b << c < d`
+- **Source:** `a && b << c < d`
+- **Grouping:** `(a && ((b << c) < d))`
+
+### A1.0910 — `a ^ b /= c + d`
+- **Source:** `a ^ b /= c + d`
+- **Grouping:** `((a ^ b) /= (c + d))`
+
+### A1.0911 — `a . b < c | d`
+- **Source:** `a . b < c | d`
+- **Grouping:** `((a . b) < (c | d))`
+
+### A1.0912 — `a >= b == c < d`
+- **Source:** `a >= b == c < d`
+- **Grouping:** `(((a >= b) == c) < d)`
+
+### A1.0913 — `a . b <= c | d`
+- **Source:** `a . b <= c | d`
+- **Grouping:** `((a . b) <= (c | d))`
+
+### A1.0914 — `a - b == c . d`
+- **Source:** `a - b == c . d`
+- **Grouping:** `((a - b) == (c . d))`
+
+### A1.0915 — `a - b || c == d`
+- **Source:** `a - b || c == d`
+- **Grouping:** `((a - b) || (c == d))`
+
+### A1.0916 — `a && b > c >> d`
+- **Source:** `a && b > c >> d`
+- **Grouping:** `(a && (b > (c >> d)))`
+
+### A1.0917 — `a ^ b | c + d`
+- **Source:** `a ^ b | c + d`
+- **Grouping:** `((a ^ b) | (c + d))`
+
+### A1.0918 — `a >= b & c & d`
+- **Source:** `a >= b & c & d`
+- **Grouping:** `(a >= ((b & c) & d))`
+
+### A1.0919 — `a /= b <= c || d`
+- **Source:** `a /= b <= c || d`
+- **Grouping:** `(((a /= b) <= c) || d)`
+
+### A1.0920 — `a >= b && c / d`
+- **Source:** `a >= b && c / d`
+- **Grouping:** `((a >= b) && (c / d))`
+
+### A1.0921 — `a || b < c && d`
+- **Source:** `a || b < c && d`
+- **Grouping:** `(a || ((b < c) && d))`
+
+### A1.0922 — `a /= b >> c || d`
+- **Source:** `a /= b >> c || d`
+- **Grouping:** `((a /= (b >> c)) || d)`
+
+### A1.0923 — `a && b ^ c * d`
+- **Source:** `a && b ^ c * d`
+- **Grouping:** `(a && (b ^ (c * d)))`
+
+### A1.0924 — `a - b & c . d`
+- **Source:** `a - b & c . d`
+- **Grouping:** `((a - b) & (c . d))`
+
+### A1.0925 — `a == b == c / d`
+- **Source:** `a == b == c / d`
+- **Grouping:** `((a == b) == (c / d))`
+
+### A1.0926 — `a >= b > c | d`
+- **Source:** `a >= b > c | d`
+- **Grouping:** `((a >= b) > (c | d))`
+
+### A1.0927 — `a == b . c >> d`
+- **Source:** `a == b . c >> d`
+- **Grouping:** `(a == ((b . c) >> d))`
+
+### A1.0928 — `a - b /= c <= d`
+- **Source:** `a - b /= c <= d`
+- **Grouping:** `(((a - b) /= c) <= d)`
+
+### A1.0929 — `a % b - c <= d`
+- **Source:** `a % b - c <= d`
+- **Grouping:** `(((a % b) - c) <= d)`
+
+### A1.0930 — `a >> b == c && d`
+- **Source:** `a >> b == c && d`
+- **Grouping:** `(((a >> b) == c) && d)`
+
+### A1.0931 — `a >= b /= c << d`
+- **Source:** `a >= b /= c << d`
+- **Grouping:** `((a >= b) /= (c << d))`
+
+### A1.0932 — `a == b /= c /= d`
+- **Source:** `a == b /= c /= d`
+- **Grouping:** `(((a == b) /= c) /= d)`
+
+### A1.0933 — `a || b - c | d`
+- **Source:** `a || b - c | d`
+- **Grouping:** `(a || ((b - c) | d))`
+
+### A1.0934 — `a > b > c == d`
+- **Source:** `a > b > c == d`
+- **Grouping:** `(((a > b) > c) == d)`
+
+### A1.0935 — `a / b >> c + d`
+- **Source:** `a / b >> c + d`
+- **Grouping:** `((a / b) >> (c + d))`
+
+### A1.0936 — `a ^ b == c >= d`
+- **Source:** `a ^ b == c >= d`
+- **Grouping:** `(((a ^ b) == c) >= d)`
+
+### A1.0937 — `a >= b | c / d`
+- **Source:** `a >= b | c / d`
+- **Grouping:** `(a >= (b | (c / d)))`
+
+### A1.0938 — `a && b || c <= d`
+- **Source:** `a && b || c <= d`
+- **Grouping:** `((a && b) || (c <= d))`
+
+### A1.0939 — `a / b / c % d`
+- **Source:** `a / b / c % d`
+- **Grouping:** `(((a / b) / c) % d)`
+
+### A1.0940 — `a > b == c % d`
+- **Source:** `a > b == c % d`
+- **Grouping:** `((a > b) == (c % d))`
+
+### A1.0941 — `a >> b | c && d`
+- **Source:** `a >> b | c && d`
+- **Grouping:** `(((a >> b) | c) && d)`
+
+### A1.0942 — `a >= b + c . d`
+- **Source:** `a >= b + c . d`
+- **Grouping:** `(a >= (b + (c . d)))`
+
+### A1.0943 — `a <= b && c >= d`
+- **Source:** `a <= b && c >= d`
+- **Grouping:** `((a <= b) && (c >= d))`
+
+### A1.0944 — `a . b / c * d`
+- **Source:** `a . b / c * d`
+- **Grouping:** `(((a . b) / c) * d)`
+
+### A1.0945 — `a - b <= c & d`
+- **Source:** `a - b <= c & d`
+- **Grouping:** `((a - b) <= (c & d))`
+
+### A1.0946 — `a > b . c % d`
+- **Source:** `a > b . c % d`
+- **Grouping:** `(a > ((b . c) % d))`
+
+### A1.0947 — `a << b % c == d`
+- **Source:** `a << b % c == d`
+- **Grouping:** `((a << (b % c)) == d)`
+
+### A1.0948 — `a | b << c < d`
+- **Source:** `a | b << c < d`
+- **Grouping:** `((a | (b << c)) < d)`
+
+### A1.0949 — `a < b == c - d`
+- **Source:** `a < b == c - d`
+- **Grouping:** `((a < b) == (c - d))`
+
+### A1.0950 — `a << b * c - d`
+- **Source:** `a << b * c - d`
+- **Grouping:** `(a << ((b * c) - d))`
+
+### A1.0951 — `a - b /= c >= d`
+- **Source:** `a - b /= c >= d`
+- **Grouping:** `(((a - b) /= c) >= d)`
+
+### A1.0952 — `a << b || c & d`
+- **Source:** `a << b || c & d`
+- **Grouping:** `((a << b) || (c & d))`
+
+### A1.0953 — `a << b << c || d`
+- **Source:** `a << b << c || d`
+- **Grouping:** `(((a << b) << c) || d)`
+
+### A1.0954 — `a >> b ^ c /= d`
+- **Source:** `a >> b ^ c /= d`
+- **Grouping:** `(((a >> b) ^ c) /= d)`
+
+### A1.0955 — `a ^ b ^ c && d`
+- **Source:** `a ^ b ^ c && d`
+- **Grouping:** `(((a ^ b) ^ c) && d)`
+
+### A1.0956 — `a <= b << c / d`
+- **Source:** `a <= b << c / d`
+- **Grouping:** `(a <= (b << (c / d)))`
+
+### A1.0957 — `a < b << c /= d`
+- **Source:** `a < b << c /= d`
+- **Grouping:** `((a < (b << c)) /= d)`
+
+### A1.0958 — `a . b >> c * d`
+- **Source:** `a . b >> c * d`
+- **Grouping:** `((a . b) >> (c * d))`
+
+### A1.0959 — `a >> b == c > d`
+- **Source:** `a >> b == c > d`
+- **Grouping:** `(((a >> b) == c) > d)`
+
+### A1.0960 — `a << b / c >= d`
+- **Source:** `a << b / c >= d`
+- **Grouping:** `((a << (b / c)) >= d)`
+
+### A1.0961 — `a >= b <= c /= d`
+- **Source:** `a >= b <= c /= d`
+- **Grouping:** `(((a >= b) <= c) /= d)`
+
+### A1.0962 — `a << b < c || d`
+- **Source:** `a << b < c || d`
+- **Grouping:** `(((a << b) < c) || d)`
+
+### A1.0963 — `a & b < c . d`
+- **Source:** `a & b < c . d`
+- **Grouping:** `((a & b) < (c . d))`
+
+### A1.0964 — `a == b + c == d`
+- **Source:** `a == b + c == d`
+- **Grouping:** `((a == (b + c)) == d)`
+
+### A1.0965 — `a >> b ^ c && d`
+- **Source:** `a >> b ^ c && d`
+- **Grouping:** `(((a >> b) ^ c) && d)`
+
+### A1.0966 — `a - b <= c - d`
+- **Source:** `a - b <= c - d`
+- **Grouping:** `((a - b) <= (c - d))`
+
+### A1.0967 — `a /= b <= c /= d`
+- **Source:** `a /= b <= c /= d`
+- **Grouping:** `(((a /= b) <= c) /= d)`
+
+### A1.0968 — `a - b . c <= d`
+- **Source:** `a - b . c <= d`
+- **Grouping:** `((a - (b . c)) <= d)`
+
+### A1.0969 — `a & b && c || d`
+- **Source:** `a & b && c || d`
+- **Grouping:** `(((a & b) && c) || d)`
+
+### A1.0970 — `a + b >= c /= d`
+- **Source:** `a + b >= c /= d`
+- **Grouping:** `(((a + b) >= c) /= d)`
+
+### A1.0971 — `a > b . c | d`
+- **Source:** `a > b . c | d`
+- **Grouping:** `(a > ((b . c) | d))`
+
+### A1.0972 — `a > b | c / d`
+- **Source:** `a > b | c / d`
+- **Grouping:** `(a > (b | (c / d)))`
+
+### A1.0973 — `a /= b && c & d`
+- **Source:** `a /= b && c & d`
+- **Grouping:** `((a /= b) && (c & d))`
+
+### A1.0974 — `a < b % c & d`
+- **Source:** `a < b % c & d`
+- **Grouping:** `(a < ((b % c) & d))`
+
+### A1.0975 — `a & b % c + d`
+- **Source:** `a & b % c + d`
+- **Grouping:** `(a & ((b % c) + d))`
+
+### A1.0976 — `a /= b ^ c - d`
+- **Source:** `a /= b ^ c - d`
+- **Grouping:** `(a /= (b ^ (c - d)))`
+
+### A1.0977 — `a >= b & c * d`
+- **Source:** `a >= b & c * d`
+- **Grouping:** `(a >= (b & (c * d)))`
+
+### A1.0978 — `a ^ b . c * d`
+- **Source:** `a ^ b . c * d`
+- **Grouping:** `(a ^ ((b . c) * d))`
+
+### A1.0979 — `a == b > c * d`
+- **Source:** `a == b > c * d`
+- **Grouping:** `((a == b) > (c * d))`
+
+### A1.0980 — `a * b && c > d`
+- **Source:** `a * b && c > d`
+- **Grouping:** `((a * b) && (c > d))`
+
+### A1.0981 — `a . b . c / d`
+- **Source:** `a . b . c / d`
+- **Grouping:** `((a . (b . c)) / d)`
+
+### A1.0982 — `a <= b | c * d`
+- **Source:** `a <= b | c * d`
+- **Grouping:** `(a <= (b | (c * d)))`
+
+### A1.0983 — `a | b >> c >> d`
+- **Source:** `a | b >> c >> d`
+- **Grouping:** `(a | ((b >> c) >> d))`
+
+### A1.0984 — `a ^ b * c & d`
+- **Source:** `a ^ b * c & d`
+- **Grouping:** `((a ^ (b * c)) & d)`
+
+### A1.0985 — `a . b % c << d`
+- **Source:** `a . b % c << d`
+- **Grouping:** `(((a . b) % c) << d)`
+
+### A1.0986 — `a >> b /= c >= d`
+- **Source:** `a >> b /= c >= d`
+- **Grouping:** `(((a >> b) /= c) >= d)`
+
+### A1.0987 — `a * b % c % d`
+- **Source:** `a * b % c % d`
+- **Grouping:** `(((a * b) % c) % d)`
+
+### A1.0988 — `a % b < c && d`
+- **Source:** `a % b < c && d`
+- **Grouping:** `(((a % b) < c) && d)`
+
+### A1.0989 — `a & b | c / d`
+- **Source:** `a & b | c / d`
+- **Grouping:** `((a & b) | (c / d))`
+
+### A1.0990 — `a > b . c << d`
+- **Source:** `a > b . c << d`
+- **Grouping:** `(a > ((b . c) << d))`
+
+### A1.0991 — `a & b < c % d`
+- **Source:** `a & b < c % d`
+- **Grouping:** `((a & b) < (c % d))`
+
+### A1.0992 — `a - b + c <= d`
+- **Source:** `a - b + c <= d`
+- **Grouping:** `(((a - b) + c) <= d)`
+
+### A1.0993 — `a == b - c < d`
+- **Source:** `a == b - c < d`
+- **Grouping:** `((a == (b - c)) < d)`
+
+### A1.0994 — `a ^ b * c < d`
+- **Source:** `a ^ b * c < d`
+- **Grouping:** `((a ^ (b * c)) < d)`
+
+### A1.0995 — `a && b > c + d`
+- **Source:** `a && b > c + d`
+- **Grouping:** `(a && (b > (c + d)))`
+
+### A1.0996 — `a && b && c . d`
+- **Source:** `a && b && c . d`
+- **Grouping:** `((a && b) && (c . d))`
+
+### A1.0997 — `a /= b | c / d`
+- **Source:** `a /= b | c / d`
+- **Grouping:** `(a /= (b | (c / d)))`
+
+### A1.0998 — `a || b < c >= d`
+- **Source:** `a || b < c >= d`
+- **Grouping:** `(a || ((b < c) >= d))`
+
+### A1.0999 — `a /= b % c . d`
+- **Source:** `a /= b % c . d`
+- **Grouping:** `(a /= (b % (c . d)))`
+
+### A1.1000 — `a << b < c . d`
+- **Source:** `a << b < c . d`
+- **Grouping:** `((a << b) < (c . d))`
+
+### A1.1001 — `a / b > c . d`
+- **Source:** `a / b > c . d`
+- **Grouping:** `((a / b) > (c . d))`
+
+### A1.1002 — `a <= b << c ^ d`
+- **Source:** `a <= b << c ^ d`
+- **Grouping:** `(a <= ((b << c) ^ d))`
+
+### A1.1003 — `a >> b + c > d`
+- **Source:** `a >> b + c > d`
+- **Grouping:** `((a >> (b + c)) > d)`
+
+### A1.1004 — `a /= b - c == d`
+- **Source:** `a /= b - c == d`
+- **Grouping:** `((a /= (b - c)) == d)`
+
+### A1.1005 — `a <= b % c < d`
+- **Source:** `a <= b % c < d`
+- **Grouping:** `((a <= (b % c)) < d)`
+
+### A1.1006 — `a == b == c << d`
+- **Source:** `a == b == c << d`
+- **Grouping:** `((a == b) == (c << d))`
+
+### A1.1007 — `a <= b <= c - d`
+- **Source:** `a <= b <= c - d`
+- **Grouping:** `((a <= b) <= (c - d))`
+
+### A1.1008 — `a % b / c <= d`
+- **Source:** `a % b / c <= d`
+- **Grouping:** `(((a % b) / c) <= d)`
+
+### A1.1009 — `a % b - c ^ d`
+- **Source:** `a % b - c ^ d`
+- **Grouping:** `(((a % b) - c) ^ d)`
+
+### A1.1010 — `a / b && c + d`
+- **Source:** `a / b && c + d`
+- **Grouping:** `((a / b) && (c + d))`
+
+### A1.1011 — `a / b + c >= d`
+- **Source:** `a / b + c >= d`
+- **Grouping:** `(((a / b) + c) >= d)`
+
+### A1.1012 — `a % b == c + d`
+- **Source:** `a % b == c + d`
+- **Grouping:** `((a % b) == (c + d))`
+
+### A1.1013 — `a % b * c << d`
+- **Source:** `a % b * c << d`
+- **Grouping:** `(((a % b) * c) << d)`
+
+### A1.1014 — `a >= b << c . d`
+- **Source:** `a >= b << c . d`
+- **Grouping:** `(a >= (b << (c . d)))`
+
+### A1.1015 — `a * b >> c /= d`
+- **Source:** `a * b >> c /= d`
+- **Grouping:** `(((a * b) >> c) /= d)`
+
+### A1.1016 — `a % b < c & d`
+- **Source:** `a % b < c & d`
+- **Grouping:** `((a % b) < (c & d))`
+
+### A1.1017 — `a > b <= c + d`
+- **Source:** `a > b <= c + d`
+- **Grouping:** `((a > b) <= (c + d))`
+
+### A1.1018 — `a * b /= c . d`
+- **Source:** `a * b /= c . d`
+- **Grouping:** `((a * b) /= (c . d))`
+
+### A1.1019 — `a + b & c > d`
+- **Source:** `a + b & c > d`
+- **Grouping:** `(((a + b) & c) > d)`
+
+### A1.1020 — `a | b . c || d`
+- **Source:** `a | b . c || d`
+- **Grouping:** `((a | (b . c)) || d)`
+
+### A1.1021 — `a & b && c == d`
+- **Source:** `a & b && c == d`
+- **Grouping:** `((a & b) && (c == d))`
+
+### A1.1022 — `a <= b << c < d`
+- **Source:** `a <= b << c < d`
+- **Grouping:** `((a <= (b << c)) < d)`
+
+### A1.1023 — `a <= b - c > d`
+- **Source:** `a <= b - c > d`
+- **Grouping:** `((a <= (b - c)) > d)`
+
+### A1.1024 — `a / b + c | d`
+- **Source:** `a / b + c | d`
+- **Grouping:** `(((a / b) + c) | d)`
+
+### A1.1025 — `a ^ b || c + d`
+- **Source:** `a ^ b || c + d`
+- **Grouping:** `((a ^ b) || (c + d))`
+
+### A1.1026 — `a /= b % c == d`
+- **Source:** `a /= b % c == d`
+- **Grouping:** `((a /= (b % c)) == d)`
+
+### A1.1027 — `a < b == c > d`
+- **Source:** `a < b == c > d`
+- **Grouping:** `(((a < b) == c) > d)`
+
+### A1.1028 — `a % b <= c || d`
+- **Source:** `a % b <= c || d`
+- **Grouping:** `(((a % b) <= c) || d)`
+
+### A1.1029 — `a - b << c >> d`
+- **Source:** `a - b << c >> d`
+- **Grouping:** `(((a - b) << c) >> d)`
+
+### A1.1030 — `a >= b >= c - d`
+- **Source:** `a >= b >= c - d`
+- **Grouping:** `((a >= b) >= (c - d))`
+
+### A1.1031 — `a > b ^ c % d`
+- **Source:** `a > b ^ c % d`
+- **Grouping:** `(a > (b ^ (c % d)))`
+
+### A1.1032 — `a || b << c && d`
+- **Source:** `a || b << c && d`
+- **Grouping:** `(a || ((b << c) && d))`
+
+### A1.1033 — `a ^ b * c | d`
+- **Source:** `a ^ b * c | d`
+- **Grouping:** `((a ^ (b * c)) | d)`
+
+### A1.1034 — `a == b % c / d`
+- **Source:** `a == b % c / d`
+- **Grouping:** `(a == ((b % c) / d))`
+
+### A1.1035 — `a * b < c <= d`
+- **Source:** `a * b < c <= d`
+- **Grouping:** `(((a * b) < c) <= d)`
+
+### A1.1036 — `a || b - c ^ d`
+- **Source:** `a || b - c ^ d`
+- **Grouping:** `(a || ((b - c) ^ d))`
+
+### A1.1037 — `a >> b && c * d`
+- **Source:** `a >> b && c * d`
+- **Grouping:** `((a >> b) && (c * d))`
+
+### A1.1038 — `a && b . c == d`
+- **Source:** `a && b . c == d`
+- **Grouping:** `(a && ((b . c) == d))`
+
+### A1.1039 — `a >> b ^ c >> d`
+- **Source:** `a >> b ^ c >> d`
+- **Grouping:** `((a >> b) ^ (c >> d))`
+
+### A1.1040 — `a || b . c <= d`
+- **Source:** `a || b . c <= d`
+- **Grouping:** `(a || ((b . c) <= d))`
+
+### A1.1041 — `a + b - c <= d`
+- **Source:** `a + b - c <= d`
+- **Grouping:** `(((a + b) - c) <= d)`
+
+### A1.1042 — `a | b + c < d`
+- **Source:** `a | b + c < d`
+- **Grouping:** `((a | (b + c)) < d)`
+
+### A1.1043 — `a < b > c / d`
+- **Source:** `a < b > c / d`
+- **Grouping:** `((a < b) > (c / d))`
+
+### A1.1044 — `a + b < c ^ d`
+- **Source:** `a + b < c ^ d`
+- **Grouping:** `((a + b) < (c ^ d))`
+
+### A1.1045 — `a - b << c ^ d`
+- **Source:** `a - b << c ^ d`
+- **Grouping:** `(((a - b) << c) ^ d)`
+
+### A1.1046 — `a == b == c < d`
+- **Source:** `a == b == c < d`
+- **Grouping:** `(((a == b) == c) < d)`
+
+### A1.1047 — `a >> b >= c - d`
+- **Source:** `a >> b >= c - d`
+- **Grouping:** `((a >> b) >= (c - d))`
+
+### A1.1048 — `a >> b % c . d`
+- **Source:** `a >> b % c . d`
+- **Grouping:** `(a >> (b % (c . d)))`
+
+### A1.1049 — `a || b >> c << d`
+- **Source:** `a || b >> c << d`
+- **Grouping:** `(a || ((b >> c) << d))`
+
+### A1.1050 — `a < b == c | d`
+- **Source:** `a < b == c | d`
+- **Grouping:** `((a < b) == (c | d))`
+
+### A1.1051 — `a ^ b | c ^ d`
+- **Source:** `a ^ b | c ^ d`
+- **Grouping:** `(((a ^ b) | c) ^ d)`
+
+### A1.1052 — `a & b /= c & d`
+- **Source:** `a & b /= c & d`
+- **Grouping:** `((a & b) /= (c & d))`
+
+### A1.1053 — `a . b + c | d`
+- **Source:** `a . b + c | d`
+- **Grouping:** `(((a . b) + c) | d)`
+
+### A1.1054 — `a /= b . c / d`
+- **Source:** `a /= b . c / d`
+- **Grouping:** `(a /= ((b . c) / d))`
+
+### A1.1055 — `a >= b /= c * d`
+- **Source:** `a >= b /= c * d`
+- **Grouping:** `((a >= b) /= (c * d))`
+
+### A1.1056 — `a * b % c <= d`
+- **Source:** `a * b % c <= d`
+- **Grouping:** `(((a * b) % c) <= d)`
+
+### A1.1057 — `a >= b . c == d`
+- **Source:** `a >= b . c == d`
+- **Grouping:** `((a >= (b . c)) == d)`
+
+### A1.1058 — `a - b <= c >= d`
+- **Source:** `a - b <= c >= d`
+- **Grouping:** `(((a - b) <= c) >= d)`
+
+### A1.1059 — `a & b > c < d`
+- **Source:** `a & b > c < d`
+- **Grouping:** `(((a & b) > c) < d)`
+
+### A1.1060 — `a > b && c < d`
+- **Source:** `a > b && c < d`
+- **Grouping:** `((a > b) && (c < d))`
+
+### A1.1061 — `a << b >= c && d`
+- **Source:** `a << b >= c && d`
+- **Grouping:** `(((a << b) >= c) && d)`
+
+### A1.1062 — `a << b | c /= d`
+- **Source:** `a << b | c /= d`
+- **Grouping:** `(((a << b) | c) /= d)`
+
+### A1.1063 — `a >= b - c >= d`
+- **Source:** `a >= b - c >= d`
+- **Grouping:** `((a >= (b - c)) >= d)`
+
+### A1.1064 — `a /= b || c . d`
+- **Source:** `a /= b || c . d`
+- **Grouping:** `((a /= b) || (c . d))`
+
+### A1.1065 — `a / b * c << d`
+- **Source:** `a / b * c << d`
+- **Grouping:** `(((a / b) * c) << d)`
+
+### A1.1066 — `a || b && c /= d`
+- **Source:** `a || b && c /= d`
+- **Grouping:** `(a || (b && (c /= d)))`
+
+### A1.1067 — `a == b <= c < d`
+- **Source:** `a == b <= c < d`
+- **Grouping:** `(((a == b) <= c) < d)`
+
+### A1.1068 — `a - b && c > d`
+- **Source:** `a - b && c > d`
+- **Grouping:** `((a - b) && (c > d))`
+
+### A1.1069 — `a << b >= c || d`
+- **Source:** `a << b >= c || d`
+- **Grouping:** `(((a << b) >= c) || d)`
+
+### A1.1070 — `a >> b + c % d`
+- **Source:** `a >> b + c % d`
+- **Grouping:** `(a >> (b + (c % d)))`
+
+### A1.1071 — `a && b % c || d`
+- **Source:** `a && b % c || d`
+- **Grouping:** `((a && (b % c)) || d)`
+
+### A1.1072 — `a >= b & c >= d`
+- **Source:** `a >= b & c >= d`
+- **Grouping:** `((a >= (b & c)) >= d)`
+
+### A1.1073 — `a == b /= c == d`
+- **Source:** `a == b /= c == d`
+- **Grouping:** `(((a == b) /= c) == d)`
+
+### A1.1074 — `a > b % c /= d`
+- **Source:** `a > b % c /= d`
+- **Grouping:** `((a > (b % c)) /= d)`
+
+### A1.1075 — `a & b - c * d`
+- **Source:** `a & b - c * d`
+- **Grouping:** `(a & (b - (c * d)))`
+
+### A1.1076 — `a + b & c && d`
+- **Source:** `a + b & c && d`
+- **Grouping:** `(((a + b) & c) && d)`
+
+### A1.1077 — `a && b | c >= d`
+- **Source:** `a && b | c >= d`
+- **Grouping:** `(a && ((b | c) >= d))`
+
+### A1.1078 — `a || b . c /= d`
+- **Source:** `a || b . c /= d`
+- **Grouping:** `(a || ((b . c) /= d))`
+
+### A1.1079 — `a << b / c < d`
+- **Source:** `a << b / c < d`
+- **Grouping:** `((a << (b / c)) < d)`
+
+### A1.1080 — `a || b - c || d`
+- **Source:** `a || b - c || d`
+- **Grouping:** `((a || (b - c)) || d)`
+
+### A1.1081 — `a <= b == c . d`
+- **Source:** `a <= b == c . d`
+- **Grouping:** `((a <= b) == (c . d))`
+
+### A1.1082 — `a > b | c ^ d`
+- **Source:** `a > b | c ^ d`
+- **Grouping:** `(a > ((b | c) ^ d))`
+
+### A1.1083 — `a >= b >> c - d`
+- **Source:** `a >= b >> c - d`
+- **Grouping:** `(a >= (b >> (c - d)))`
+
+### A1.1084 — `a /= b < c >> d`
+- **Source:** `a /= b < c >> d`
+- **Grouping:** `((a /= b) < (c >> d))`
+
+### A1.1085 — `a < b + c - d`
+- **Source:** `a < b + c - d`
+- **Grouping:** `(a < ((b + c) - d))`
+
+### A1.1086 — `a & b > c << d`
+- **Source:** `a & b > c << d`
+- **Grouping:** `((a & b) > (c << d))`
+
+### A1.1087 — `a / b - c >= d`
+- **Source:** `a / b - c >= d`
+- **Grouping:** `(((a / b) - c) >= d)`
+
+### A1.1088 — `a / b == c || d`
+- **Source:** `a / b == c || d`
+- **Grouping:** `(((a / b) == c) || d)`
+
+### A1.1089 — `a * b < c && d`
+- **Source:** `a * b < c && d`
+- **Grouping:** `(((a * b) < c) && d)`
+
+### A1.1090 — `a >> b ^ c * d`
+- **Source:** `a >> b ^ c * d`
+- **Grouping:** `((a >> b) ^ (c * d))`
+
+### A1.1091 — `a << b ^ c == d`
+- **Source:** `a << b ^ c == d`
+- **Grouping:** `(((a << b) ^ c) == d)`
+
+### A1.1092 — `a * b || c /= d`
+- **Source:** `a * b || c /= d`
+- **Grouping:** `((a * b) || (c /= d))`
+
+### A1.1093 — `a || b ^ c || d`
+- **Source:** `a || b ^ c || d`
+- **Grouping:** `((a || (b ^ c)) || d)`
+
+### A1.1094 — `a && b >= c ^ d`
+- **Source:** `a && b >= c ^ d`
+- **Grouping:** `(a && (b >= (c ^ d)))`
+
+### A1.1095 — `a ^ b || c <= d`
+- **Source:** `a ^ b || c <= d`
+- **Grouping:** `((a ^ b) || (c <= d))`
+
+### A1.1096 — `a == b <= c / d`
+- **Source:** `a == b <= c / d`
+- **Grouping:** `((a == b) <= (c / d))`
+
+### A1.1097 — `a ^ b == c /= d`
+- **Source:** `a ^ b == c /= d`
+- **Grouping:** `(((a ^ b) == c) /= d)`
+
+### A1.1098 — `a ^ b /= c | d`
+- **Source:** `a ^ b /= c | d`
+- **Grouping:** `((a ^ b) /= (c | d))`
+
+### A1.1099 — `a == b | c + d`
+- **Source:** `a == b | c + d`
+- **Grouping:** `(a == (b | (c + d)))`
+
+### A1.1100 — `a - b >> c + d`
+- **Source:** `a - b >> c + d`
+- **Grouping:** `((a - b) >> (c + d))`
+
+### A1.1101 — `a < b << c & d`
+- **Source:** `a < b << c & d`
+- **Grouping:** `(a < ((b << c) & d))`
+
+### A1.1102 — `a /= b || c >> d`
+- **Source:** `a /= b || c >> d`
+- **Grouping:** `((a /= b) || (c >> d))`
+
+### A1.1103 — `a / b >= c < d`
+- **Source:** `a / b >= c < d`
+- **Grouping:** `(((a / b) >= c) < d)`
+
+### A1.1104 — `a << b >= c >> d`
+- **Source:** `a << b >= c >> d`
+- **Grouping:** `((a << b) >= (c >> d))`
+
+### A1.1105 — `a & b >= c . d`
+- **Source:** `a & b >= c . d`
+- **Grouping:** `((a & b) >= (c . d))`
+
+### A1.1106 — `a - b == c & d`
+- **Source:** `a - b == c & d`
+- **Grouping:** `((a - b) == (c & d))`
+
+### A1.1107 — `a /= b > c . d`
+- **Source:** `a /= b > c . d`
+- **Grouping:** `((a /= b) > (c . d))`
+
+### A1.1108 — `a + b % c & d`
+- **Source:** `a + b % c & d`
+- **Grouping:** `((a + (b % c)) & d)`
+
+### A1.1109 — `a == b == c >= d`
+- **Source:** `a == b == c >= d`
+- **Grouping:** `(((a == b) == c) >= d)`
+
+### A1.1110 — `a << b * c <= d`
+- **Source:** `a << b * c <= d`
+- **Grouping:** `((a << (b * c)) <= d)`
+
+### A1.1111 — `a > b /= c & d`
+- **Source:** `a > b /= c & d`
+- **Grouping:** `((a > b) /= (c & d))`
+
+### A1.1112 — `a ^ b / c << d`
+- **Source:** `a ^ b / c << d`
+- **Grouping:** `(a ^ ((b / c) << d))`
+
+### A1.1113 — `a > b == c - d`
+- **Source:** `a > b == c - d`
+- **Grouping:** `((a > b) == (c - d))`
+
+### A1.1114 — `a + b < c . d`
+- **Source:** `a + b < c . d`
+- **Grouping:** `((a + b) < (c . d))`
+
+### A1.1115 — `a & b & c . d`
+- **Source:** `a & b & c . d`
+- **Grouping:** `((a & b) & (c . d))`
+
+### A1.1116 — `a * b == c <= d`
+- **Source:** `a * b == c <= d`
+- **Grouping:** `(((a * b) == c) <= d)`
+
+### A1.1117 — `a & b & c == d`
+- **Source:** `a & b & c == d`
+- **Grouping:** `(((a & b) & c) == d)`
+
+### A1.1118 — `a == b + c * d`
+- **Source:** `a == b + c * d`
+- **Grouping:** `(a == (b + (c * d)))`
+
+### A1.1119 — `a || b % c > d`
+- **Source:** `a || b % c > d`
+- **Grouping:** `(a || ((b % c) > d))`
+
+### A1.1120 — `a >> b <= c | d`
+- **Source:** `a >> b <= c | d`
+- **Grouping:** `((a >> b) <= (c | d))`
+
+### A1.1121 — `a > b << c || d`
+- **Source:** `a > b << c || d`
+- **Grouping:** `((a > (b << c)) || d)`
+
+### A1.1122 — `a >> b % c ^ d`
+- **Source:** `a >> b % c ^ d`
+- **Grouping:** `((a >> (b % c)) ^ d)`
+
+### A1.1123 — `a - b == c > d`
+- **Source:** `a - b == c > d`
+- **Grouping:** `(((a - b) == c) > d)`
+
+### A1.1124 — `a + b || c / d`
+- **Source:** `a + b || c / d`
+- **Grouping:** `((a + b) || (c / d))`
+
+### A1.1125 — `a - b >= c >= d`
+- **Source:** `a - b >= c >= d`
+- **Grouping:** `(((a - b) >= c) >= d)`
+
+### A1.1126 — `a /= b / c == d`
+- **Source:** `a /= b / c == d`
+- **Grouping:** `((a /= (b / c)) == d)`
+
+### A1.1127 — `a % b & c ^ d`
+- **Source:** `a % b & c ^ d`
+- **Grouping:** `(((a % b) & c) ^ d)`
+
+### A1.1128 — `a + b && c / d`
+- **Source:** `a + b && c / d`
+- **Grouping:** `((a + b) && (c / d))`
+
+### A1.1129 — `a % b > c <= d`
+- **Source:** `a % b > c <= d`
+- **Grouping:** `(((a % b) > c) <= d)`
+
+### A1.1130 — `a . b | c >> d`
+- **Source:** `a . b | c >> d`
+- **Grouping:** `((a . b) | (c >> d))`
+
+### A1.1131 — `a * b >= c - d`
+- **Source:** `a * b >= c - d`
+- **Grouping:** `((a * b) >= (c - d))`
+
+### A1.1132 — `a << b & c * d`
+- **Source:** `a << b & c * d`
+- **Grouping:** `((a << b) & (c * d))`
+
+### A1.1133 — `a ^ b > c - d`
+- **Source:** `a ^ b > c - d`
+- **Grouping:** `((a ^ b) > (c - d))`
+
+### A1.1134 — `a << b == c /= d`
+- **Source:** `a << b == c /= d`
+- **Grouping:** `(((a << b) == c) /= d)`
+
+### A1.1135 — `a <= b >> c ^ d`
+- **Source:** `a <= b >> c ^ d`
+- **Grouping:** `(a <= ((b >> c) ^ d))`
+
+### A1.1136 — `a ^ b . c < d`
+- **Source:** `a ^ b . c < d`
+- **Grouping:** `((a ^ (b . c)) < d)`
+
+### A1.1137 — `a / b + c % d`
+- **Source:** `a / b + c % d`
+- **Grouping:** `((a / b) + (c % d))`
+
+### A1.1138 — `a || b . c - d`
+- **Source:** `a || b . c - d`
+- **Grouping:** `(a || ((b . c) - d))`
+
+### A1.1139 — `a * b / c /= d`
+- **Source:** `a * b / c /= d`
+- **Grouping:** `(((a * b) / c) /= d)`
+
+### A1.1140 — `a % b >> c . d`
+- **Source:** `a % b >> c . d`
+- **Grouping:** `((a % b) >> (c . d))`
+
+### A1.1141 — `a ^ b ^ c << d`
+- **Source:** `a ^ b ^ c << d`
+- **Grouping:** `((a ^ b) ^ (c << d))`
+
+### A1.1142 — `a . b >= c / d`
+- **Source:** `a . b >= c / d`
+- **Grouping:** `((a . b) >= (c / d))`
+
+### A1.1143 — `a || b >> c >= d`
+- **Source:** `a || b >> c >= d`
+- **Grouping:** `(a || ((b >> c) >= d))`
+
+### A1.1144 — `a % b << c || d`
+- **Source:** `a % b << c || d`
+- **Grouping:** `(((a % b) << c) || d)`
+
+### A1.1145 — `a > b << c / d`
+- **Source:** `a > b << c / d`
+- **Grouping:** `(a > (b << (c / d)))`
+
+### A1.1146 — `a % b / c + d`
+- **Source:** `a % b / c + d`
+- **Grouping:** `(((a % b) / c) + d)`
+
+### A1.1147 — `a ^ b >= c % d`
+- **Source:** `a ^ b >= c % d`
+- **Grouping:** `((a ^ b) >= (c % d))`
+
+### A1.1148 — `a | b / c > d`
+- **Source:** `a | b / c > d`
+- **Grouping:** `((a | (b / c)) > d)`
+
+### A1.1149 — `a ^ b > c == d`
+- **Source:** `a ^ b > c == d`
+- **Grouping:** `(((a ^ b) > c) == d)`
+
+### A1.1150 — `a + b <= c || d`
+- **Source:** `a + b <= c || d`
+- **Grouping:** `(((a + b) <= c) || d)`
+
+### A1.1151 — `a <= b - c <= d`
+- **Source:** `a <= b - c <= d`
+- **Grouping:** `((a <= (b - c)) <= d)`
+
+### A1.1152 — `a == b / c == d`
+- **Source:** `a == b / c == d`
+- **Grouping:** `((a == (b / c)) == d)`
+
+### A1.1153 — `a & b % c && d`
+- **Source:** `a & b % c && d`
+- **Grouping:** `((a & (b % c)) && d)`
+
+### A1.1154 — `a <= b ^ c % d`
+- **Source:** `a <= b ^ c % d`
+- **Grouping:** `(a <= (b ^ (c % d)))`
+
+### A1.1155 — `a - b | c == d`
+- **Source:** `a - b | c == d`
+- **Grouping:** `(((a - b) | c) == d)`
+
+### A1.1156 — `a | b / c < d`
+- **Source:** `a | b / c < d`
+- **Grouping:** `((a | (b / c)) < d)`
+
+### A1.1157 — `a < b - c >= d`
+- **Source:** `a < b - c >= d`
+- **Grouping:** `((a < (b - c)) >= d)`
+
+### A1.1158 — `a / b - c % d`
+- **Source:** `a / b - c % d`
+- **Grouping:** `((a / b) - (c % d))`
+
+### A1.1159 — `a ^ b < c == d`
+- **Source:** `a ^ b < c == d`
+- **Grouping:** `(((a ^ b) < c) == d)`
+
+### A1.1160 — `a == b > c == d`
+- **Source:** `a == b > c == d`
+- **Grouping:** `(((a == b) > c) == d)`
+
+### A1.1161 — `a /= b /= c ^ d`
+- **Source:** `a /= b /= c ^ d`
+- **Grouping:** `((a /= b) /= (c ^ d))`
+
+### A1.1162 — `a == b * c & d`
+- **Source:** `a == b * c & d`
+- **Grouping:** `(a == ((b * c) & d))`
+
+### A1.1163 — `a << b /= c /= d`
+- **Source:** `a << b /= c /= d`
+- **Grouping:** `(((a << b) /= c) /= d)`
+
+### A1.1164 — `a << b ^ c <= d`
+- **Source:** `a << b ^ c <= d`
+- **Grouping:** `(((a << b) ^ c) <= d)`
+
+### A1.1165 — `a && b == c == d`
+- **Source:** `a && b == c == d`
+- **Grouping:** `(a && ((b == c) == d))`
+
+### A1.1166 — `a ^ b << c / d`
+- **Source:** `a ^ b << c / d`
+- **Grouping:** `(a ^ (b << (c / d)))`
+
+### A1.1167 — `a % b . c || d`
+- **Source:** `a % b . c || d`
+- **Grouping:** `((a % (b . c)) || d)`
+
+### A1.1168 — `a * b || c + d`
+- **Source:** `a * b || c + d`
+- **Grouping:** `((a * b) || (c + d))`
+
+### A1.1169 — `a == b >> c || d`
+- **Source:** `a == b >> c || d`
+- **Grouping:** `((a == (b >> c)) || d)`
+
+### A1.1170 — `a + b <= c * d`
+- **Source:** `a + b <= c * d`
+- **Grouping:** `((a + b) <= (c * d))`
+
+### A1.1171 — `a << b . c <= d`
+- **Source:** `a << b . c <= d`
+- **Grouping:** `((a << (b . c)) <= d)`
+
+### A1.1172 — `a << b - c & d`
+- **Source:** `a << b - c & d`
+- **Grouping:** `((a << (b - c)) & d)`
+
+### A1.1173 — `a - b % c >= d`
+- **Source:** `a - b % c >= d`
+- **Grouping:** `((a - (b % c)) >= d)`
+
+### A1.1174 — `a + b >= c + d`
+- **Source:** `a + b >= c + d`
+- **Grouping:** `((a + b) >= (c + d))`
+
+### A1.1175 — `a >= b >= c + d`
+- **Source:** `a >= b >= c + d`
+- **Grouping:** `((a >= b) >= (c + d))`
+
+### A1.1176 — `a == b * c . d`
+- **Source:** `a == b * c . d`
+- **Grouping:** `(a == (b * (c . d)))`
+
+### A1.1177 — `a & b /= c - d`
+- **Source:** `a & b /= c - d`
+- **Grouping:** `((a & b) /= (c - d))`
+
+### A1.1178 — `a | b >= c <= d`
+- **Source:** `a | b >= c <= d`
+- **Grouping:** `(((a | b) >= c) <= d)`
+
+### A1.1179 — `a >= b == c / d`
+- **Source:** `a >= b == c / d`
+- **Grouping:** `((a >= b) == (c / d))`
+
+### A1.1180 — `a / b / c /= d`
+- **Source:** `a / b / c /= d`
+- **Grouping:** `(((a / b) / c) /= d)`
+
+### A1.1181 — `a == b /= c & d`
+- **Source:** `a == b /= c & d`
+- **Grouping:** `((a == b) /= (c & d))`
+
+### A1.1182 — `a >> b < c & d`
+- **Source:** `a >> b < c & d`
+- **Grouping:** `((a >> b) < (c & d))`
+
+### A1.1183 — `a >> b == c - d`
+- **Source:** `a >> b == c - d`
+- **Grouping:** `((a >> b) == (c - d))`
+
+### A1.1184 — `a % b >= c <= d`
+- **Source:** `a % b >= c <= d`
+- **Grouping:** `(((a % b) >= c) <= d)`
+
+### A1.1185 — `a < b > c > d`
+- **Source:** `a < b > c > d`
+- **Grouping:** `(((a < b) > c) > d)`
+
+### A1.1186 — `a <= b /= c * d`
+- **Source:** `a <= b /= c * d`
+- **Grouping:** `((a <= b) /= (c * d))`
+
+### A1.1187 — `a & b /= c * d`
+- **Source:** `a & b /= c * d`
+- **Grouping:** `((a & b) /= (c * d))`
+
+### A1.1188 — `a * b >= c >> d`
+- **Source:** `a * b >= c >> d`
+- **Grouping:** `((a * b) >= (c >> d))`
+
+### A1.1189 — `a | b == c . d`
+- **Source:** `a | b == c . d`
+- **Grouping:** `((a | b) == (c . d))`
+
+### A1.1190 — `a + b % c . d`
+- **Source:** `a + b % c . d`
+- **Grouping:** `(a + (b % (c . d)))`
+
+### A1.1191 — `a >= b < c | d`
+- **Source:** `a >= b < c | d`
+- **Grouping:** `((a >= b) < (c | d))`
+
+### A1.1192 — `a > b & c + d`
+- **Source:** `a > b & c + d`
+- **Grouping:** `(a > (b & (c + d)))`
+
+### A1.1193 — `a /= b . c - d`
+- **Source:** `a /= b . c - d`
+- **Grouping:** `(a /= ((b . c) - d))`
+
+### A1.1194 — `a << b > c && d`
+- **Source:** `a << b > c && d`
+- **Grouping:** `(((a << b) > c) && d)`
+
+### A1.1195 — `a > b + c << d`
+- **Source:** `a > b + c << d`
+- **Grouping:** `(a > ((b + c) << d))`
+
+### A1.1196 — `a < b >> c >= d`
+- **Source:** `a < b >> c >= d`
+- **Grouping:** `((a < (b >> c)) >= d)`
+
+### A1.1197 — `a << b / c <= d`
+- **Source:** `a << b / c <= d`
+- **Grouping:** `((a << (b / c)) <= d)`
+
+### A1.1198 — `a . b % c | d`
+- **Source:** `a . b % c | d`
+- **Grouping:** `(((a . b) % c) | d)`
+
+### A1.1199 — `a >= b % c == d`
+- **Source:** `a >= b % c == d`
+- **Grouping:** `((a >= (b % c)) == d)`
+
+### A1.1200 — `a * b >> c == d`
+- **Source:** `a * b >> c == d`
+- **Grouping:** `(((a * b) >> c) == d)`
+
+### A1.1201 — `a >= b <= c >= d`
+- **Source:** `a >= b <= c >= d`
+- **Grouping:** `(((a >= b) <= c) >= d)`
+
+### A1.1202 — `a == b < c / d`
+- **Source:** `a == b < c / d`
+- **Grouping:** `((a == b) < (c / d))`
+
+### A1.1203 — `a || b + c /= d`
+- **Source:** `a || b + c /= d`
+- **Grouping:** `(a || ((b + c) /= d))`
+
+### A1.1204 — `a ^ b == c % d`
+- **Source:** `a ^ b == c % d`
+- **Grouping:** `((a ^ b) == (c % d))`
+
+### A1.1205 — `a == b /= c >> d`
+- **Source:** `a == b /= c >> d`
+- **Grouping:** `((a == b) /= (c >> d))`
+
+### A1.1206 — `a /= b + c & d`
+- **Source:** `a /= b + c & d`
+- **Grouping:** `(a /= ((b + c) & d))`
+
+### A1.1207 — `a & b % c * d`
+- **Source:** `a & b % c * d`
+- **Grouping:** `(a & ((b % c) * d))`
+
+### A1.1208 — `a || b > c < d`
+- **Source:** `a || b > c < d`
+- **Grouping:** `(a || ((b > c) < d))`
+
+### A1.1209 — `a / b || c > d`
+- **Source:** `a / b || c > d`
+- **Grouping:** `((a / b) || (c > d))`
+
+### A1.1210 — `a < b * c >= d`
+- **Source:** `a < b * c >= d`
+- **Grouping:** `((a < (b * c)) >= d)`
+
+### A1.1211 — `a - b && c + d`
+- **Source:** `a - b && c + d`
+- **Grouping:** `((a - b) && (c + d))`
+
+### A1.1212 — `a == b || c - d`
+- **Source:** `a == b || c - d`
+- **Grouping:** `((a == b) || (c - d))`
+
+### A1.1213 — `a <= b && c || d`
+- **Source:** `a <= b && c || d`
+- **Grouping:** `(((a <= b) && c) || d)`
+
+### A1.1214 — `a == b /= c || d`
+- **Source:** `a == b /= c || d`
+- **Grouping:** `(((a == b) /= c) || d)`
+
+### A1.1215 — `a == b && c || d`
+- **Source:** `a == b && c || d`
+- **Grouping:** `(((a == b) && c) || d)`
+
+### A1.1216 — `a * b == c * d`
+- **Source:** `a * b == c * d`
+- **Grouping:** `((a * b) == (c * d))`
+
+### A1.1217 — `a | b /= c % d`
+- **Source:** `a | b /= c % d`
+- **Grouping:** `((a | b) /= (c % d))`
+
+### A1.1218 — `a << b || c << d`
+- **Source:** `a << b || c << d`
+- **Grouping:** `((a << b) || (c << d))`
+
+### A1.1219 — `a | b & c / d`
+- **Source:** `a | b & c / d`
+- **Grouping:** `((a | b) & (c / d))`
+
+### A1.1220 — `a || b / c * d`
+- **Source:** `a || b / c * d`
+- **Grouping:** `(a || ((b / c) * d))`
+
+### A1.1221 — `a % b + c ^ d`
+- **Source:** `a % b + c ^ d`
+- **Grouping:** `(((a % b) + c) ^ d)`
+
+### A1.1222 — `a | b << c & d`
+- **Source:** `a | b << c & d`
+- **Grouping:** `((a | (b << c)) & d)`
+
+### A1.1223 — `a & b + c << d`
+- **Source:** `a & b + c << d`
+- **Grouping:** `(a & ((b + c) << d))`
+
+### A1.1224 — `a && b ^ c >> d`
+- **Source:** `a && b ^ c >> d`
+- **Grouping:** `(a && (b ^ (c >> d)))`
+
+### A1.1225 — `a || b << c /= d`
+- **Source:** `a || b << c /= d`
+- **Grouping:** `(a || ((b << c) /= d))`
+
+### A1.1226 — `a /= b >> c / d`
+- **Source:** `a /= b >> c / d`
+- **Grouping:** `(a /= (b >> (c / d)))`
+
+### A1.1227 — `a || b >= c >= d`
+- **Source:** `a || b >= c >= d`
+- **Grouping:** `(a || ((b >= c) >= d))`
+
+### A1.1228 — `a || b + c < d`
+- **Source:** `a || b + c < d`
+- **Grouping:** `(a || ((b + c) < d))`
+
+### A1.1229 — `a & b - c /= d`
+- **Source:** `a & b - c /= d`
+- **Grouping:** `((a & (b - c)) /= d)`
+
+### A1.1230 — `a | b % c && d`
+- **Source:** `a | b % c && d`
+- **Grouping:** `((a | (b % c)) && d)`
+
+### A1.1231 — `a & b ^ c + d`
+- **Source:** `a & b ^ c + d`
+- **Grouping:** `((a & b) ^ (c + d))`
+
+### A1.1232 — `a /= b >= c == d`
+- **Source:** `a /= b >= c == d`
+- **Grouping:** `(((a /= b) >= c) == d)`
+
+### A1.1233 — `a <= b | c + d`
+- **Source:** `a <= b | c + d`
+- **Grouping:** `(a <= (b | (c + d)))`
+
+### A1.1234 — `a + b && c >= d`
+- **Source:** `a + b && c >= d`
+- **Grouping:** `((a + b) && (c >= d))`
+
+### A1.1235 — `a / b /= c /= d`
+- **Source:** `a / b /= c /= d`
+- **Grouping:** `(((a / b) /= c) /= d)`
+
+### A1.1236 — `a /= b || c == d`
+- **Source:** `a /= b || c == d`
+- **Grouping:** `((a /= b) || (c == d))`
+
+### A1.1237 — `a / b /= c & d`
+- **Source:** `a / b /= c & d`
+- **Grouping:** `((a / b) /= (c & d))`
+
+### A1.1238 — `a || b - c >= d`
+- **Source:** `a || b - c >= d`
+- **Grouping:** `(a || ((b - c) >= d))`
+
+### A1.1239 — `a | b >= c + d`
+- **Source:** `a | b >= c + d`
+- **Grouping:** `((a | b) >= (c + d))`
+
+### A1.1240 — `a * b . c << d`
+- **Source:** `a * b . c << d`
+- **Grouping:** `((a * (b . c)) << d)`
+
+### A1.1241 — `a ^ b && c < d`
+- **Source:** `a ^ b && c < d`
+- **Grouping:** `((a ^ b) && (c < d))`
+
+### A1.1242 — `a | b / c - d`
+- **Source:** `a | b / c - d`
+- **Grouping:** `(a | ((b / c) - d))`
+
+### A1.1243 — `a | b && c . d`
+- **Source:** `a | b && c . d`
+- **Grouping:** `((a | b) && (c . d))`
+
+### A1.1244 — `a - b && c >= d`
+- **Source:** `a - b && c >= d`
+- **Grouping:** `((a - b) && (c >= d))`
+
+### A1.1245 — `a == b > c | d`
+- **Source:** `a == b > c | d`
+- **Grouping:** `((a == b) > (c | d))`
+
+### A1.1246 — `a > b & c . d`
+- **Source:** `a > b & c . d`
+- **Grouping:** `(a > (b & (c . d)))`
+
+### A1.1247 — `a . b + c >> d`
+- **Source:** `a . b + c >> d`
+- **Grouping:** `(((a . b) + c) >> d)`
+
+### A1.1248 — `a && b * c == d`
+- **Source:** `a && b * c == d`
+- **Grouping:** `(a && ((b * c) == d))`
+
+### A1.1249 — `a || b < c > d`
+- **Source:** `a || b < c > d`
+- **Grouping:** `(a || ((b < c) > d))`
+
+### A1.1250 — `a + b || c > d`
+- **Source:** `a + b || c > d`
+- **Grouping:** `((a + b) || (c > d))`
+
+### A1.1251 — `a & b >> c | d`
+- **Source:** `a & b >> c | d`
+- **Grouping:** `((a & (b >> c)) | d)`
+
+### A1.1252 — `a < b ^ c <= d`
+- **Source:** `a < b ^ c <= d`
+- **Grouping:** `((a < (b ^ c)) <= d)`
+
+### A1.1253 — `a << b / c & d`
+- **Source:** `a << b / c & d`
+- **Grouping:** `((a << (b / c)) & d)`
+
+### A1.1254 — `a >= b >= c ^ d`
+- **Source:** `a >= b >= c ^ d`
+- **Grouping:** `((a >= b) >= (c ^ d))`
+
+### A1.1255 — `a == b /= c | d`
+- **Source:** `a == b /= c | d`
+- **Grouping:** `((a == b) /= (c | d))`
+
+### A1.1256 — `a == b > c || d`
+- **Source:** `a == b > c || d`
+- **Grouping:** `(((a == b) > c) || d)`
+
+### A1.1257 — `a . b + c && d`
+- **Source:** `a . b + c && d`
+- **Grouping:** `(((a . b) + c) && d)`
+
+### A1.1258 — `a + b || c == d`
+- **Source:** `a + b || c == d`
+- **Grouping:** `((a + b) || (c == d))`
+
+### A1.1259 — `a >> b >> c || d`
+- **Source:** `a >> b >> c || d`
+- **Grouping:** `(((a >> b) >> c) || d)`
+
+### A1.1260 — `a /= b % c < d`
+- **Source:** `a /= b % c < d`
+- **Grouping:** `((a /= (b % c)) < d)`
+
+### A1.1261 — `a % b | c % d`
+- **Source:** `a % b | c % d`
+- **Grouping:** `((a % b) | (c % d))`
+
+### A1.1262 — `a + b /= c * d`
+- **Source:** `a + b /= c * d`
+- **Grouping:** `((a + b) /= (c * d))`
+
+### A1.1263 — `a - b ^ c & d`
+- **Source:** `a - b ^ c & d`
+- **Grouping:** `(((a - b) ^ c) & d)`
+
+### A1.1264 — `a << b <= c + d`
+- **Source:** `a << b <= c + d`
+- **Grouping:** `((a << b) <= (c + d))`
+
+### A1.1265 — `a * b ^ c << d`
+- **Source:** `a * b ^ c << d`
+- **Grouping:** `((a * b) ^ (c << d))`
+
+### A1.1266 — `a <= b << c > d`
+- **Source:** `a <= b << c > d`
+- **Grouping:** `((a <= (b << c)) > d)`
+
+### A1.1267 — `a | b << c >> d`
+- **Source:** `a | b << c >> d`
+- **Grouping:** `(a | ((b << c) >> d))`
+
+### A1.1268 — `a * b > c > d`
+- **Source:** `a * b > c > d`
+- **Grouping:** `(((a * b) > c) > d)`
+
+### A1.1269 — `a | b <= c < d`
+- **Source:** `a | b <= c < d`
+- **Grouping:** `(((a | b) <= c) < d)`
+
+### A1.1270 — `a . b && c % d`
+- **Source:** `a . b && c % d`
+- **Grouping:** `((a . b) && (c % d))`
+
+### A1.1271 — `a / b && c * d`
+- **Source:** `a / b && c * d`
+- **Grouping:** `((a / b) && (c * d))`
+
+### A1.1272 — `a + b % c + d`
+- **Source:** `a + b % c + d`
+- **Grouping:** `((a + (b % c)) + d)`
+
+### A1.1273 — `a > b . c >> d`
+- **Source:** `a > b . c >> d`
+- **Grouping:** `(a > ((b . c) >> d))`
+
+### A1.1274 — `a > b /= c == d`
+- **Source:** `a > b /= c == d`
+- **Grouping:** `(((a > b) /= c) == d)`
+
+### A1.1275 — `a && b >> c * d`
+- **Source:** `a && b >> c * d`
+- **Grouping:** `(a && (b >> (c * d)))`
+
+### A1.1276 — `a && b < c || d`
+- **Source:** `a && b < c || d`
+- **Grouping:** `((a && (b < c)) || d)`
+
+### A1.1277 — `a /= b >= c - d`
+- **Source:** `a /= b >= c - d`
+- **Grouping:** `((a /= b) >= (c - d))`
+
+### A1.1278 — `a - b / c & d`
+- **Source:** `a - b / c & d`
+- **Grouping:** `((a - (b / c)) & d)`
+
+### A1.1279 — `a + b % c * d`
+- **Source:** `a + b % c * d`
+- **Grouping:** `(a + ((b % c) * d))`
+
+### A1.1280 — `a . b > c << d`
+- **Source:** `a . b > c << d`
+- **Grouping:** `((a . b) > (c << d))`
+
+### A1.1281 — `a || b > c / d`
+- **Source:** `a || b > c / d`
+- **Grouping:** `(a || (b > (c / d)))`
+
+### A1.1282 — `a == b > c >= d`
+- **Source:** `a == b > c >= d`
+- **Grouping:** `(((a == b) > c) >= d)`
+
+### A1.1283 — `a /= b <= c & d`
+- **Source:** `a /= b <= c & d`
+- **Grouping:** `((a /= b) <= (c & d))`
+
+### A1.1284 — `a <= b || c > d`
+- **Source:** `a <= b || c > d`
+- **Grouping:** `((a <= b) || (c > d))`
+
+### A1.1285 — `a | b || c >> d`
+- **Source:** `a | b || c >> d`
+- **Grouping:** `((a | b) || (c >> d))`
+
+### A1.1286 — `a || b + c % d`
+- **Source:** `a || b + c % d`
+- **Grouping:** `(a || (b + (c % d)))`
+
+### A1.1287 — `a == b /= c % d`
+- **Source:** `a == b /= c % d`
+- **Grouping:** `((a == b) /= (c % d))`
+
+### A1.1288 — `a % b ^ c || d`
+- **Source:** `a % b ^ c || d`
+- **Grouping:** `(((a % b) ^ c) || d)`
+
+### A1.1289 — `a >= b * c >> d`
+- **Source:** `a >= b * c >> d`
+- **Grouping:** `(a >= ((b * c) >> d))`
+
+### A1.1290 — `a - b == c || d`
+- **Source:** `a - b == c || d`
+- **Grouping:** `(((a - b) == c) || d)`
+
+### A1.1291 — `a * b << c == d`
+- **Source:** `a * b << c == d`
+- **Grouping:** `(((a * b) << c) == d)`
+
+### A1.1292 — `a % b . c / d`
+- **Source:** `a % b . c / d`
+- **Grouping:** `((a % (b . c)) / d)`
+
+### A1.1293 — `a % b < c ^ d`
+- **Source:** `a % b < c ^ d`
+- **Grouping:** `((a % b) < (c ^ d))`
+
+### A1.1294 — `a >> b > c < d`
+- **Source:** `a >> b > c < d`
+- **Grouping:** `(((a >> b) > c) < d)`
+
+### A1.1295 — `a - b << c . d`
+- **Source:** `a - b << c . d`
+- **Grouping:** `((a - b) << (c . d))`
+
+### A1.1296 — `a >> b | c << d`
+- **Source:** `a >> b | c << d`
+- **Grouping:** `((a >> b) | (c << d))`
+
+### A1.1297 — `a / b && c & d`
+- **Source:** `a / b && c & d`
+- **Grouping:** `((a / b) && (c & d))`
+
+### A1.1298 — `a / b >> c | d`
+- **Source:** `a / b >> c | d`
+- **Grouping:** `(((a / b) >> c) | d)`
+
+### A1.1299 — `a /= b >= c % d`
+- **Source:** `a /= b >= c % d`
+- **Grouping:** `((a /= b) >= (c % d))`
+
+### A1.1300 — `a < b << c % d`
+- **Source:** `a < b << c % d`
+- **Grouping:** `(a < (b << (c % d)))`
+
+### A1.1301 — `a . b | c + d`
+- **Source:** `a . b | c + d`
+- **Grouping:** `((a . b) | (c + d))`
+
+### A1.1302 — `a * b * c + d`
+- **Source:** `a * b * c + d`
+- **Grouping:** `(((a * b) * c) + d)`
+
+### A1.1303 — `a >> b < c <= d`
+- **Source:** `a >> b < c <= d`
+- **Grouping:** `(((a >> b) < c) <= d)`
+
+### A1.1304 — `a & b >= c % d`
+- **Source:** `a & b >= c % d`
+- **Grouping:** `((a & b) >= (c % d))`
+
+### A1.1305 — `a == b << c >= d`
+- **Source:** `a == b << c >= d`
+- **Grouping:** `((a == (b << c)) >= d)`
+
+### A1.1306 — `a + b || c >= d`
+- **Source:** `a + b || c >= d`
+- **Grouping:** `((a + b) || (c >= d))`
+
+### A1.1307 — `a & b >> c % d`
+- **Source:** `a & b >> c % d`
+- **Grouping:** `(a & (b >> (c % d)))`
+
+### A1.1308 — `a + b == c / d`
+- **Source:** `a + b == c / d`
+- **Grouping:** `((a + b) == (c / d))`
+
+### A1.1309 — `a ^ b >= c /= d`
+- **Source:** `a ^ b >= c /= d`
+- **Grouping:** `(((a ^ b) >= c) /= d)`
+
+### A1.1310 — `a >> b >> c ^ d`
+- **Source:** `a >> b >> c ^ d`
+- **Grouping:** `(((a >> b) >> c) ^ d)`
+
+### A1.1311 — `a << b <= c || d`
+- **Source:** `a << b <= c || d`
+- **Grouping:** `(((a << b) <= c) || d)`
+
+### A1.1312 — `a == b / c . d`
+- **Source:** `a == b / c . d`
+- **Grouping:** `(a == (b / (c . d)))`
+
+### A1.1313 — `a && b <= c | d`
+- **Source:** `a && b <= c | d`
+- **Grouping:** `(a && (b <= (c | d)))`
+
+### A1.1314 — `a << b ^ c ^ d`
+- **Source:** `a << b ^ c ^ d`
+- **Grouping:** `(((a << b) ^ c) ^ d)`
+
+### A1.1315 — `a / b ^ c == d`
+- **Source:** `a / b ^ c == d`
+- **Grouping:** `(((a / b) ^ c) == d)`
+
+### A1.1316 — `a . b /= c / d`
+- **Source:** `a . b /= c / d`
+- **Grouping:** `((a . b) /= (c / d))`
+
+### A1.1317 — `a - b . c >= d`
+- **Source:** `a - b . c >= d`
+- **Grouping:** `((a - (b . c)) >= d)`
+
+### A1.1318 — `a . b > c % d`
+- **Source:** `a . b > c % d`
+- **Grouping:** `((a . b) > (c % d))`
+
+### A1.1319 — `a /= b /= c << d`
+- **Source:** `a /= b /= c << d`
+- **Grouping:** `((a /= b) /= (c << d))`
+
+### A1.1320 — `a /= b & c % d`
+- **Source:** `a /= b & c % d`
+- **Grouping:** `(a /= (b & (c % d)))`
+
+### A1.1321 — `a * b & c << d`
+- **Source:** `a * b & c << d`
+- **Grouping:** `((a * b) & (c << d))`
+
+### A1.1322 — `a /= b + c <= d`
+- **Source:** `a /= b + c <= d`
+- **Grouping:** `((a /= (b + c)) <= d)`
+
+### A1.1323 — `a >= b - c <= d`
+- **Source:** `a >= b - c <= d`
+- **Grouping:** `((a >= (b - c)) <= d)`
+
+### A1.1324 — `a == b - c /= d`
+- **Source:** `a == b - c /= d`
+- **Grouping:** `((a == (b - c)) /= d)`
+
+### A1.1325 — `a / b ^ c & d`
+- **Source:** `a / b ^ c & d`
+- **Grouping:** `(((a / b) ^ c) & d)`
+
+### A1.1326 — `a <= b == c >> d`
+- **Source:** `a <= b == c >> d`
+- **Grouping:** `((a <= b) == (c >> d))`
+
+### A1.1327 — `a > b / c % d`
+- **Source:** `a > b / c % d`
+- **Grouping:** `(a > ((b / c) % d))`
+
+### A1.1328 — `a - b /= c % d`
+- **Source:** `a - b /= c % d`
+- **Grouping:** `((a - b) /= (c % d))`
+
+### A1.1329 — `a >> b <= c + d`
+- **Source:** `a >> b <= c + d`
+- **Grouping:** `((a >> b) <= (c + d))`
+
+### A1.1330 — `a . b | c == d`
+- **Source:** `a . b | c == d`
+- **Grouping:** `(((a . b) | c) == d)`
+
+### A1.1331 — `a ^ b < c ^ d`
+- **Source:** `a ^ b < c ^ d`
+- **Grouping:** `((a ^ b) < (c ^ d))`
+
+### A1.1332 — `a ^ b >> c <= d`
+- **Source:** `a ^ b >> c <= d`
+- **Grouping:** `((a ^ (b >> c)) <= d)`
+
+### A1.1333 — `a > b < c - d`
+- **Source:** `a > b < c - d`
+- **Grouping:** `((a > b) < (c - d))`
+
+### A1.1334 — `a || b . c >= d`
+- **Source:** `a || b . c >= d`
+- **Grouping:** `(a || ((b . c) >= d))`
+
+### A1.1335 — `a & b - c && d`
+- **Source:** `a & b - c && d`
+- **Grouping:** `((a & (b - c)) && d)`
+
+### A1.1336 — `a && b << c || d`
+- **Source:** `a && b << c || d`
+- **Grouping:** `((a && (b << c)) || d)`
+
+### A1.1337 — `a >> b . c > d`
+- **Source:** `a >> b . c > d`
+- **Grouping:** `((a >> (b . c)) > d)`
+
+### A1.1338 — `a > b + c ^ d`
+- **Source:** `a > b + c ^ d`
+- **Grouping:** `(a > ((b + c) ^ d))`
+
+### A1.1339 — `a % b + c == d`
+- **Source:** `a % b + c == d`
+- **Grouping:** `(((a % b) + c) == d)`
+
+### A1.1340 — `a ^ b . c <= d`
+- **Source:** `a ^ b . c <= d`
+- **Grouping:** `((a ^ (b . c)) <= d)`
+
+### A1.1341 — `a / b > c & d`
+- **Source:** `a / b > c & d`
+- **Grouping:** `((a / b) > (c & d))`
+
+### A1.1342 — `a + b << c > d`
+- **Source:** `a + b << c > d`
+- **Grouping:** `(((a + b) << c) > d)`
+
+### A1.1343 — `a && b ^ c || d`
+- **Source:** `a && b ^ c || d`
+- **Grouping:** `((a && (b ^ c)) || d)`
+
+### A1.1344 — `a - b /= c . d`
+- **Source:** `a - b /= c . d`
+- **Grouping:** `((a - b) /= (c . d))`
+
+### A1.1345 — `a > b + c >> d`
+- **Source:** `a > b + c >> d`
+- **Grouping:** `(a > ((b + c) >> d))`
+
+### A1.1346 — `a >= b ^ c > d`
+- **Source:** `a >= b ^ c > d`
+- **Grouping:** `((a >= (b ^ c)) > d)`
+
+### A1.1347 — `a % b / c & d`
+- **Source:** `a % b / c & d`
+- **Grouping:** `(((a % b) / c) & d)`
+
+### A1.1348 — `a > b / c & d`
+- **Source:** `a > b / c & d`
+- **Grouping:** `(a > ((b / c) & d))`
+
+### A1.1349 — `a & b + c >= d`
+- **Source:** `a & b + c >= d`
+- **Grouping:** `((a & (b + c)) >= d)`
+
+### A1.1350 — `a | b << c % d`
+- **Source:** `a | b << c % d`
+- **Grouping:** `(a | (b << (c % d)))`
+
+### A1.1351 — `a > b * c && d`
+- **Source:** `a > b * c && d`
+- **Grouping:** `((a > (b * c)) && d)`
+
+### A1.1352 — `a >> b < c | d`
+- **Source:** `a >> b < c | d`
+- **Grouping:** `((a >> b) < (c | d))`
+
+### A1.1353 — `a || b >> c + d`
+- **Source:** `a || b >> c + d`
+- **Grouping:** `(a || (b >> (c + d)))`
+
+### A1.1354 — `a > b == c + d`
+- **Source:** `a > b == c + d`
+- **Grouping:** `((a > b) == (c + d))`
+
+### A1.1355 — `a >> b || c <= d`
+- **Source:** `a >> b || c <= d`
+- **Grouping:** `((a >> b) || (c <= d))`
+
+### A1.1356 — `a /= b << c * d`
+- **Source:** `a /= b << c * d`
+- **Grouping:** `(a /= (b << (c * d)))`
+
+### A1.1357 — `a ^ b > c > d`
+- **Source:** `a ^ b > c > d`
+- **Grouping:** `(((a ^ b) > c) > d)`
+
+### A1.1358 — `a . b . c + d`
+- **Source:** `a . b . c + d`
+- **Grouping:** `((a . (b . c)) + d)`
+
+### A1.1359 — `a <= b || c < d`
+- **Source:** `a <= b || c < d`
+- **Grouping:** `((a <= b) || (c < d))`
+
+### A1.1360 — `a * b / c * d`
+- **Source:** `a * b / c * d`
+- **Grouping:** `(((a * b) / c) * d)`
+
+### A1.1361 — `a / b << c << d`
+- **Source:** `a / b << c << d`
+- **Grouping:** `(((a / b) << c) << d)`
+
+### A1.1362 — `a && b /= c + d`
+- **Source:** `a && b /= c + d`
+- **Grouping:** `(a && (b /= (c + d)))`
+
+### A1.1363 — `a /= b < c > d`
+- **Source:** `a /= b < c > d`
+- **Grouping:** `(((a /= b) < c) > d)`
+
+### A1.1364 — `a > b - c /= d`
+- **Source:** `a > b - c /= d`
+- **Grouping:** `((a > (b - c)) /= d)`
+
+### A1.1365 — `a <= b >> c > d`
+- **Source:** `a <= b >> c > d`
+- **Grouping:** `((a <= (b >> c)) > d)`
+
+### A1.1366 — `a + b % c == d`
+- **Source:** `a + b % c == d`
+- **Grouping:** `((a + (b % c)) == d)`
+
+### A1.1367 — `a && b && c <= d`
+- **Source:** `a && b && c <= d`
+- **Grouping:** `((a && b) && (c <= d))`
+
+### A1.1368 — `a . b - c || d`
+- **Source:** `a . b - c || d`
+- **Grouping:** `(((a . b) - c) || d)`
+
+### A1.1369 — `a * b == c >= d`
+- **Source:** `a * b == c >= d`
+- **Grouping:** `(((a * b) == c) >= d)`
+
+### A1.1370 — `a & b == c && d`
+- **Source:** `a & b == c && d`
+- **Grouping:** `(((a & b) == c) && d)`
+
+### A1.1371 — `a <= b < c & d`
+- **Source:** `a <= b < c & d`
+- **Grouping:** `((a <= b) < (c & d))`
+
+### A1.1372 — `a ^ b < c <= d`
+- **Source:** `a ^ b < c <= d`
+- **Grouping:** `(((a ^ b) < c) <= d)`
+
+### A1.1373 — `a >= b || c + d`
+- **Source:** `a >= b || c + d`
+- **Grouping:** `((a >= b) || (c + d))`
+
+### A1.1374 — `a < b * c ^ d`
+- **Source:** `a < b * c ^ d`
+- **Grouping:** `(a < ((b * c) ^ d))`
+
+### A1.1375 — `a * b ^ c < d`
+- **Source:** `a * b ^ c < d`
+- **Grouping:** `(((a * b) ^ c) < d)`
+
+### A1.1376 — `a > b > c | d`
+- **Source:** `a > b > c | d`
+- **Grouping:** `((a > b) > (c | d))`
+
+### A1.1377 — `a << b && c * d`
+- **Source:** `a << b && c * d`
+- **Grouping:** `((a << b) && (c * d))`
+
+### A1.1378 — `a && b && c >> d`
+- **Source:** `a && b && c >> d`
+- **Grouping:** `((a && b) && (c >> d))`
+
+### A1.1379 — `a < b /= c << d`
+- **Source:** `a < b /= c << d`
+- **Grouping:** `((a < b) /= (c << d))`
+
+### A1.1380 — `a | b / c == d`
+- **Source:** `a | b / c == d`
+- **Grouping:** `((a | (b / c)) == d)`
+
+### A1.1381 — `a == b >= c + d`
+- **Source:** `a == b >= c + d`
+- **Grouping:** `((a == b) >= (c + d))`
+
+### A1.1382 — `a == b << c >> d`
+- **Source:** `a == b << c >> d`
+- **Grouping:** `(a == ((b << c) >> d))`
+
+### A1.1383 — `a % b * c == d`
+- **Source:** `a % b * c == d`
+- **Grouping:** `(((a % b) * c) == d)`
+
+### A1.1384 — `a < b >> c || d`
+- **Source:** `a < b >> c || d`
+- **Grouping:** `((a < (b >> c)) || d)`
+
+### A1.1385 — `a || b <= c >= d`
+- **Source:** `a || b <= c >= d`
+- **Grouping:** `(a || ((b <= c) >= d))`
+
+### A1.1386 — `a + b . c >= d`
+- **Source:** `a + b . c >= d`
+- **Grouping:** `((a + (b . c)) >= d)`
+
+### A1.1387 — `a % b * c <= d`
+- **Source:** `a % b * c <= d`
+- **Grouping:** `(((a % b) * c) <= d)`
+
+### A1.1388 — `a < b >> c / d`
+- **Source:** `a < b >> c / d`
+- **Grouping:** `(a < (b >> (c / d)))`
+
+### A1.1389 — `a >> b /= c | d`
+- **Source:** `a >> b /= c | d`
+- **Grouping:** `((a >> b) /= (c | d))`
+
+### A1.1390 — `a <= b | c . d`
+- **Source:** `a <= b | c . d`
+- **Grouping:** `(a <= (b | (c . d)))`
+
+### A1.1391 — `a <= b <= c < d`
+- **Source:** `a <= b <= c < d`
+- **Grouping:** `(((a <= b) <= c) < d)`
+
+### A1.1392 — `a + b % c >= d`
+- **Source:** `a + b % c >= d`
+- **Grouping:** `((a + (b % c)) >= d)`
+
+### A1.1393 — `a & b << c || d`
+- **Source:** `a & b << c || d`
+- **Grouping:** `((a & (b << c)) || d)`
+
+### A1.1394 — `a - b | c < d`
+- **Source:** `a - b | c < d`
+- **Grouping:** `(((a - b) | c) < d)`
+
+### A1.1395 — `a ^ b > c >= d`
+- **Source:** `a ^ b > c >= d`
+- **Grouping:** `(((a ^ b) > c) >= d)`
+
+### A1.1396 — `a + b & c << d`
+- **Source:** `a + b & c << d`
+- **Grouping:** `((a + b) & (c << d))`
+
+### A1.1397 — `a == b > c & d`
+- **Source:** `a == b > c & d`
+- **Grouping:** `((a == b) > (c & d))`
+
+### A1.1398 — `a >= b >> c < d`
+- **Source:** `a >= b >> c < d`
+- **Grouping:** `((a >= (b >> c)) < d)`
+
+### A1.1399 — `a + b << c >= d`
+- **Source:** `a + b << c >= d`
+- **Grouping:** `(((a + b) << c) >= d)`
+
+### A1.1400 — `a >= b / c / d`
+- **Source:** `a >= b / c / d`
+- **Grouping:** `(a >= ((b / c) / d))`
+
+### A1.1401 — `a ^ b > c * d`
+- **Source:** `a ^ b > c * d`
+- **Grouping:** `((a ^ b) > (c * d))`
+
+### A1.1402 — `a >> b & c < d`
+- **Source:** `a >> b & c < d`
+- **Grouping:** `(((a >> b) & c) < d)`
+
+### A1.1403 — `a || b + c > d`
+- **Source:** `a || b + c > d`
+- **Grouping:** `(a || ((b + c) > d))`
+
+### A1.1404 — `a >= b . c << d`
+- **Source:** `a >= b . c << d`
+- **Grouping:** `(a >= ((b . c) << d))`
+
+### A1.1405 — `a << b || c && d`
+- **Source:** `a << b || c && d`
+- **Grouping:** `((a << b) || (c && d))`
+
+### A1.1406 — `a > b > c > d`
+- **Source:** `a > b > c > d`
+- **Grouping:** `(((a > b) > c) > d)`
+
+### A1.1407 — `a & b && c >> d`
+- **Source:** `a & b && c >> d`
+- **Grouping:** `((a & b) && (c >> d))`
+
+### A1.1408 — `a | b && c | d`
+- **Source:** `a | b && c | d`
+- **Grouping:** `((a | b) && (c | d))`
+
+### A1.1409 — `a && b < c % d`
+- **Source:** `a && b < c % d`
+- **Grouping:** `(a && (b < (c % d)))`
+
+### A1.1410 — `a == b == c >> d`
+- **Source:** `a == b == c >> d`
+- **Grouping:** `((a == b) == (c >> d))`
+
+### A1.1411 — `a * b | c / d`
+- **Source:** `a * b | c / d`
+- **Grouping:** `((a * b) | (c / d))`
+
+### A1.1412 — `a || b && c * d`
+- **Source:** `a || b && c * d`
+- **Grouping:** `(a || (b && (c * d)))`
+
+### A1.1413 — `a . b > c && d`
+- **Source:** `a . b > c && d`
+- **Grouping:** `(((a . b) > c) && d)`
+
+### A1.1414 — `a / b == c % d`
+- **Source:** `a / b == c % d`
+- **Grouping:** `((a / b) == (c % d))`
+
+### A1.1415 — `a << b * c /= d`
+- **Source:** `a << b * c /= d`
+- **Grouping:** `((a << (b * c)) /= d)`
+
+### A1.1416 — `a & b > c <= d`
+- **Source:** `a & b > c <= d`
+- **Grouping:** `(((a & b) > c) <= d)`
+
+### A1.1417 — `a >> b . c * d`
+- **Source:** `a >> b . c * d`
+- **Grouping:** `(a >> ((b . c) * d))`
+
+### A1.1418 — `a * b ^ c >> d`
+- **Source:** `a * b ^ c >> d`
+- **Grouping:** `((a * b) ^ (c >> d))`
+
+### A1.1419 — `a + b >= c . d`
+- **Source:** `a + b >= c . d`
+- **Grouping:** `((a + b) >= (c . d))`
+
+### A1.1420 — `a - b || c - d`
+- **Source:** `a - b || c - d`
+- **Grouping:** `((a - b) || (c - d))`
+
+### A1.1421 — `a > b - c >= d`
+- **Source:** `a > b - c >= d`
+- **Grouping:** `((a > (b - c)) >= d)`
+
+### A1.1422 — `a - b ^ c - d`
+- **Source:** `a - b ^ c - d`
+- **Grouping:** `((a - b) ^ (c - d))`
+
+### A1.1423 — `a == b == c == d`
+- **Source:** `a == b == c == d`
+- **Grouping:** `(((a == b) == c) == d)`
+
+### A1.1424 — `a < b % c == d`
+- **Source:** `a < b % c == d`
+- **Grouping:** `((a < (b % c)) == d)`
+
+### A1.1425 — `a + b + c & d`
+- **Source:** `a + b + c & d`
+- **Grouping:** `(((a + b) + c) & d)`
+
+### A1.1426 — `a /= b && c > d`
+- **Source:** `a /= b && c > d`
+- **Grouping:** `((a /= b) && (c > d))`
+
+### A1.1427 — `a > b <= c && d`
+- **Source:** `a > b <= c && d`
+- **Grouping:** `(((a > b) <= c) && d)`
+
+### A1.1428 — `a << b || c /= d`
+- **Source:** `a << b || c /= d`
+- **Grouping:** `((a << b) || (c /= d))`
+
+### A1.1429 — `a == b >= c - d`
+- **Source:** `a == b >= c - d`
+- **Grouping:** `((a == b) >= (c - d))`
+
+### A1.1430 — `a <= b >> c << d`
+- **Source:** `a <= b >> c << d`
+- **Grouping:** `(a <= ((b >> c) << d))`
+
+### A1.1431 — `a || b > c . d`
+- **Source:** `a || b > c . d`
+- **Grouping:** `(a || (b > (c . d)))`
+
+### A1.1432 — `a >= b | c == d`
+- **Source:** `a >= b | c == d`
+- **Grouping:** `((a >= (b | c)) == d)`
+
+### A1.1433 — `a - b & c / d`
+- **Source:** `a - b & c / d`
+- **Grouping:** `((a - b) & (c / d))`
+
+### A1.1434 — `a || b || c && d`
+- **Source:** `a || b || c && d`
+- **Grouping:** `((a || b) || (c && d))`
+
+### A1.1435 — `a << b == c || d`
+- **Source:** `a << b == c || d`
+- **Grouping:** `(((a << b) == c) || d)`
+
+### A1.1436 — `a / b & c % d`
+- **Source:** `a / b & c % d`
+- **Grouping:** `((a / b) & (c % d))`
+
+### A1.1437 — `a >> b >= c % d`
+- **Source:** `a >> b >= c % d`
+- **Grouping:** `((a >> b) >= (c % d))`
+
+### A1.1438 — `a || b % c << d`
+- **Source:** `a || b % c << d`
+- **Grouping:** `(a || ((b % c) << d))`
+
+### A1.1439 — `a % b + c /= d`
+- **Source:** `a % b + c /= d`
+- **Grouping:** `(((a % b) + c) /= d)`
+
+### A1.1440 — `a || b < c == d`
+- **Source:** `a || b < c == d`
+- **Grouping:** `(a || ((b < c) == d))`
+
+### A1.1441 — `a <= b > c - d`
+- **Source:** `a <= b > c - d`
+- **Grouping:** `((a <= b) > (c - d))`
+
+### A1.1442 — `a / b + c ^ d`
+- **Source:** `a / b + c ^ d`
+- **Grouping:** `(((a / b) + c) ^ d)`
+
+### A1.1443 — `a || b > c /= d`
+- **Source:** `a || b > c /= d`
+- **Grouping:** `(a || ((b > c) /= d))`
+
+### A1.1444 — `a <= b || c & d`
+- **Source:** `a <= b || c & d`
+- **Grouping:** `((a <= b) || (c & d))`
+
+### A1.1445 — `a == b . c >= d`
+- **Source:** `a == b . c >= d`
+- **Grouping:** `((a == (b . c)) >= d)`
+
+### A1.1446 — `a > b > c / d`
+- **Source:** `a > b > c / d`
+- **Grouping:** `((a > b) > (c / d))`
+
+### A1.1447 — `a . b == c / d`
+- **Source:** `a . b == c / d`
+- **Grouping:** `((a . b) == (c / d))`
+
+### A1.1448 — `a << b || c | d`
+- **Source:** `a << b || c | d`
+- **Grouping:** `((a << b) || (c | d))`
+
+### A1.1449 — `a && b /= c * d`
+- **Source:** `a && b /= c * d`
+- **Grouping:** `(a && (b /= (c * d)))`
+
+### A1.1450 — `a ^ b >= c || d`
+- **Source:** `a ^ b >= c || d`
+- **Grouping:** `(((a ^ b) >= c) || d)`
+
+### A1.1451 — `a >= b * c << d`
+- **Source:** `a >= b * c << d`
+- **Grouping:** `(a >= ((b * c) << d))`
+
+### A1.1452 — `a | b == c && d`
+- **Source:** `a | b == c && d`
+- **Grouping:** `(((a | b) == c) && d)`
+
+### A1.1453 — `a - b - c && d`
+- **Source:** `a - b - c && d`
+- **Grouping:** `(((a - b) - c) && d)`
+
+### A1.1454 — `a >> b >> c < d`
+- **Source:** `a >> b >> c < d`
+- **Grouping:** `(((a >> b) >> c) < d)`
+
+### A1.1455 — `a << b | c ^ d`
+- **Source:** `a << b | c ^ d`
+- **Grouping:** `(((a << b) | c) ^ d)`
+
+### A1.1456 — `a << b || c == d`
+- **Source:** `a << b || c == d`
+- **Grouping:** `((a << b) || (c == d))`
+
+### A1.1457 — `a % b >> c ^ d`
+- **Source:** `a % b >> c ^ d`
+- **Grouping:** `(((a % b) >> c) ^ d)`
+
+### A1.1458 — `a ^ b / c . d`
+- **Source:** `a ^ b / c . d`
+- **Grouping:** `(a ^ (b / (c . d)))`
+
+### A1.1459 — `a || b << c . d`
+- **Source:** `a || b << c . d`
+- **Grouping:** `(a || (b << (c . d)))`
+
+### A1.1460 — `a <= b . c ^ d`
+- **Source:** `a <= b . c ^ d`
+- **Grouping:** `(a <= ((b . c) ^ d))`
+
+### A1.1461 — `a * b << c ^ d`
+- **Source:** `a * b << c ^ d`
+- **Grouping:** `(((a * b) << c) ^ d)`
+
+### A1.1462 — `a /= b < c <= d`
+- **Source:** `a /= b < c <= d`
+- **Grouping:** `(((a /= b) < c) <= d)`
+
+### A1.1463 — `a > b + c - d`
+- **Source:** `a > b + c - d`
+- **Grouping:** `(a > ((b + c) - d))`
+
+### A1.1464 — `a <= b % c / d`
+- **Source:** `a <= b % c / d`
+- **Grouping:** `(a <= ((b % c) / d))`
+
+### A1.1465 — `a == b . c & d`
+- **Source:** `a == b . c & d`
+- **Grouping:** `(a == ((b . c) & d))`
+
+### A1.1466 — `a % b > c - d`
+- **Source:** `a % b > c - d`
+- **Grouping:** `((a % b) > (c - d))`
+
+### A1.1467 — `a / b || c | d`
+- **Source:** `a / b || c | d`
+- **Grouping:** `((a / b) || (c | d))`
+
+### A1.1468 — `a || b > c | d`
+- **Source:** `a || b > c | d`
+- **Grouping:** `(a || (b > (c | d)))`
+
+### A1.1469 — `a - b / c >> d`
+- **Source:** `a - b / c >> d`
+- **Grouping:** `((a - (b / c)) >> d)`
+
+### A1.1470 — `a == b < c && d`
+- **Source:** `a == b < c && d`
+- **Grouping:** `(((a == b) < c) && d)`
+
+### A1.1471 — `a + b >= c - d`
+- **Source:** `a + b >= c - d`
+- **Grouping:** `((a + b) >= (c - d))`
+
+### A1.1472 — `a >= b . c || d`
+- **Source:** `a >= b . c || d`
+- **Grouping:** `((a >= (b . c)) || d)`
+
+### A1.1473 — `a /= b /= c & d`
+- **Source:** `a /= b /= c & d`
+- **Grouping:** `((a /= b) /= (c & d))`
+
+### A1.1474 — `a <= b . c << d`
+- **Source:** `a <= b . c << d`
+- **Grouping:** `(a <= ((b . c) << d))`
+
+### A1.1475 — `a * b * c == d`
+- **Source:** `a * b * c == d`
+- **Grouping:** `(((a * b) * c) == d)`
+
+### A1.1476 — `a ^ b == c * d`
+- **Source:** `a ^ b == c * d`
+- **Grouping:** `((a ^ b) == (c * d))`
+
+### A1.1477 — `a <= b < c + d`
+- **Source:** `a <= b < c + d`
+- **Grouping:** `((a <= b) < (c + d))`
+
+### A1.1478 — `a /= b . c << d`
+- **Source:** `a /= b . c << d`
+- **Grouping:** `(a /= ((b . c) << d))`
+
+### A1.1479 — `a ^ b * c % d`
+- **Source:** `a ^ b * c % d`
+- **Grouping:** `(a ^ ((b * c) % d))`
+
+### A1.1480 — `a | b <= c == d`
+- **Source:** `a | b <= c == d`
+- **Grouping:** `(((a | b) <= c) == d)`
+
+### A1.1481 — `a < b << c | d`
+- **Source:** `a < b << c | d`
+- **Grouping:** `(a < ((b << c) | d))`
+
+### A1.1482 — `a >= b || c * d`
+- **Source:** `a >= b || c * d`
+- **Grouping:** `((a >= b) || (c * d))`
+
+### A1.1483 — `a + b | c % d`
+- **Source:** `a + b | c % d`
+- **Grouping:** `((a + b) | (c % d))`
+
+### A1.1484 — `a * b || c && d`
+- **Source:** `a * b || c && d`
+- **Grouping:** `((a * b) || (c && d))`
+
+### A1.1485 — `a | b % c / d`
+- **Source:** `a | b % c / d`
+- **Grouping:** `(a | ((b % c) / d))`
+
+### A1.1486 — `a % b >> c | d`
+- **Source:** `a % b >> c | d`
+- **Grouping:** `(((a % b) >> c) | d)`
+
+### A1.1487 — `a >> b > c / d`
+- **Source:** `a >> b > c / d`
+- **Grouping:** `((a >> b) > (c / d))`
+
+### A1.1488 — `a / b == c * d`
+- **Source:** `a / b == c * d`
+- **Grouping:** `((a / b) == (c * d))`
+
+### A1.1489 — `a == b | c > d`
+- **Source:** `a == b | c > d`
+- **Grouping:** `((a == (b | c)) > d)`
+
+### A1.1490 — `a & b / c + d`
+- **Source:** `a & b / c + d`
+- **Grouping:** `(a & ((b / c) + d))`
+
+### A1.1491 — `a + b ^ c >= d`
+- **Source:** `a + b ^ c >= d`
+- **Grouping:** `(((a + b) ^ c) >= d)`
+
+### A1.1492 — `a & b * c <= d`
+- **Source:** `a & b * c <= d`
+- **Grouping:** `((a & (b * c)) <= d)`
+
+### A1.1493 — `a + b * c + d`
+- **Source:** `a + b * c + d`
+- **Grouping:** `((a + (b * c)) + d)`
+
+### A1.1494 — `a % b - c . d`
+- **Source:** `a % b - c . d`
+- **Grouping:** `((a % b) - (c . d))`
+
+### A1.1495 — `a / b << c == d`
+- **Source:** `a / b << c == d`
+- **Grouping:** `(((a / b) << c) == d)`
+
+### A1.1496 — `a /= b < c ^ d`
+- **Source:** `a /= b < c ^ d`
+- **Grouping:** `((a /= b) < (c ^ d))`
+
+### A1.1497 — `a . b > c & d`
+- **Source:** `a . b > c & d`
+- **Grouping:** `((a . b) > (c & d))`
+
+### A1.1498 — `a > b ^ c <= d`
+- **Source:** `a > b ^ c <= d`
+- **Grouping:** `((a > (b ^ c)) <= d)`
+
+### A1.1499 — `a <= b . c <= d`
+- **Source:** `a <= b . c <= d`
+- **Grouping:** `((a <= (b . c)) <= d)`
+
+### A1.1500 — `a && b % c == d`
+- **Source:** `a && b % c == d`
+- **Grouping:** `(a && ((b % c) == d))`
+
+### A1.1501 — `a || b <= c /= d`
+- **Source:** `a || b <= c /= d`
+- **Grouping:** `(a || ((b <= c) /= d))`
+
+### A1.1502 — `a >= b * c * d`
+- **Source:** `a >= b * c * d`
+- **Grouping:** `(a >= ((b * c) * d))`
+
+### A1.1503 — `a /= b > c == d`
+- **Source:** `a /= b > c == d`
+- **Grouping:** `(((a /= b) > c) == d)`
+
+### A1.1504 — `a | b - c || d`
+- **Source:** `a | b - c || d`
+- **Grouping:** `((a | (b - c)) || d)`
+
+### A1.1505 — `a + b | c && d`
+- **Source:** `a + b | c && d`
+- **Grouping:** `(((a + b) | c) && d)`
+
+### A1.1506 — `a <= b + c + d`
+- **Source:** `a <= b + c + d`
+- **Grouping:** `(a <= ((b + c) + d))`
+
+### A1.1507 — `a + b << c <= d`
+- **Source:** `a + b << c <= d`
+- **Grouping:** `(((a + b) << c) <= d)`
+
+### A1.1508 — `a - b >> c /= d`
+- **Source:** `a - b >> c /= d`
+- **Grouping:** `(((a - b) >> c) /= d)`
+
+### A1.1509 — `a == b ^ c . d`
+- **Source:** `a == b ^ c . d`
+- **Grouping:** `(a == (b ^ (c . d)))`
+
+### A1.1510 — `a < b < c & d`
+- **Source:** `a < b < c & d`
+- **Grouping:** `((a < b) < (c & d))`
+
+### A1.1511 — `a . b & c - d`
+- **Source:** `a . b & c - d`
+- **Grouping:** `((a . b) & (c - d))`
+
+### A1.1512 — `a * b == c > d`
+- **Source:** `a * b == c > d`
+- **Grouping:** `(((a * b) == c) > d)`
+
+### A1.1513 — `a + b << c + d`
+- **Source:** `a + b << c + d`
+- **Grouping:** `((a + b) << (c + d))`
+
+### A1.1514 — `a . b % c >= d`
+- **Source:** `a . b % c >= d`
+- **Grouping:** `(((a . b) % c) >= d)`
+
+### A1.1515 — `a / b * c || d`
+- **Source:** `a / b * c || d`
+- **Grouping:** `(((a / b) * c) || d)`
+
+### A1.1516 — `a && b & c << d`
+- **Source:** `a && b & c << d`
+- **Grouping:** `(a && (b & (c << d)))`
+
+### A1.1517 — `a <= b * c + d`
+- **Source:** `a <= b * c + d`
+- **Grouping:** `(a <= ((b * c) + d))`
+
+### A1.1518 — `a < b & c & d`
+- **Source:** `a < b & c & d`
+- **Grouping:** `(a < ((b & c) & d))`
+
+### A1.1519 — `a ^ b == c - d`
+- **Source:** `a ^ b == c - d`
+- **Grouping:** `((a ^ b) == (c - d))`
+
+### A1.1520 — `a - b * c / d`
+- **Source:** `a - b * c / d`
+- **Grouping:** `(a - ((b * c) / d))`
+
+### A1.1521 — `a >= b & c - d`
+- **Source:** `a >= b & c - d`
+- **Grouping:** `(a >= (b & (c - d)))`
+
+### A1.1522 — `a * b == c || d`
+- **Source:** `a * b == c || d`
+- **Grouping:** `(((a * b) == c) || d)`
+
+### A1.1523 — `a & b > c - d`
+- **Source:** `a & b > c - d`
+- **Grouping:** `((a & b) > (c - d))`
+
+### A1.1524 — `a . b >= c > d`
+- **Source:** `a . b >= c > d`
+- **Grouping:** `(((a . b) >= c) > d)`
+
+### A1.1525 — `a & b - c <= d`
+- **Source:** `a & b - c <= d`
+- **Grouping:** `((a & (b - c)) <= d)`
+
+### A1.1526 — `a << b - c << d`
+- **Source:** `a << b - c << d`
+- **Grouping:** `((a << (b - c)) << d)`
+
+### A1.1527 — `a > b >> c & d`
+- **Source:** `a > b >> c & d`
+- **Grouping:** `(a > ((b >> c) & d))`
+
+### A1.1528 — `a == b . c > d`
+- **Source:** `a == b . c > d`
+- **Grouping:** `((a == (b . c)) > d)`
+
+### A1.1529 — `a . b >> c | d`
+- **Source:** `a . b >> c | d`
+- **Grouping:** `(((a . b) >> c) | d)`
+
+### A1.1530 — `a | b >= c == d`
+- **Source:** `a | b >= c == d`
+- **Grouping:** `(((a | b) >= c) == d)`
+
+### A1.1531 — `a << b == c > d`
+- **Source:** `a << b == c > d`
+- **Grouping:** `(((a << b) == c) > d)`
+
+### A1.1532 — `a <= b || c % d`
+- **Source:** `a <= b || c % d`
+- **Grouping:** `((a <= b) || (c % d))`
+
+### A1.1533 — `a <= b /= c & d`
+- **Source:** `a <= b /= c & d`
+- **Grouping:** `((a <= b) /= (c & d))`
+
+### A1.1534 — `a + b >> c >> d`
+- **Source:** `a + b >> c >> d`
+- **Grouping:** `(((a + b) >> c) >> d)`
+
+### A1.1535 — `a || b ^ c > d`
+- **Source:** `a || b ^ c > d`
+- **Grouping:** `(a || ((b ^ c) > d))`
+
+### A1.1536 — `a > b < c << d`
+- **Source:** `a > b < c << d`
+- **Grouping:** `((a > b) < (c << d))`
+
+### A1.1537 — `a < b | c < d`
+- **Source:** `a < b | c < d`
+- **Grouping:** `((a < (b | c)) < d)`
+
+### A1.1538 — `a . b == c - d`
+- **Source:** `a . b == c - d`
+- **Grouping:** `((a . b) == (c - d))`
+
+### A1.1539 — `a / b >> c << d`
+- **Source:** `a / b >> c << d`
+- **Grouping:** `(((a / b) >> c) << d)`
+
+### A1.1540 — `a >= b + c * d`
+- **Source:** `a >= b + c * d`
+- **Grouping:** `(a >= (b + (c * d)))`
+
+### A1.1541 — `a /= b || c >= d`
+- **Source:** `a /= b || c >= d`
+- **Grouping:** `((a /= b) || (c >= d))`
+
+### A1.1542 — `a << b && c >= d`
+- **Source:** `a << b && c >= d`
+- **Grouping:** `((a << b) && (c >= d))`
+
+### A1.1543 — `a . b | c <= d`
+- **Source:** `a . b | c <= d`
+- **Grouping:** `(((a . b) | c) <= d)`
+
+### A1.1544 — `a | b < c > d`
+- **Source:** `a | b < c > d`
+- **Grouping:** `(((a | b) < c) > d)`
+
+### A1.1545 — `a || b == c ^ d`
+- **Source:** `a || b == c ^ d`
+- **Grouping:** `(a || (b == (c ^ d)))`
+
+### A1.1546 — `a >= b && c /= d`
+- **Source:** `a >= b && c /= d`
+- **Grouping:** `((a >= b) && (c /= d))`
+
+### A1.1547 — `a - b << c - d`
+- **Source:** `a - b << c - d`
+- **Grouping:** `((a - b) << (c - d))`
+
+### A1.1548 — `a % b % c . d`
+- **Source:** `a % b % c . d`
+- **Grouping:** `((a % b) % (c . d))`
+
+### A1.1549 — `a ^ b % c & d`
+- **Source:** `a ^ b % c & d`
+- **Grouping:** `((a ^ (b % c)) & d)`
+
+### A1.1550 — `a ^ b < c > d`
+- **Source:** `a ^ b < c > d`
+- **Grouping:** `(((a ^ b) < c) > d)`
+
+### A1.1551 — `a + b /= c >> d`
+- **Source:** `a + b /= c >> d`
+- **Grouping:** `((a + b) /= (c >> d))`
+
+### A1.1552 — `a % b . c . d`
+- **Source:** `a % b . c . d`
+- **Grouping:** `(a % (b . (c . d)))`
+
+### A1.1553 — `a << b & c % d`
+- **Source:** `a << b & c % d`
+- **Grouping:** `((a << b) & (c % d))`
+
+### A1.1554 — `a == b || c * d`
+- **Source:** `a == b || c * d`
+- **Grouping:** `((a == b) || (c * d))`
+
+### A1.1555 — `a + b || c /= d`
+- **Source:** `a + b || c /= d`
+- **Grouping:** `((a + b) || (c /= d))`
+
+### A1.1556 — `a + b << c || d`
+- **Source:** `a + b << c || d`
+- **Grouping:** `(((a + b) << c) || d)`
+
+### A1.1557 — `a + b < c << d`
+- **Source:** `a + b < c << d`
+- **Grouping:** `((a + b) < (c << d))`
+
+### A1.1558 — `a << b | c <= d`
+- **Source:** `a << b | c <= d`
+- **Grouping:** `(((a << b) | c) <= d)`
+
+### A1.1559 — `a && b % c /= d`
+- **Source:** `a && b % c /= d`
+- **Grouping:** `(a && ((b % c) /= d))`
+
+### A1.1560 — `a || b >> c - d`
+- **Source:** `a || b >> c - d`
+- **Grouping:** `(a || (b >> (c - d)))`
+
+### A1.1561 — `a . b || c ^ d`
+- **Source:** `a . b || c ^ d`
+- **Grouping:** `((a . b) || (c ^ d))`
+
+### A1.1562 — `a >= b || c < d`
+- **Source:** `a >= b || c < d`
+- **Grouping:** `((a >= b) || (c < d))`
+
+### A1.1563 — `a <= b & c | d`
+- **Source:** `a <= b & c | d`
+- **Grouping:** `(a <= ((b & c) | d))`
+
+### A1.1564 — `a && b / c == d`
+- **Source:** `a && b / c == d`
+- **Grouping:** `(a && ((b / c) == d))`
+
+### A1.1565 — `a << b . c | d`
+- **Source:** `a << b . c | d`
+- **Grouping:** `((a << (b . c)) | d)`
+
+### A1.1566 — `a % b * c + d`
+- **Source:** `a % b * c + d`
+- **Grouping:** `(((a % b) * c) + d)`
+
+### A1.1567 — `a % b > c % d`
+- **Source:** `a % b > c % d`
+- **Grouping:** `((a % b) > (c % d))`
+
+### A1.1568 — `a < b && c ^ d`
+- **Source:** `a < b && c ^ d`
+- **Grouping:** `((a < b) && (c ^ d))`
+
+### A1.1569 — `a / b > c <= d`
+- **Source:** `a / b > c <= d`
+- **Grouping:** `(((a / b) > c) <= d)`
+
+### A1.1570 — `a | b - c & d`
+- **Source:** `a | b - c & d`
+- **Grouping:** `((a | (b - c)) & d)`
+
+### A1.1571 — `a - b >> c >> d`
+- **Source:** `a - b >> c >> d`
+- **Grouping:** `(((a - b) >> c) >> d)`
+
+### A1.1572 — `a == b . c < d`
+- **Source:** `a == b . c < d`
+- **Grouping:** `((a == (b . c)) < d)`
+
+### A1.1573 — `a / b / c . d`
+- **Source:** `a / b / c . d`
+- **Grouping:** `((a / b) / (c . d))`
+
+### A1.1574 — `a + b > c & d`
+- **Source:** `a + b > c & d`
+- **Grouping:** `((a + b) > (c & d))`
+
+### A1.1575 — `a /= b % c /= d`
+- **Source:** `a /= b % c /= d`
+- **Grouping:** `((a /= (b % c)) /= d)`
+
+### A1.1576 — `a + b /= c <= d`
+- **Source:** `a + b /= c <= d`
+- **Grouping:** `(((a + b) /= c) <= d)`
+
+### A1.1577 — `a << b . c & d`
+- **Source:** `a << b . c & d`
+- **Grouping:** `((a << (b . c)) & d)`
+
+### A1.1578 — `a * b - c < d`
+- **Source:** `a * b - c < d`
+- **Grouping:** `(((a * b) - c) < d)`
+
+### A1.1579 — `a % b >= c && d`
+- **Source:** `a % b >= c && d`
+- **Grouping:** `(((a % b) >= c) && d)`
+
+### A1.1580 — `a < b || c << d`
+- **Source:** `a < b || c << d`
+- **Grouping:** `((a < b) || (c << d))`
+
+### A1.1581 — `a & b & c || d`
+- **Source:** `a & b & c || d`
+- **Grouping:** `(((a & b) & c) || d)`
+
+### A1.1582 — `a << b - c && d`
+- **Source:** `a << b - c && d`
+- **Grouping:** `((a << (b - c)) && d)`
+
+### A1.1583 — `a >= b / c || d`
+- **Source:** `a >= b / c || d`
+- **Grouping:** `((a >= (b / c)) || d)`
+
+### A1.1584 — `a /= b > c >> d`
+- **Source:** `a /= b > c >> d`
+- **Grouping:** `((a /= b) > (c >> d))`
+
+### A1.1585 — `a && b - c >> d`
+- **Source:** `a && b - c >> d`
+- **Grouping:** `(a && ((b - c) >> d))`
+
+### A1.1586 — `a < b >= c + d`
+- **Source:** `a < b >= c + d`
+- **Grouping:** `((a < b) >= (c + d))`
+
+### A1.1587 — `a || b == c /= d`
+- **Source:** `a || b == c /= d`
+- **Grouping:** `(a || ((b == c) /= d))`
+
+### A1.1588 — `a % b >> c & d`
+- **Source:** `a % b >> c & d`
+- **Grouping:** `(((a % b) >> c) & d)`
+
+### A1.1589 — `a | b >> c ^ d`
+- **Source:** `a | b >> c ^ d`
+- **Grouping:** `((a | (b >> c)) ^ d)`
+
+### A1.1590 — `a && b + c >> d`
+- **Source:** `a && b + c >> d`
+- **Grouping:** `(a && ((b + c) >> d))`
+
+### A1.1591 — `a | b > c > d`
+- **Source:** `a | b > c > d`
+- **Grouping:** `(((a | b) > c) > d)`
+
+### A1.1592 — `a ^ b | c || d`
+- **Source:** `a ^ b | c || d`
+- **Grouping:** `(((a ^ b) | c) || d)`
+
+### A1.1593 — `a <= b < c < d`
+- **Source:** `a <= b < c < d`
+- **Grouping:** `(((a <= b) < c) < d)`
+
+### A1.1594 — `a || b == c - d`
+- **Source:** `a || b == c - d`
+- **Grouping:** `(a || (b == (c - d)))`
+
+### A1.1595 — `a % b /= c | d`
+- **Source:** `a % b /= c | d`
+- **Grouping:** `((a % b) /= (c | d))`
+
+### A1.1596 — `a & b ^ c && d`
+- **Source:** `a & b ^ c && d`
+- **Grouping:** `(((a & b) ^ c) && d)`
+
+### A1.1597 — `a && b % c & d`
+- **Source:** `a && b % c & d`
+- **Grouping:** `(a && ((b % c) & d))`
+
+### A1.1598 — `a - b + c . d`
+- **Source:** `a - b + c . d`
+- **Grouping:** `((a - b) + (c . d))`
+
+### A1.1599 — `a | b + c || d`
+- **Source:** `a | b + c || d`
+- **Grouping:** `((a | (b + c)) || d)`
+
+### A1.1600 — `a & b & c % d`
+- **Source:** `a & b & c % d`
+- **Grouping:** `((a & b) & (c % d))`
+
+### A1.1601 — `a & b - c >> d`
+- **Source:** `a & b - c >> d`
+- **Grouping:** `(a & ((b - c) >> d))`
+
+### A1.1602 — `a ^ b <= c << d`
+- **Source:** `a ^ b <= c << d`
+- **Grouping:** `((a ^ b) <= (c << d))`
+
+### A1.1603 — `a >= b >> c >> d`
+- **Source:** `a >= b >> c >> d`
+- **Grouping:** `(a >= ((b >> c) >> d))`
+
+### A1.1604 — `a || b || c < d`
+- **Source:** `a || b || c < d`
+- **Grouping:** `((a || b) || (c < d))`
+
+### A1.1605 — `a <= b > c % d`
+- **Source:** `a <= b > c % d`
+- **Grouping:** `((a <= b) > (c % d))`
+
+### A1.1606 — `a . b . c > d`
+- **Source:** `a . b . c > d`
+- **Grouping:** `((a . (b . c)) > d)`
+
+### A1.1607 — `a >> b >= c == d`
+- **Source:** `a >> b >= c == d`
+- **Grouping:** `(((a >> b) >= c) == d)`
+
+### A1.1608 — `a | b || c <= d`
+- **Source:** `a | b || c <= d`
+- **Grouping:** `((a | b) || (c <= d))`
+
+### A1.1609 — `a < b < c - d`
+- **Source:** `a < b < c - d`
+- **Grouping:** `((a < b) < (c - d))`
+
+### A1.1610 — `a < b /= c - d`
+- **Source:** `a < b /= c - d`
+- **Grouping:** `((a < b) /= (c - d))`
+
+### A1.1611 — `a >= b /= c > d`
+- **Source:** `a >= b /= c > d`
+- **Grouping:** `(((a >= b) /= c) > d)`
+
+### A1.1612 — `a || b . c + d`
+- **Source:** `a || b . c + d`
+- **Grouping:** `(a || ((b . c) + d))`
+
+### A1.1613 — `a * b > c << d`
+- **Source:** `a * b > c << d`
+- **Grouping:** `((a * b) > (c << d))`
+
+### A1.1614 — `a / b % c > d`
+- **Source:** `a / b % c > d`
+- **Grouping:** `(((a / b) % c) > d)`
+
+### A1.1615 — `a || b . c >> d`
+- **Source:** `a || b . c >> d`
+- **Grouping:** `(a || ((b . c) >> d))`
+
+### A1.1616 — `a . b * c + d`
+- **Source:** `a . b * c + d`
+- **Grouping:** `(((a . b) * c) + d)`
+
+### A1.1617 — `a / b . c >= d`
+- **Source:** `a / b . c >= d`
+- **Grouping:** `((a / (b . c)) >= d)`
+
+### A1.1618 — `a >> b && c ^ d`
+- **Source:** `a >> b && c ^ d`
+- **Grouping:** `((a >> b) && (c ^ d))`
+
+### A1.1619 — `a | b < c == d`
+- **Source:** `a | b < c == d`
+- **Grouping:** `(((a | b) < c) == d)`
+
+### A1.1620 — `a & b * c + d`
+- **Source:** `a & b * c + d`
+- **Grouping:** `(a & ((b * c) + d))`
+
+### A1.1621 — `a == b & c >= d`
+- **Source:** `a == b & c >= d`
+- **Grouping:** `((a == (b & c)) >= d)`
+
+### A1.1622 — `a * b || c % d`
+- **Source:** `a * b || c % d`
+- **Grouping:** `((a * b) || (c % d))`
+
+### A1.1623 — `a | b > c ^ d`
+- **Source:** `a | b > c ^ d`
+- **Grouping:** `((a | b) > (c ^ d))`
+
+### A1.1624 — `a <= b | c & d`
+- **Source:** `a <= b | c & d`
+- **Grouping:** `(a <= ((b | c) & d))`
+
+### A1.1625 — `a >= b / c | d`
+- **Source:** `a >= b / c | d`
+- **Grouping:** `(a >= ((b / c) | d))`
+
+### A1.1626 — `a >> b - c > d`
+- **Source:** `a >> b - c > d`
+- **Grouping:** `((a >> (b - c)) > d)`
+
+### A1.1627 — `a < b | c /= d`
+- **Source:** `a < b | c /= d`
+- **Grouping:** `((a < (b | c)) /= d)`
+
+### A1.1628 — `a + b + c % d`
+- **Source:** `a + b + c % d`
+- **Grouping:** `((a + b) + (c % d))`
+
+### A1.1629 — `a << b | c >= d`
+- **Source:** `a << b | c >= d`
+- **Grouping:** `(((a << b) | c) >= d)`
+
+### A1.1630 — `a <= b >= c < d`
+- **Source:** `a <= b >= c < d`
+- **Grouping:** `(((a <= b) >= c) < d)`
+
+### A1.1631 — `a - b <= c + d`
+- **Source:** `a - b <= c + d`
+- **Grouping:** `((a - b) <= (c + d))`
+
+### A1.1632 — `a * b / c % d`
+- **Source:** `a * b / c % d`
+- **Grouping:** `(((a * b) / c) % d)`
+
+### A1.1633 — `a - b + c < d`
+- **Source:** `a - b + c < d`
+- **Grouping:** `(((a - b) + c) < d)`
+
+### A1.1634 — `a | b / c | d`
+- **Source:** `a | b / c | d`
+- **Grouping:** `((a | (b / c)) | d)`
+
+### A1.1635 — `a <= b < c || d`
+- **Source:** `a <= b < c || d`
+- **Grouping:** `(((a <= b) < c) || d)`
+
+### A1.1636 — `a << b == c + d`
+- **Source:** `a << b == c + d`
+- **Grouping:** `((a << b) == (c + d))`
+
+### A1.1637 — `a | b ^ c >> d`
+- **Source:** `a | b ^ c >> d`
+- **Grouping:** `((a | b) ^ (c >> d))`
+
+### A1.1638 — `a << b <= c . d`
+- **Source:** `a << b <= c . d`
+- **Grouping:** `((a << b) <= (c . d))`
+
+### A1.1639 — `a . b <= c < d`
+- **Source:** `a . b <= c < d`
+- **Grouping:** `(((a . b) <= c) < d)`
+
+### A1.1640 — `a % b ^ c /= d`
+- **Source:** `a % b ^ c /= d`
+- **Grouping:** `(((a % b) ^ c) /= d)`
+
+### A1.1641 — `a || b < c | d`
+- **Source:** `a || b < c | d`
+- **Grouping:** `(a || (b < (c | d)))`
+
+### A1.1642 — `a . b | c << d`
+- **Source:** `a . b | c << d`
+- **Grouping:** `((a . b) | (c << d))`
+
+### A1.1643 — `a * b >> c / d`
+- **Source:** `a * b >> c / d`
+- **Grouping:** `((a * b) >> (c / d))`
+
+### A1.1644 — `a >= b + c | d`
+- **Source:** `a >= b + c | d`
+- **Grouping:** `(a >= ((b + c) | d))`
+
+### A1.1645 — `a % b > c + d`
+- **Source:** `a % b > c + d`
+- **Grouping:** `((a % b) > (c + d))`
+
+### A1.1646 — `a && b . c << d`
+- **Source:** `a && b . c << d`
+- **Grouping:** `(a && ((b . c) << d))`
+
+### A1.1647 — `a + b - c && d`
+- **Source:** `a + b - c && d`
+- **Grouping:** `(((a + b) - c) && d)`
+
+### A1.1648 — `a < b && c - d`
+- **Source:** `a < b && c - d`
+- **Grouping:** `((a < b) && (c - d))`
+
+### A1.1649 — `a || b >= c / d`
+- **Source:** `a || b >= c / d`
+- **Grouping:** `(a || (b >= (c / d)))`
+
+### A1.1650 — `a < b == c || d`
+- **Source:** `a < b == c || d`
+- **Grouping:** `(((a < b) == c) || d)`
+
+### A1.1651 — `a == b >= c ^ d`
+- **Source:** `a == b >= c ^ d`
+- **Grouping:** `((a == b) >= (c ^ d))`
+
+### A1.1652 — `a * b && c <= d`
+- **Source:** `a * b && c <= d`
+- **Grouping:** `((a * b) && (c <= d))`
+
+### A1.1653 — `a & b + c >> d`
+- **Source:** `a & b + c >> d`
+- **Grouping:** `(a & ((b + c) >> d))`
+
+### A1.1654 — `a >= b == c && d`
+- **Source:** `a >= b == c && d`
+- **Grouping:** `(((a >= b) == c) && d)`
+
+### A1.1655 — `a . b || c >> d`
+- **Source:** `a . b || c >> d`
+- **Grouping:** `((a . b) || (c >> d))`
+
+### A1.1656 — `a % b ^ c - d`
+- **Source:** `a % b ^ c - d`
+- **Grouping:** `((a % b) ^ (c - d))`
+
+### A1.1657 — `a /= b . c & d`
+- **Source:** `a /= b . c & d`
+- **Grouping:** `(a /= ((b . c) & d))`
+
+### A1.1658 — `a | b / c * d`
+- **Source:** `a | b / c * d`
+- **Grouping:** `(a | ((b / c) * d))`
+
+### A1.1659 — `a == b >= c == d`
+- **Source:** `a == b >= c == d`
+- **Grouping:** `(((a == b) >= c) == d)`
+
+### A1.1660 — `a + b / c && d`
+- **Source:** `a + b / c && d`
+- **Grouping:** `((a + (b / c)) && d)`
+
+### A1.1661 — `a . b && c & d`
+- **Source:** `a . b && c & d`
+- **Grouping:** `((a . b) && (c & d))`
+
+### A1.1662 — `a < b ^ c | d`
+- **Source:** `a < b ^ c | d`
+- **Grouping:** `(a < ((b ^ c) | d))`
+
+### A1.1663 — `a + b || c ^ d`
+- **Source:** `a + b || c ^ d`
+- **Grouping:** `((a + b) || (c ^ d))`
+
+### A1.1664 — `a || b + c / d`
+- **Source:** `a || b + c / d`
+- **Grouping:** `(a || (b + (c / d)))`
+
+### A1.1665 — `a /= b * c / d`
+- **Source:** `a /= b * c / d`
+- **Grouping:** `(a /= ((b * c) / d))`
+
+### A1.1666 — `a | b * c << d`
+- **Source:** `a | b * c << d`
+- **Grouping:** `(a | ((b * c) << d))`
+
+### A1.1667 — `a << b * c ^ d`
+- **Source:** `a << b * c ^ d`
+- **Grouping:** `((a << (b * c)) ^ d)`
+
+### A1.1668 — `a /= b << c . d`
+- **Source:** `a /= b << c . d`
+- **Grouping:** `(a /= (b << (c . d)))`
+
+### A1.1669 — `a ^ b | c && d`
+- **Source:** `a ^ b | c && d`
+- **Grouping:** `(((a ^ b) | c) && d)`
+
+### A1.1670 — `a < b && c / d`
+- **Source:** `a < b && c / d`
+- **Grouping:** `((a < b) && (c / d))`
+
+### A1.1671 — `a <= b >= c > d`
+- **Source:** `a <= b >= c > d`
+- **Grouping:** `(((a <= b) >= c) > d)`
+
+### A1.1672 — `a > b << c ^ d`
+- **Source:** `a > b << c ^ d`
+- **Grouping:** `(a > ((b << c) ^ d))`
+
+### A1.1673 — `a || b ^ c == d`
+- **Source:** `a || b ^ c == d`
+- **Grouping:** `(a || ((b ^ c) == d))`
+
+### A1.1674 — `a >= b | c - d`
+- **Source:** `a >= b | c - d`
+- **Grouping:** `(a >= (b | (c - d)))`
+
+### A1.1675 — `a << b ^ c << d`
+- **Source:** `a << b ^ c << d`
+- **Grouping:** `((a << b) ^ (c << d))`
+
+### A1.1676 — `a - b < c <= d`
+- **Source:** `a - b < c <= d`
+- **Grouping:** `(((a - b) < c) <= d)`
+
+### A1.1677 — `a | b <= c % d`
+- **Source:** `a | b <= c % d`
+- **Grouping:** `((a | b) <= (c % d))`
+
+### A1.1678 — `a >= b - c << d`
+- **Source:** `a >= b - c << d`
+- **Grouping:** `(a >= ((b - c) << d))`
+
+### A1.1679 — `a % b >= c + d`
+- **Source:** `a % b >= c + d`
+- **Grouping:** `((a % b) >= (c + d))`
+
+### A1.1680 — `a ^ b | c < d`
+- **Source:** `a ^ b | c < d`
+- **Grouping:** `(((a ^ b) | c) < d)`
+
+### A1.1681 — `a + b & c >> d`
+- **Source:** `a + b & c >> d`
+- **Grouping:** `((a + b) & (c >> d))`
+
+### A1.1682 — `a / b < c < d`
+- **Source:** `a / b < c < d`
+- **Grouping:** `(((a / b) < c) < d)`
+
+### A1.1683 — `a ^ b > c ^ d`
+- **Source:** `a ^ b > c ^ d`
+- **Grouping:** `((a ^ b) > (c ^ d))`
+
+### A1.1684 — `a / b - c / d`
+- **Source:** `a / b - c / d`
+- **Grouping:** `((a / b) - (c / d))`
+
+### A1.1685 — `a < b >> c >> d`
+- **Source:** `a < b >> c >> d`
+- **Grouping:** `(a < ((b >> c) >> d))`
+
+### A1.1686 — `a - b && c >> d`
+- **Source:** `a - b && c >> d`
+- **Grouping:** `((a - b) && (c >> d))`
+
+### A1.1687 — `a / b <= c && d`
+- **Source:** `a / b <= c && d`
+- **Grouping:** `(((a / b) <= c) && d)`
+
+### A1.1688 — `a / b || c - d`
+- **Source:** `a / b || c - d`
+- **Grouping:** `((a / b) || (c - d))`
+
+### A1.1689 — `a || b % c < d`
+- **Source:** `a || b % c < d`
+- **Grouping:** `(a || ((b % c) < d))`
+
+### A1.1690 — `a & b / c - d`
+- **Source:** `a & b / c - d`
+- **Grouping:** `(a & ((b / c) - d))`
+
+### A1.1691 — `a * b - c . d`
+- **Source:** `a * b - c . d`
+- **Grouping:** `((a * b) - (c . d))`
+
+### A1.1692 — `a + b - c >> d`
+- **Source:** `a + b - c >> d`
+- **Grouping:** `(((a + b) - c) >> d)`
+
+### A1.1693 — `a . b * c & d`
+- **Source:** `a . b * c & d`
+- **Grouping:** `(((a . b) * c) & d)`
+
+### A1.1694 — `a / b >= c << d`
+- **Source:** `a / b >= c << d`
+- **Grouping:** `((a / b) >= (c << d))`
+
+### A1.1695 — `a << b || c - d`
+- **Source:** `a << b || c - d`
+- **Grouping:** `((a << b) || (c - d))`
+
+### A1.1696 — `a . b /= c >= d`
+- **Source:** `a . b /= c >= d`
+- **Grouping:** `(((a . b) /= c) >= d)`
+
+### A1.1697 — `a /= b << c < d`
+- **Source:** `a /= b << c < d`
+- **Grouping:** `((a /= (b << c)) < d)`
+
+### A1.1698 — `a > b * c >= d`
+- **Source:** `a > b * c >= d`
+- **Grouping:** `((a > (b * c)) >= d)`
+
+### A1.1699 — `a && b + c + d`
+- **Source:** `a && b + c + d`
+- **Grouping:** `(a && ((b + c) + d))`
+
+### A1.1700 — `a < b == c <= d`
+- **Source:** `a < b == c <= d`
+- **Grouping:** `(((a < b) == c) <= d)`
+
+### A1.1701 — `a | b & c * d`
+- **Source:** `a | b & c * d`
+- **Grouping:** `((a | b) & (c * d))`
+
+### A1.1702 — `a / b << c >= d`
+- **Source:** `a / b << c >= d`
+- **Grouping:** `(((a / b) << c) >= d)`
+
+### A1.1703 — `a << b ^ c && d`
+- **Source:** `a << b ^ c && d`
+- **Grouping:** `(((a << b) ^ c) && d)`
+
+### A1.1704 — `a < b ^ c / d`
+- **Source:** `a < b ^ c / d`
+- **Grouping:** `(a < (b ^ (c / d)))`
+
+### A1.1705 — `a == b > c && d`
+- **Source:** `a == b > c && d`
+- **Grouping:** `(((a == b) > c) && d)`
+
+### A1.1706 — `a << b % c && d`
+- **Source:** `a << b % c && d`
+- **Grouping:** `((a << (b % c)) && d)`
+
+### A1.1707 — `a % b /= c == d`
+- **Source:** `a % b /= c == d`
+- **Grouping:** `(((a % b) /= c) == d)`
+
+### A1.1708 — `a . b / c - d`
+- **Source:** `a . b / c - d`
+- **Grouping:** `(((a . b) / c) - d)`
+
+### A1.1709 — `a && b == c > d`
+- **Source:** `a && b == c > d`
+- **Grouping:** `(a && ((b == c) > d))`
+
+### A1.1710 — `a + b >> c * d`
+- **Source:** `a + b >> c * d`
+- **Grouping:** `((a + b) >> (c * d))`
+
+### A1.1711 — `a % b & c . d`
+- **Source:** `a % b & c . d`
+- **Grouping:** `((a % b) & (c . d))`
+
+### A1.1712 — `a >= b == c * d`
+- **Source:** `a >= b == c * d`
+- **Grouping:** `((a >= b) == (c * d))`
+
+### A1.1713 — `a - b && c . d`
+- **Source:** `a - b && c . d`
+- **Grouping:** `((a - b) && (c . d))`
+
+### A1.1714 — `a . b /= c >> d`
+- **Source:** `a . b /= c >> d`
+- **Grouping:** `((a . b) /= (c >> d))`
+
+### A1.1715 — `a << b . c >> d`
+- **Source:** `a << b . c >> d`
+- **Grouping:** `((a << (b . c)) >> d)`
+
+### A1.1716 — `a && b > c - d`
+- **Source:** `a && b > c - d`
+- **Grouping:** `(a && (b > (c - d)))`
+
+### A1.1717 — `a | b % c * d`
+- **Source:** `a | b % c * d`
+- **Grouping:** `(a | ((b % c) * d))`
+
+### A1.1718 — `a == b . c - d`
+- **Source:** `a == b . c - d`
+- **Grouping:** `(a == ((b . c) - d))`
+
+### A1.1719 — `a >> b >> c * d`
+- **Source:** `a >> b >> c * d`
+- **Grouping:** `((a >> b) >> (c * d))`
+
+### A1.1720 — `a & b > c % d`
+- **Source:** `a & b > c % d`
+- **Grouping:** `((a & b) > (c % d))`
+
+### A1.1721 — `a | b >> c /= d`
+- **Source:** `a | b >> c /= d`
+- **Grouping:** `((a | (b >> c)) /= d)`
+
+### A1.1722 — `a * b <= c && d`
+- **Source:** `a * b <= c && d`
+- **Grouping:** `(((a * b) <= c) && d)`
+
+### A1.1723 — `a & b >> c || d`
+- **Source:** `a & b >> c || d`
+- **Grouping:** `((a & (b >> c)) || d)`
+
+### A1.1724 — `a * b && c / d`
+- **Source:** `a * b && c / d`
+- **Grouping:** `((a * b) && (c / d))`
+
+### A1.1725 — `a && b & c <= d`
+- **Source:** `a && b & c <= d`
+- **Grouping:** `(a && ((b & c) <= d))`
+
+### A1.1726 — `a > b | c . d`
+- **Source:** `a > b | c . d`
+- **Grouping:** `(a > (b | (c . d)))`
+
+### A1.1727 — `a | b >= c /= d`
+- **Source:** `a | b >= c /= d`
+- **Grouping:** `(((a | b) >= c) /= d)`
+
+### A1.1728 — `a << b - c ^ d`
+- **Source:** `a << b - c ^ d`
+- **Grouping:** `((a << (b - c)) ^ d)`
+
+### A1.1729 — `a % b << c % d`
+- **Source:** `a % b << c % d`
+- **Grouping:** `((a % b) << (c % d))`
+
+### A1.1730 — `a % b / c << d`
+- **Source:** `a % b / c << d`
+- **Grouping:** `(((a % b) / c) << d)`
+
+### A1.1731 — `a > b >= c - d`
+- **Source:** `a > b >= c - d`
+- **Grouping:** `((a > b) >= (c - d))`
+
+### A1.1732 — `a < b - c < d`
+- **Source:** `a < b - c < d`
+- **Grouping:** `((a < (b - c)) < d)`
+
+### A1.1733 — `a <= b <= c >> d`
+- **Source:** `a <= b <= c >> d`
+- **Grouping:** `((a <= b) <= (c >> d))`
+
+### A1.1734 — `a - b | c << d`
+- **Source:** `a - b | c << d`
+- **Grouping:** `((a - b) | (c << d))`
+
+### A1.1735 — `a & b | c <= d`
+- **Source:** `a & b | c <= d`
+- **Grouping:** `(((a & b) | c) <= d)`
+
+### A1.1736 — `a == b >= c . d`
+- **Source:** `a == b >= c . d`
+- **Grouping:** `((a == b) >= (c . d))`
+
+### A1.1737 — `a / b . c && d`
+- **Source:** `a / b . c && d`
+- **Grouping:** `((a / (b . c)) && d)`
+
+### A1.1738 — `a >> b < c < d`
+- **Source:** `a >> b < c < d`
+- **Grouping:** `(((a >> b) < c) < d)`
+
+### A1.1739 — `a <= b >= c & d`
+- **Source:** `a <= b >= c & d`
+- **Grouping:** `((a <= b) >= (c & d))`
+
+### A1.1740 — `a & b /= c % d`
+- **Source:** `a & b /= c % d`
+- **Grouping:** `((a & b) /= (c % d))`
+
+### A1.1741 — `a >= b > c << d`
+- **Source:** `a >= b > c << d`
+- **Grouping:** `((a >= b) > (c << d))`
+
+### A1.1742 — `a . b + c % d`
+- **Source:** `a . b + c % d`
+- **Grouping:** `((a . b) + (c % d))`
+
+### A1.1743 — `a << b == c < d`
+- **Source:** `a << b == c < d`
+- **Grouping:** `(((a << b) == c) < d)`
+
+### A1.1744 — `a >= b << c + d`
+- **Source:** `a >= b << c + d`
+- **Grouping:** `(a >= (b << (c + d)))`
+
+### A1.1745 — `a ^ b << c > d`
+- **Source:** `a ^ b << c > d`
+- **Grouping:** `((a ^ (b << c)) > d)`
+
+### A1.1746 — `a / b && c && d`
+- **Source:** `a / b && c && d`
+- **Grouping:** `(((a / b) && c) && d)`
+
+### A1.1747 — `a && b - c >= d`
+- **Source:** `a && b - c >= d`
+- **Grouping:** `(a && ((b - c) >= d))`
+
+### A1.1748 — `a == b . c <= d`
+- **Source:** `a == b . c <= d`
+- **Grouping:** `((a == (b . c)) <= d)`
+
+### A1.1749 — `a + b || c + d`
+- **Source:** `a + b || c + d`
+- **Grouping:** `((a + b) || (c + d))`
+
+### A1.1750 — `a || b % c . d`
+- **Source:** `a || b % c . d`
+- **Grouping:** `(a || (b % (c . d)))`
+
+### A1.1751 — `a >= b + c & d`
+- **Source:** `a >= b + c & d`
+- **Grouping:** `(a >= ((b + c) & d))`
+
+### A1.1752 — `a && b >= c + d`
+- **Source:** `a && b >= c + d`
+- **Grouping:** `(a && (b >= (c + d)))`
+
+### A1.1753 — `a >= b <= c % d`
+- **Source:** `a >= b <= c % d`
+- **Grouping:** `((a >= b) <= (c % d))`
+
+### A1.1754 — `a < b - c / d`
+- **Source:** `a < b - c / d`
+- **Grouping:** `(a < (b - (c / d)))`
+
+### A1.1755 — `a ^ b || c /= d`
+- **Source:** `a ^ b || c /= d`
+- **Grouping:** `((a ^ b) || (c /= d))`
+
+### A1.1756 — `a /= b < c + d`
+- **Source:** `a /= b < c + d`
+- **Grouping:** `((a /= b) < (c + d))`
+
+### A1.1757 — `a && b + c < d`
+- **Source:** `a && b + c < d`
+- **Grouping:** `(a && ((b + c) < d))`
+
+### A1.1758 — `a - b - c % d`
+- **Source:** `a - b - c % d`
+- **Grouping:** `((a - b) - (c % d))`
+
+### A1.1759 — `a / b > c >> d`
+- **Source:** `a / b > c >> d`
+- **Grouping:** `((a / b) > (c >> d))`
+
+### A1.1760 — `a - b >> c | d`
+- **Source:** `a - b >> c | d`
+- **Grouping:** `(((a - b) >> c) | d)`
+
+### A1.1761 — `a < b % c . d`
+- **Source:** `a < b % c . d`
+- **Grouping:** `(a < (b % (c . d)))`
+
+### A1.1762 — `a ^ b > c || d`
+- **Source:** `a ^ b > c || d`
+- **Grouping:** `(((a ^ b) > c) || d)`
+
+### A1.1763 — `a & b % c >= d`
+- **Source:** `a & b % c >= d`
+- **Grouping:** `((a & (b % c)) >= d)`
+
+### A1.1764 — `a << b | c || d`
+- **Source:** `a << b | c || d`
+- **Grouping:** `(((a << b) | c) || d)`
+
+### A1.1765 — `a - b & c ^ d`
+- **Source:** `a - b & c ^ d`
+- **Grouping:** `(((a - b) & c) ^ d)`
+
+### A1.1766 — `a & b && c /= d`
+- **Source:** `a & b && c /= d`
+- **Grouping:** `((a & b) && (c /= d))`
+
+### A1.1767 — `a || b < c /= d`
+- **Source:** `a || b < c /= d`
+- **Grouping:** `(a || ((b < c) /= d))`
+
+### A1.1768 — `a - b . c . d`
+- **Source:** `a - b . c . d`
+- **Grouping:** `(a - (b . (c . d)))`
+
+### A1.1769 — `a && b ^ c & d`
+- **Source:** `a && b ^ c & d`
+- **Grouping:** `(a && ((b ^ c) & d))`
+
+### A1.1770 — `a /= b <= c >> d`
+- **Source:** `a /= b <= c >> d`
+- **Grouping:** `((a /= b) <= (c >> d))`
+
+### A1.1771 — `a & b >= c | d`
+- **Source:** `a & b >= c | d`
+- **Grouping:** `((a & b) >= (c | d))`
+
+### A1.1772 — `a | b >= c | d`
+- **Source:** `a | b >= c | d`
+- **Grouping:** `((a | b) >= (c | d))`
+
+### A1.1773 — `a >> b - c >> d`
+- **Source:** `a >> b - c >> d`
+- **Grouping:** `((a >> (b - c)) >> d)`
+
+### A1.1774 — `a + b / c % d`
+- **Source:** `a + b / c % d`
+- **Grouping:** `(a + ((b / c) % d))`
+
+### A1.1775 — `a && b - c / d`
+- **Source:** `a && b - c / d`
+- **Grouping:** `(a && (b - (c / d)))`
+
+### A1.1776 — `a . b & c | d`
+- **Source:** `a . b & c | d`
+- **Grouping:** `(((a . b) & c) | d)`
+
+### A1.1777 — `a % b - c > d`
+- **Source:** `a % b - c > d`
+- **Grouping:** `(((a % b) - c) > d)`
+
+### A1.1778 — `a << b | c << d`
+- **Source:** `a << b | c << d`
+- **Grouping:** `((a << b) | (c << d))`
+
+### A1.1779 — `a - b + c >> d`
+- **Source:** `a - b + c >> d`
+- **Grouping:** `(((a - b) + c) >> d)`
+
+### A1.1780 — `a >> b == c < d`
+- **Source:** `a >> b == c < d`
+- **Grouping:** `(((a >> b) == c) < d)`
+
+### A1.1781 — `a <= b <= c & d`
+- **Source:** `a <= b <= c & d`
+- **Grouping:** `((a <= b) <= (c & d))`
+
+### A1.1782 — `a * b && c >= d`
+- **Source:** `a * b && c >= d`
+- **Grouping:** `((a * b) && (c >= d))`
+
+### A1.1783 — `a >= b || c /= d`
+- **Source:** `a >= b || c /= d`
+- **Grouping:** `((a >= b) || (c /= d))`
+
+### A1.1784 — `a . b || c <= d`
+- **Source:** `a . b || c <= d`
+- **Grouping:** `((a . b) || (c <= d))`
+
+### A1.1785 — `a >> b % c - d`
+- **Source:** `a >> b % c - d`
+- **Grouping:** `(a >> ((b % c) - d))`
+
+### A1.1786 — `a + b /= c == d`
+- **Source:** `a + b /= c == d`
+- **Grouping:** `(((a + b) /= c) == d)`
+
+### A1.1787 — `a + b == c == d`
+- **Source:** `a + b == c == d`
+- **Grouping:** `(((a + b) == c) == d)`
+
+### A1.1788 — `a | b ^ c | d`
+- **Source:** `a | b ^ c | d`
+- **Grouping:** `(((a | b) ^ c) | d)`
+
+### A1.1789 — `a > b << c > d`
+- **Source:** `a > b << c > d`
+- **Grouping:** `((a > (b << c)) > d)`
+
+### A1.1790 — `a < b + c /= d`
+- **Source:** `a < b + c /= d`
+- **Grouping:** `((a < (b + c)) /= d)`
+
+### A1.1791 — `a >= b + c / d`
+- **Source:** `a >= b + c / d`
+- **Grouping:** `(a >= (b + (c / d)))`
+
+### A1.1792 — `a >= b + c || d`
+- **Source:** `a >= b + c || d`
+- **Grouping:** `((a >= (b + c)) || d)`
+
+### A1.1793 — `a | b < c + d`
+- **Source:** `a | b < c + d`
+- **Grouping:** `((a | b) < (c + d))`
+
+### A1.1794 — `a < b ^ c < d`
+- **Source:** `a < b ^ c < d`
+- **Grouping:** `((a < (b ^ c)) < d)`
+
+### A1.1795 — `a || b ^ c && d`
+- **Source:** `a || b ^ c && d`
+- **Grouping:** `(a || ((b ^ c) && d))`
+
+### A1.1796 — `a | b * c - d`
+- **Source:** `a | b * c - d`
+- **Grouping:** `(a | ((b * c) - d))`
+
+### A1.1797 — `a % b <= c == d`
+- **Source:** `a % b <= c == d`
+- **Grouping:** `(((a % b) <= c) == d)`
+
+### A1.1798 — `a || b << c >> d`
+- **Source:** `a || b << c >> d`
+- **Grouping:** `(a || ((b << c) >> d))`
+
+### A1.1799 — `a <= b - c & d`
+- **Source:** `a <= b - c & d`
+- **Grouping:** `(a <= ((b - c) & d))`
+
+### A1.1800 — `a <= b <= c . d`
+- **Source:** `a <= b <= c . d`
+- **Grouping:** `((a <= b) <= (c . d))`
+
+### A1.1801 — `a <= b & c & d`
+- **Source:** `a <= b & c & d`
+- **Grouping:** `(a <= ((b & c) & d))`
+
+### A1.1802 — `a >= b - c - d`
+- **Source:** `a >= b - c - d`
+- **Grouping:** `(a >= ((b - c) - d))`
+
+### A1.1803 — `a - b < c && d`
+- **Source:** `a - b < c && d`
+- **Grouping:** `(((a - b) < c) && d)`
+
+### A1.1804 — `a / b || c /= d`
+- **Source:** `a / b || c /= d`
+- **Grouping:** `((a / b) || (c /= d))`
+
+### A1.1805 — `a ^ b % c / d`
+- **Source:** `a ^ b % c / d`
+- **Grouping:** `(a ^ ((b % c) / d))`
+
+### A1.1806 — `a < b . c && d`
+- **Source:** `a < b . c && d`
+- **Grouping:** `((a < (b . c)) && d)`
+
+### A1.1807 — `a && b % c < d`
+- **Source:** `a && b % c < d`
+- **Grouping:** `(a && ((b % c) < d))`
+
+### A1.1808 — `a & b . c /= d`
+- **Source:** `a & b . c /= d`
+- **Grouping:** `((a & (b . c)) /= d)`
+
+### A1.1809 — `a >= b + c < d`
+- **Source:** `a >= b + c < d`
+- **Grouping:** `((a >= (b + c)) < d)`
+
+### A1.1810 — `a . b && c > d`
+- **Source:** `a . b && c > d`
+- **Grouping:** `((a . b) && (c > d))`
+
+### A1.1811 — `a & b <= c % d`
+- **Source:** `a & b <= c % d`
+- **Grouping:** `((a & b) <= (c % d))`
+
+### A1.1812 — `a + b . c ^ d`
+- **Source:** `a + b . c ^ d`
+- **Grouping:** `((a + (b . c)) ^ d)`
+
+### A1.1813 — `a - b == c << d`
+- **Source:** `a - b == c << d`
+- **Grouping:** `((a - b) == (c << d))`
+
+### A1.1814 — `a / b / c == d`
+- **Source:** `a / b / c == d`
+- **Grouping:** `(((a / b) / c) == d)`
+
+### A1.1815 — `a ^ b / c | d`
+- **Source:** `a ^ b / c | d`
+- **Grouping:** `((a ^ (b / c)) | d)`
+
+### A1.1816 — `a . b - c - d`
+- **Source:** `a . b - c - d`
+- **Grouping:** `(((a . b) - c) - d)`
+
+### A1.1817 — `a || b <= c & d`
+- **Source:** `a || b <= c & d`
+- **Grouping:** `(a || (b <= (c & d)))`
+
+### A1.1818 — `a * b & c || d`
+- **Source:** `a * b & c || d`
+- **Grouping:** `(((a * b) & c) || d)`
+
+### A1.1819 — `a /= b > c >= d`
+- **Source:** `a /= b > c >= d`
+- **Grouping:** `(((a /= b) > c) >= d)`
+
+### A1.1820 — `a / b | c & d`
+- **Source:** `a / b | c & d`
+- **Grouping:** `(((a / b) | c) & d)`
+
+### A1.1821 — `a % b << c ^ d`
+- **Source:** `a % b << c ^ d`
+- **Grouping:** `(((a % b) << c) ^ d)`
+
+### A1.1822 — `a / b || c < d`
+- **Source:** `a / b || c < d`
+- **Grouping:** `((a / b) || (c < d))`
+
+### A1.1823 — `a << b ^ c & d`
+- **Source:** `a << b ^ c & d`
+- **Grouping:** `(((a << b) ^ c) & d)`
+
+### A1.1824 — `a <= b << c || d`
+- **Source:** `a <= b << c || d`
+- **Grouping:** `((a <= (b << c)) || d)`
+
+### A1.1825 — `a & b == c + d`
+- **Source:** `a & b == c + d`
+- **Grouping:** `((a & b) == (c + d))`
+
+### A1.1826 — `a & b | c && d`
+- **Source:** `a & b | c && d`
+- **Grouping:** `(((a & b) | c) && d)`
+
+### A1.1827 — `a >> b < c > d`
+- **Source:** `a >> b < c > d`
+- **Grouping:** `(((a >> b) < c) > d)`
+
+### A1.1828 — `a << b + c | d`
+- **Source:** `a << b + c | d`
+- **Grouping:** `((a << (b + c)) | d)`
+
+### A1.1829 — `a ^ b || c >= d`
+- **Source:** `a ^ b || c >= d`
+- **Grouping:** `((a ^ b) || (c >= d))`
+
+### A1.1830 — `a == b & c << d`
+- **Source:** `a == b & c << d`
+- **Grouping:** `(a == (b & (c << d)))`
+
+### A1.1831 — `a /= b && c / d`
+- **Source:** `a /= b && c / d`
+- **Grouping:** `((a /= b) && (c / d))`
+
+### A1.1832 — `a / b + c && d`
+- **Source:** `a / b + c && d`
+- **Grouping:** `(((a / b) + c) && d)`
+
+### A1.1833 — `a <= b / c > d`
+- **Source:** `a <= b / c > d`
+- **Grouping:** `((a <= (b / c)) > d)`
+
+### A1.1834 — `a / b >> c & d`
+- **Source:** `a / b >> c & d`
+- **Grouping:** `(((a / b) >> c) & d)`
+
+### A1.1835 — `a && b || c > d`
+- **Source:** `a && b || c > d`
+- **Grouping:** `((a && b) || (c > d))`
+
+### A1.1836 — `a > b / c == d`
+- **Source:** `a > b / c == d`
+- **Grouping:** `((a > (b / c)) == d)`
+
+### A1.1837 — `a - b & c > d`
+- **Source:** `a - b & c > d`
+- **Grouping:** `(((a - b) & c) > d)`
+
+### A1.1838 — `a > b - c . d`
+- **Source:** `a > b - c . d`
+- **Grouping:** `(a > (b - (c . d)))`
+
+### A1.1839 — `a >= b + c && d`
+- **Source:** `a >= b + c && d`
+- **Grouping:** `((a >= (b + c)) && d)`
+
+### A1.1840 — `a >> b <= c >> d`
+- **Source:** `a >> b <= c >> d`
+- **Grouping:** `((a >> b) <= (c >> d))`
+
+### A1.1841 — `a / b + c . d`
+- **Source:** `a / b + c . d`
+- **Grouping:** `((a / b) + (c . d))`
+
+### A1.1842 — `a . b - c % d`
+- **Source:** `a . b - c % d`
+- **Grouping:** `((a . b) - (c % d))`
+
+### A1.1843 — `a * b >> c + d`
+- **Source:** `a * b >> c + d`
+- **Grouping:** `((a * b) >> (c + d))`
+
+### A1.1844 — `a == b && c == d`
+- **Source:** `a == b && c == d`
+- **Grouping:** `((a == b) && (c == d))`
+
+### A1.1845 — `a >= b || c && d`
+- **Source:** `a >= b || c && d`
+- **Grouping:** `((a >= b) || (c && d))`
+
+### A1.1846 — `a >> b <= c /= d`
+- **Source:** `a >> b <= c /= d`
+- **Grouping:** `(((a >> b) <= c) /= d)`
+
+### A1.1847 — `a < b == c && d`
+- **Source:** `a < b == c && d`
+- **Grouping:** `(((a < b) == c) && d)`
+
+### A1.1848 — `a / b > c || d`
+- **Source:** `a / b > c || d`
+- **Grouping:** `(((a / b) > c) || d)`
+
+### A1.1849 — `a / b < c | d`
+- **Source:** `a / b < c | d`
+- **Grouping:** `((a / b) < (c | d))`
+
+### A1.1850 — `a /= b ^ c | d`
+- **Source:** `a /= b ^ c | d`
+- **Grouping:** `(a /= ((b ^ c) | d))`
+
+
+## Appendix A.2 — Application, lambda, indexing, and composition clinic
+### A2.001 — `f x`
+- **Reading:** `(f x)`
+- **Why it matters:** Application is juxtaposition; `x` is one argument value.
+
+### A2.002 — `f x y`
+- **Reading:** `((f x) y)`
+- **Why it matters:** Syntactic association is leftward; compiler call flattening may treat a function declaration with two parameters as a two-argument call.
+
+### A2.003 — `f (x y)`
+- **Reading:** `(f (x y))`
+- **Why it matters:** Parentheses make the argument the result of `x y`.
+
+### A2.004 — `(f x) y`
+- **Reading:** `((f x) y)`
+- **Why it matters:** Explicitly grouped left-associated application.
+
+### A2.005 — `f xs[i]`
+- **Reading:** `(f (xs[i]))`
+- **Why it matters:** The parser indexes the argument atom before attaching it as an application argument.
+
+### A2.006 — `(f xs)[i]`
+- **Reading:** `((f xs)[i])`
+- **Why it matters:** Parentheses request indexing of the application result.
+
+### A2.007 — `f()`
+- **Reading:** `f()`
+- **Why it matters:** Special zero-argument call syntax.
+
+### A2.008 — `f ()`
+- **Reading:** `REJECT: empty parentheses are not an ordinary expression atom`
+- **Why it matters:** This is not the same token grouping as `f()`.
+
+### A2.009 — `(\x -> x*x) 2`
+- **Reading:** `(((\x -> (x * x))) 2)`
+- **Why it matters:** Parenthesized anonymous function immediately applied to `2`.
+
+### A2.010 — `(\x -> x*x)2`
+- **Reading:** `(((\x -> (x * x))) 2)`
+- **Why it matters:** Same tokens as above except whitespace is absent; juxtaposition still applies.
+
+### A2.011 — `(fn (x) => x + 1) 9`
+- **Reading:** `(((fn (x) => (x + 1))) 9)`
+- **Why it matters:** Parenthesized lambda using fat arrow, immediately applied.
+
+### A2.012 — `(\x y -> x+y) 20 22`
+- **Reading:** `((((\x y -> (x + y))) 20) 22)`
+- **Why it matters:** Two identifier parameters; no tuple destructuring.
+
+### A2.013 — `f . g`
+- **Reading:** `(f . g)`
+- **Why it matters:** Composition constructs a unary function; it does not call that function.
+
+### A2.014 — `f . g . h`
+- **Reading:** `(f . (g . h))`
+- **Why it matters:** Dot is right-associative.
+
+### A2.015 — `f . g x`
+- **Reading:** `(f . (g x))`
+- **Why it matters:** Application binds more tightly than composition.
+
+### A2.016 — `(f . g) x`
+- **Reading:** `((f . g) x)`
+- **Why it matters:** Parentheses force composition before application.
+
+### A2.017 — `f . (g x)`
+- **Reading:** `(f . (g x))`
+- **Why it matters:** Explicit right operand makes the grouping visible.
+
+### A2.018 — `-(f x)`
+- **Reading:** `(-(f x))`
+- **Why it matters:** Unary minus includes the application inside its operand.
+
+### A2.019 — `-f x`
+- **Reading:** `(-(f x))`
+- **Why it matters:** Application is included inside a prefix operator operand.
+
+### A2.020 — `!predicate x`
+- **Reading:** `(!(predicate x))`
+- **Why it matters:** Bang is prefix; call application remains inside its operand.
+
+### A2.021 — `~bits`
+- **Reading:** `(~bits)`
+- **Why it matters:** Bitwise complement is a supported prefix form.
+
+### A2.022 — `a + b * c`
+- **Reading:** `(a + (b * c))`
+- **Why it matters:** Multiplication binds more tightly than addition.
+
+### A2.023 — `a - b - c`
+- **Reading:** `((a - b) - c)`
+- **Why it matters:** Subtraction is syntactically left-associative.
+
+### A2.024 — `a < b < c`
+- **Reading:** `((a < b) < c)`
+- **Why it matters:** This is not a mathematical comparison chain.
+
+### A2.025 — `(a < b) && (b < c)`
+- **Reading:** `((a < b) && (b < c))`
+- **Why it matters:** Use explicit conjunction for a range check.
+
+### A2.026 — `base[i][j]`
+- **Reading:** `(base[i][j])`
+- **Why it matters:** Repeated postfix indexing chains from the left.
+
+### A2.027 — `p + i`
+- **Reading:** `(p + i)`
+- **Why it matters:** Potential pointer offset only if later representation analysis knows `p` is pointer-like.
+
+### A2.028 — `i + p`
+- **Reading:** `(i + p)`
+- **Why it matters:** Pointer-plus-integer is recognized in either operand order for addition.
+
+### A2.029 — `p - i`
+- **Reading:** `(p - i)`
+- **Why it matters:** Pointer minus integer is a recognized pointer-offset form.
+
+### A2.030 — `p - q`
+- **Reading:** `(p - q)`
+- **Why it matters:** Pointer difference if both operands are known pointer-like; result units depend on pointer metadata.
+
+### A2.031 — `p + q`
+- **Reading:** `(p + q)`
+- **Why it matters:** Not a supported two-pointer addition case.
+
+### A2.032 — `i - p`
+- **Reading:** `(i - p)`
+- **Why it matters:** Not a supported pointer-offset case.
+
+### A2.033 — `p[0]`
+- **Reading:** `(p[0])`
+- **Why it matters:** Indexing is the read/dereference spelling for pointer-like bases.
+
+### A2.034 — `p[ i + 1 ]`
+- **Reading:** `(p[(i + 1)])`
+- **Why it matters:** The index is a full expression.
+
+### A2.035 — `f (p + i)[0]`
+- **Reading:** `(f ((p + i)[0]))`
+- **Why it matters:** The index suffix attaches to the argument atom before function application.
+
+### A2.036 — `((f p)[i])`
+- **Reading:** `((f p)[i])`
+- **Why it matters:** Parentheses express indexing the result of a call.
+
+### A2.037 — `let x = 5; x + 1`
+- **Reading:** `let-binding then body `(x + 1)``
+- **Why it matters:** The semicolon divides local binding value from its body.
+
+### A2.038 — `{ let x = 5; x + 1 }`
+- **Reading:** `block-scoped local binding with tail `(x + 1)``
+- **Why it matters:** The local `let` scopes over remaining block contents.
+
+### A2.039 — `case flag of { 1 -> yes; _ -> no }`
+- **Reading:** `case-expression with two arms`
+- **Why it matters:** Both arrows `->` and `=>` are accepted.
+
+### A2.040 — `case option of { None -> 0; Some x -> x }`
+- **Reading:** `constructor patterns with arities zero and one`
+- **Why it matters:** Uppercase-leading patterns are constructor patterns.
+
+### A2.041 — `(i32, u8)`
+- **Reading:** `tuple type, not expression tuple`
+- **Why it matters:** Tuple type syntax belongs to type context.
+
+### A2.042 — `(left, right)`
+- **Reading:** `REJECT as ordinary expression tuple`
+- **Why it matters:** Tuple patterns are accepted in pattern context; tuple values have no generic comma-expression form.
+
+### A2.043 — `type Maybe a { None; Some a; };`
+- **Reading:** `type declaration with parameter `a` and two constructors`
+- **Why it matters:** Declaration-level semicolons are mandatory at the outer type declaration boundary.
+
+### A2.044 — `let extern read : i32 -> i32 = "read" : (i32) -> i32;`
+- **Reading:** `external declaration with separate MAK and foreign types`
+- **Why it matters:** Validate signatures against the linked C declaration.
+
+### A2.045 — `let extern data : [u8] = global "data" : u8*;`
+- **Reading:** `global object declared as typed foreign pointer`
+- **Why it matters:** The C object must match the emitted global declaration.
+
+### A2.046 — `let extern variadic : i32 = "v" : (i32, ...) -> i32;`
+- **Reading:** `variadic foreign function type`
+- **Why it matters:** Ellipsis works in foreign type context, not general expressions.
+
+### A2.047 — `bring "a.mak" "b.mak";`
+- **Reading:** `bring declaration with two paths`
+- **Why it matters:** No alias or import-name list exists in this grammar.
+
+
+## Appendix A.3 — Pointer arithmetic scenario table
+### A3.001 — `typed_u8 + 0`
+- **Shape:** u8* + integer.
+- **Constraint:** Same byte address; an offset of one changes by one byte.
+
+### A3.002 — `typed_u8 + 1`
+- **Shape:** u8* + integer.
+- **Constraint:** Advances one `u8` element.
+
+### A3.003 — `typed_i32 + 1`
+- **Shape:** i32* + integer.
+- **Constraint:** Advances one `i32` element, not one byte.
+
+### A3.004 — `typed_i32 + 4`
+- **Shape:** i32* + integer.
+- **Constraint:** Advances four `i32` elements.
+
+### A3.005 — `typed_i32 - 1`
+- **Shape:** i32* - integer.
+- **Constraint:** Moves one typed element backward.
+
+### A3.006 — `4 + typed_i32`
+- **Shape:** integer + i32*.
+- **Constraint:** Addition path recognizes integer on left and pointer on right.
+
+### A3.007 — `typed_i32[0]`
+- **Shape:** i32* indexing.
+- **Constraint:** Reads element zero, subject to actual pointer validity.
+
+### A3.008 — `typed_i32[3]`
+- **Shape:** i32* indexing.
+- **Constraint:** Reads element three, subject to bounds/lifetime.
+
+### A3.009 — `(typed_i32 + 3)[0]`
+- **Shape:** typed pointer addition then index.
+- **Constraint:** Equivalent access position to `typed_i32[3]` when pointer arithmetic is valid.
+
+### A3.010 — `end_i32 - start_i32`
+- **Shape:** typed pointer subtraction.
+- **Constraint:** C typed pointer subtraction returns element distance in applicable same-array cases.
+
+### A3.011 — `opaque_ptr + 1`
+- **Shape:** opaque ptr plus integer.
+- **Constraint:** Fallback offset is byte-based because no pointee type is known.
+
+### A3.012 — `opaque_ptr[1]`
+- **Shape:** opaque ptr indexing.
+- **Constraint:** Fallback indexing uses a byte-sized element.
+
+### A3.013 — `opaque_end - opaque_start`
+- **Shape:** opaque pointer subtraction.
+- **Constraint:** Without recovered element metadata, generated fallback subtracts integerized addresses.
+
+### A3.014 — `integer - pointer`
+- **Shape:** reverse subtraction.
+- **Constraint:** Not handled as pointer arithmetic.
+
+### A3.015 — `pointer + pointer`
+- **Shape:** two-pointer addition.
+- **Constraint:** Not handled as valid pointer addition.
+
+### A3.016 — `pointer * 2`
+- **Shape:** multiplication.
+- **Constraint:** Not a pointer offset operation.
+
+### A3.017 — `pointer / 2`
+- **Shape:** division.
+- **Constraint:** Not a pointer offset operation.
+
+### A3.018 — `pointer % 2`
+- **Shape:** remainder.
+- **Constraint:** Not a pointer offset operation.
+
+### A3.019 — `&a`
+- **Shape:** prefix position.
+- **Constraint:** Invalid as address-of; `&` is binary only.
+
+### A3.020 — `*p`
+- **Shape:** prefix position.
+- **Constraint:** Invalid as dereference; unary `*` is not in grammar.
+
+### A3.021 — `p[0]`
+- **Shape:** index form.
+- **Constraint:** Supported pointer read spelling, assuming pointer-like representation.
+
+### A3.022 — `p[index + 1]`
+- **Shape:** index form.
+- **Constraint:** Index expression may itself use ordinary operators.
+
+### A3.023 — `p[i][j]`
+- **Shape:** nested indexing.
+- **Constraint:** The parser nests the reserved index intrinsic.
+
+### A3.024 — `fn p -> p + 1`
+- **Shape:** function value.
+- **Constraint:** Pointer addition remains subject to metadata of the argument at call time.
+
+### A3.025 — `bump . advance`
+- **Shape:** composition.
+- **Constraint:** Composition has no special pointer meaning; each operand must be a useful function.
+
+
+## Appendix A.4 — Prefix/operator boundaries
+### A4.001 — `-x`
+- **Grouping:** `(-x)`
+- **Note:** Unary minus wraps the next application-level operand.
+
+### A4.002 — `-f x`
+- **Grouping:** `(-(f x))`
+- **Note:** The call `f x` is part of the unary operand.
+
+### A4.003 — `!f x`
+- **Grouping:** `(!(f x))`
+- **Note:** Logical-style prefix operator also includes application.
+
+### A4.004 — `~f x`
+- **Grouping:** `(~(f x))`
+- **Note:** Bitwise complement includes the application expression syntactically.
+
+### A4.005 — `(-f) x`
+- **Grouping:** `((-f) x)`
+- **Note:** Parentheses change the callee grouping.
+
+### A4.006 — `-(a + b)`
+- **Grouping:** `(-(a + b))`
+- **Note:** Parentheses include an infix arithmetic expression in the operand.
+
+### A4.007 — `(-a) * b`
+- **Grouping:** `(((-a)) * b)`
+- **Note:** Unary operator applies before multiplication.
+
+### A4.008 — `!a == b`
+- **Grouping:** `((!a) == b)`
+- **Note:** Prefix `!` binds before comparison.
+
+### A4.009 — `~a & b`
+- **Grouping:** `((~a) & b)`
+- **Note:** Prefix complement binds before bitwise AND.
+
+### A4.010 — `a * -b`
+- **Grouping:** `(a * (-b))`
+- **Note:** Prefix minus begins the right operand.
+
+### A4.011 — `a + -b`
+- **Grouping:** `(a + (-b))`
+- **Note:** Unary minus is allowed on the additive right operand.
+
+### A4.012 — `a - -b`
+- **Grouping:** `(a - (-b))`
+- **Note:** Binary minus followed by unary minus.
+
+### A4.013 — `a / -b`
+- **Grouping:** `(a / (-b))`
+- **Note:** Division right operand is unary-negated.
+
+### A4.014 — `a % ~b`
+- **Grouping:** `(a % (~b))`
+- **Note:** Remainder uses a complemented right operand.
+
+### A4.015 — `!(a && b)`
+- **Grouping:** `(!(a && b))`
+- **Note:** Parentheses make the intended logical operand explicit.
+
+### A4.016 — `~(a | b)`
+- **Grouping:** `(~(a | b))`
+- **Note:** Bitwise complement applies to the grouped OR expression.
+
+### A4.017 — `-(f . g)`
+- **Grouping:** `(-(f . g))`
+- **Note:** Parentheses are needed because prefix parse stops before composition.
+
+### A4.018 — `(-f) . g`
+- **Grouping:** `((-f) . g)`
+- **Note:** Composition left operand is explicitly the negated value of `f`.
+
+### A4.019 — `f . (-g)`
+- **Grouping:** `(f . (-g))`
+- **Note:** Composition right operand is explicitly grouped as a prefix expression.
+
+### A4.020 — `f . g x`
+- **Grouping:** `(f . (g x))`
+- **Note:** Application is available in the right operand of composition.
+
+### A4.021 — `f . (g . h)`
+- **Grouping:** `(f . (g . h))`
+- **Note:** Composition can be parenthesized to expose right association.
+
+### A4.022 — `((f . g) . h)`
+- **Grouping:** `((f . g) . h)`
+- **Note:** Parentheses can force the syntactic grouping; actual dot rewrite still builds callable compositions.
+

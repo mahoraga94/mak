@@ -1,5 +1,3 @@
-#![allow(unused_variables, unused_mut, unreachable_patterns, dead_code)]
-
 use crate::ast::*;
 use crate::lexer::Span;
 use std::collections::{HashMap, HashSet};
@@ -12,9 +10,21 @@ fn is_builtin_intrinsic(name: &str) -> bool {
     matches!(name, "$mak.index")
 }
 
+/// Internal marker stored in purity sets for extern globals that may change
+/// between evaluations. The NUL prefix cannot collide with source identifiers.
+#[inline]
+fn mutable_global_marker(name: &str) -> String {
+    format!("\0mak.mutable-global:{name}")
+}
+
+#[inline]
+fn is_mutable_global_name(name: &str, pure: &HashSet<String>) -> bool {
+    pure.contains(&mutable_global_marker(name))
+}
 
 const NULL_SPAN: Span = Span { lo: 0, hi: 0 };
 const LOCAL_LAYERS: usize = 128;
+const WPO_STATE_BUDGET: usize = 8192;
 
 macro_rules! opt_debug {
     ($($arg:tt)*) => {{
@@ -254,8 +264,8 @@ fn print_pass_stats(s: &OptStats) {
     }
 }
 
-const WPO_ROUNDS: usize = 20;
-const WPO_MAX_COMMITS: usize = 160;
+const WPO_ROUNDS: usize = 128;
+const WPO_MAX_COMMITS: usize = 8192;
 const WPO_COST_GROWTH_NUM: usize = 3;
 const WPO_COST_GROWTH_DEN: usize = 2;
 
@@ -452,9 +462,10 @@ fn flatten_application_for_opt<'a>(fun: &'a Expr, args: &'a [Expr]) -> (&'a Expr
 
 fn wpo_pure_expr(e: &Expr, pure: &HashSet<String>, local_scc: &HashSet<String>) -> bool {
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Var(_) => true,
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) => true,
+        ExprKind::Var(name) => !is_mutable_global_name(name, pure),
         ExprKind::Fn { body, .. } => wpo_pure_expr(body, pure, local_scc),
-        ExprKind::Quote(_) => true,
+        ExprKind::Quote(inner) => wpo_pure_expr(inner, pure, local_scc),
         ExprKind::Let { value, body, .. } => {
             wpo_pure_expr(value, pure, local_scc) && wpo_pure_expr(body, pure, local_scc)
         }
@@ -493,8 +504,13 @@ fn wpo_collect_pure(p: &Program, graph: &HashMap<String, HashSet<String>>) -> Ha
 
     for d in &p.decls {
         match d {
-            Decl::External(e) if e.pure => {
-                pure.insert(e.name.clone());
+            Decl::External(e) => {
+                if e.pure {
+                    pure.insert(e.name.clone());
+                }
+                if e.is_global {
+                    pure.insert(mutable_global_marker(&e.name));
+                }
             }
             Decl::Type { ctors, .. } => {
                 for c in ctors {
@@ -805,12 +821,26 @@ fn wpo_adaptive_inline(p: Program, pure: &HashSet<String>, changed: &mut bool) -
             let uses = count_var(&b, param);
             if uses == 0 {
                 if is_pure(arg, pure) {
+                    // Argument has no observable effect and its parameter is
+                    // unused, so dropping it is valid.
                     continue;
                 }
+                // An unused *effectful* argument still must be evaluated. Put
+                // it in an unused let, preserving left-to-right argument order.
+                let fresh = fresh_opt_name(used, serial, "discarded_arg");
+                lets.push((fresh, arg.clone()));
+                continue;
             }
-            if uses <= 1 || is_pure(arg, pure) {
+            if uses == 1 && is_pure(arg, pure) {
+                b = subst(b, param, arg);
+            } else if uses == 1 && matches!(
+                &arg.kind,
+                ExprKind::Var(_) | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_)
+            ) {
                 b = subst(b, param, arg);
             } else {
+                // Bind every impure argument exactly once, and also cache
+                // expensive pure expressions used more than once.
                 let fresh = fresh_opt_name(used, serial, "ip");
                 b = subst(
                     b,
@@ -994,6 +1024,78 @@ fn wpo_cost(p: &Program) -> usize {
         .saturating_add(m.fns.saturating_mul(5))
 }
 
+/// Return the names of external functions that are still called along a
+/// statically reachable chain starting at the program body.
+///
+/// This is a deliberately conservative correctness guard, not a purity
+/// analysis.  Optimizer passes may inline or rearrange ordinary functions,
+/// but must not silently erase every reachable call to an observable external
+/// such as getchar, write, putchar, or printf.  The normal scope/type checks
+/// cannot detect that kind of miscompile.
+fn reachable_external_calls(p: &Program) -> HashSet<String> {
+    let externals: HashSet<String> = p
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::External(e) => Some(e.name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    let definitions: HashMap<String, &Expr> = p
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            Decl::Let { name, value, .. } => Some((name.clone(), value.as_ref())),
+            _ => None,
+        })
+        .collect();
+
+    fn scan_expr(
+        e: &Expr,
+        externals: &HashSet<String>,
+        pending: &mut Vec<String>,
+        calls: &mut HashSet<String>,
+    ) {
+        walk(e, &mut |node| {
+            if let ExprKind::Var(name) = &node.kind {
+                pending.push(name.clone());
+            }
+            if let ExprKind::App { fun, .. } = &node.kind {
+                if let ExprKind::Var(name) = &fun.kind {
+                    if externals.contains(name) {
+                        calls.insert(name.clone());
+                    }
+                }
+            }
+        });
+    }
+
+    let mut pending = Vec::new();
+    let mut visited = HashSet::new();
+    let mut calls = HashSet::new();
+    scan_expr(&p.body, &externals, &mut pending, &mut calls);
+
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        if let Some(value) = definitions.get(&name) {
+            scan_expr(value, &externals, &mut pending, &mut calls);
+        }
+    }
+
+    calls
+}
+
+fn lost_reachable_external_calls(before: &Program, after: &Program) -> Vec<String> {
+    let before_calls = reachable_external_calls(before);
+    let after_calls = reachable_external_calls(after);
+    let mut lost: Vec<String> = before_calls.difference(&after_calls).cloned().collect();
+    lost.sort();
+    lost
+}
+
 #[inline]
 fn opt_cost(p: &Program) -> usize {
     let m = measure(p);
@@ -1013,6 +1115,7 @@ where
     F: FnOnce(Program, &HashSet<String>, &mut bool) -> Program,
 {
     let before_hash = fingerprint(&p);
+    let before_program = p.clone();
     let before_cost = wpo_cost(&p);
     let before_measure = measure(&p);
     let mut changed = false;
@@ -1034,6 +1137,17 @@ where
         opt_debug!(
             "[WPO] pass={} KEEP: transform reported changed=false; candidate discarded without AST checks",
             label
+        );
+        return (p, false);
+    }
+
+    let lost_external_calls = lost_reachable_external_calls(&before_program, &candidate);
+    if !lost_external_calls.is_empty() {
+        stats.rejected += 1;
+        opt_debug!(
+            "[WPO] pass={} REVERT: reachable external call(s) disappeared: {:?}; reason=EXTERNAL_EFFECT_LOST",
+            label,
+            lost_external_calls
         );
         return (p, false);
     }
@@ -1061,6 +1175,28 @@ where
         );
         return (p, false);
     }
+    if let Err(errors) = crate::sema::analyze(candidate.clone()) {
+        stats.rejected += 1;
+        opt_debug!(
+            "[WPO] pass={} REVERT: semantic validation failed with {} diagnostic(s)",
+            label,
+            errors.len()
+        );
+        return (p, false);
+    }
+
+    // A well-scoped AST can still violate the backend ABI contract. In
+    // particular, call-result representations in recursive SCCs must remain
+    // consistent with constructor-pattern use sites. Validate each committed
+    // whole-program rewrite, not just the final winner.
+    if !crate::cgen::validate_program(&candidate) {
+        stats.rejected += 1;
+        opt_debug!(
+            "[WPO] pass={} REVERT: CGen representation/ABI validation failed; reason=ABI_INVARIANT",
+            label
+        );
+        return (p, false);
+    }
 
     *stats.phase_hits.entry(label.to_string()).or_default() += 1;
     stats.commits += 1;
@@ -1076,6 +1212,8 @@ where
 fn whole_program_optimize(mut p: Program) -> (Program, WpoStats) {
     let mut stats = WpoStats::default();
     let mut last = fingerprint(&p);
+    let mut best = p.clone();
+    let mut best_key = optimization_key(&best);
 
     for round in 0..WPO_ROUNDS {
         if stats.commits >= WPO_MAX_COMMITS {
@@ -1160,6 +1298,11 @@ fn whole_program_optimize(mut p: Program) -> (Program, WpoStats) {
         p = next;
 
         let now = fingerprint(&p);
+        let candidate_key = optimization_key(&p);
+        if candidate_key < best_key {
+            best = p.clone();
+            best_key = candidate_key;
+        }
         if now == before_round || now == last {
             opt_debug!(
                 "[WPO] ROUND {} END: fixed point reached; before={:016x}, after={:016x}, previous={:016x}",
@@ -1183,7 +1326,10 @@ fn whole_program_optimize(mut p: Program) -> (Program, WpoStats) {
         }
     }
 
-    (p, stats)
+    // Continue optimizing from the latest state above, but never return a
+    // state whose estimated runtime cost is worse than the best verified state
+    // found during this search.
+    (best, stats)
 }
 
 fn print_wpo_stats(before: &Measure, after: &Measure, s: &WpoStats, p: &Program) {
@@ -1250,389 +1396,836 @@ fn print_wpo_stats(before: &Measure, after: &Measure, s: &WpoStats, p: &Program)
     }
 }
 
+// -----------------------------------------------------------------------------
+// Partial evaluation and candidate scoring
+// -----------------------------------------------------------------------------
+
+/// Recursively propagates constants and path facts. In a `case x` arm matching
+/// an integer pattern, the arm body is analyzed under the fact `x == pattern`.
+/// This is a small path-sensitive abstract interpreter, not a source-level
+/// rewrite: branches keep their original runtime guards.
+fn partial_path_expr(
+    e: Expr,
+    env: &mut ConstEnv,
+    mutable_globals: &HashSet<String>,
+    pure: &HashSet<String>,
+    changed: &mut bool,
+) -> Expr {
+    let sp = e.span;
+    match e.kind {
+        ExprKind::Var(name) => match env.get(&name) {
+            AbsVal::Const(value) => {
+                *changed = true;
+                int(value)
+            }
+            AbsVal::Unknown => Expr { span: sp, kind: ExprKind::Var(name) },
+        },
+        ExprKind::Let { name, value, body } => {
+            let value = partial_path_expr(*value, env, mutable_globals, pure, changed);
+            let abstract_value = eval_abs(&value, env);
+            let old = env.vars.len();
+            env.push(name.clone(), abstract_value);
+            let body = partial_path_expr(*body, env, mutable_globals, pure, changed);
+            env.vars.truncate(old);
+            Expr {
+                span: sp,
+                kind: ExprKind::Let {
+                    name,
+                    value: Box::new(value),
+                    body: Box::new(body),
+                },
+            }
+        }
+        ExprKind::Fn { params, body } => {
+            let old = env.vars.len();
+            for param in &params {
+                env.push(param.clone(), AbsVal::Unknown);
+            }
+            let body = partial_path_expr(*body, env, mutable_globals, pure, changed);
+            env.vars.truncate(old);
+            Expr { span: sp, kind: ExprKind::Fn { params, body: Box::new(body) } }
+        }
+        ExprKind::App { fun, args } => Expr {
+            span: sp,
+            kind: ExprKind::App {
+                fun: Box::new(partial_path_expr(*fun, env, mutable_globals, pure, changed)),
+                args: args
+                    .into_iter()
+                    .map(|arg| partial_path_expr(arg, env, mutable_globals, pure, changed))
+                    .collect(),
+            },
+        },
+        ExprKind::Case { scrut, arms } => {
+            let scrut = partial_path_expr(*scrut, env, mutable_globals, pure, changed);
+            let scrut_fact = match &scrut.kind {
+                ExprKind::Var(n) if !mutable_globals.contains(n) => Some(n.clone()),
+                _ => None,
+            };
+            let arms = arms
+                .into_iter()
+                .map(|arm| {
+                    let old = env.vars.len();
+                    match (&arm.pat, &scrut.kind) {
+                        (Pat::Int(value), _) => {
+                            if let Some(name) = &scrut_fact {
+                                env.push(name.clone(), AbsVal::Const(*value));
+                            }
+                        }
+                        (Pat::Bind(name), ExprKind::Int(value)) => {
+                            env.push(name.clone(), AbsVal::Const(*value));
+                        }
+                        (Pat::Bind(name), ExprKind::Var(source)) => {
+                            let value = env.get(source);
+                            env.push(name.clone(), value);
+                        }
+                        _ => {}
+                    }
+                    // Shadow all explicit arm binders with unknown values unless
+                    // a concrete scrutinee value was safely established above.
+                    let mut binders = Vec::new();
+                    pat_binders(&arm.pat, &mut binders);
+                    for binder in binders {
+                        if !env.vars[old..].iter().any(|(n, _)| n == &binder) {
+                            env.push(binder, AbsVal::Unknown);
+                        }
+                    }
+                    let body = partial_path_expr(arm.body, env, mutable_globals, pure, changed);
+                    env.vars.truncate(old);
+                    Arm { pat: arm.pat, body, span: arm.span }
+                })
+                .collect();
+            Expr { span: sp, kind: ExprKind::Case { scrut: Box::new(scrut), arms } }
+        }
+        ExprKind::Block { stmts, tail } => Expr {
+            span: sp,
+            kind: ExprKind::Block {
+                stmts: stmts
+                    .into_iter()
+                    .map(|stmt| partial_path_expr(stmt, env, mutable_globals, pure, changed))
+                    .collect(),
+                tail: Box::new(partial_path_expr(*tail, env, mutable_globals, pure, changed)),
+            },
+        },
+        ExprKind::Bin { op, l, r } => {
+            let l = partial_path_expr(*l, env, mutable_globals, pure, changed);
+            let r = partial_path_expr(*r, env, mutable_globals, pure, changed);
+            let candidate = Expr {
+                span: sp,
+                kind: ExprKind::Bin { op, l: Box::new(l), r: Box::new(r) },
+            };
+            partial_reduce_condition(candidate, pure, changed)
+        }
+        ExprKind::Un { op, e } => {
+            let inner = partial_path_expr(*e, env, mutable_globals, pure, changed);
+            simp_un(Expr { span: sp, kind: ExprKind::Un { op, e: Box::new(inner) } }, pure, changed)
+        }
+        ExprKind::Quote(q) => Expr {
+            span: sp,
+            kind: ExprKind::Quote(Box::new(partial_path_expr(*q, env, mutable_globals, pure, changed))),
+        },
+        other => Expr { span: sp, kind: other },
+    }
+}
+
+/// Reduce partially-known short-circuit conditions while preserving evaluation
+/// of every potentially effectful subexpression. `effect_const` intentionally
+/// emits a block when dropping an expression would drop side effects.
+fn partial_reduce_condition(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
+    let sp = e.span;
+    let ExprKind::Bin { op, l, r } = &e.kind else { return e; };
+    let left = (**l).clone();
+    let right = (**r).clone();
+    let li = as_int(&left);
+    let ri = as_int(&right);
+    match op {
+        BinOp::LAnd => {
+            if let Some(v) = li {
+                *changed = true;
+                return if v == 0 { int(0) } else { bin(BinOp::Ne, right, int(0), sp) };
+            }
+            if let Some(v) = ri {
+                *changed = true;
+                return if v == 0 {
+                    effect_const(left, 0, pure)
+                } else {
+                    bin(BinOp::Ne, left, int(0), sp)
+                };
+            }
+        }
+        BinOp::LOr => {
+            if let Some(v) = li {
+                *changed = true;
+                return if v != 0 { int(1) } else { bin(BinOp::Ne, right, int(0), sp) };
+            }
+            if let Some(v) = ri {
+                *changed = true;
+                return if v != 0 {
+                    effect_const(left, 1, pure)
+                } else {
+                    bin(BinOp::Ne, left, int(0), sp)
+                };
+            }
+        }
+        _ => {}
+    }
+    // Existing arithmetic/comparison rewrites are intentionally reused after
+    // path propagation, rather than duplicating their operator semantics.
+    simp_bin(e, pure, changed)
+}
+
+fn partial_eval_opt(mut p: Program, pure: &HashSet<String>, changed: &mut bool) -> Program {
+    let mutable_globals: HashSet<String> = p
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            Decl::External(external) if external.is_global => Some(external.name.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut env = ConstEnv::new();
+    let mut decls = Vec::with_capacity(p.decls.len());
+    for decl in p.decls {
+        match decl {
+            Decl::Let { name, value, span } => {
+                let value = partial_path_expr(*value, &mut env, &mutable_globals, pure, changed);
+                let abstract_value = eval_abs(&value, &env);
+                env.push(name.clone(), abstract_value);
+                decls.push(Decl::Let { name, value: Box::new(value), span });
+            }
+            other => decls.push(other),
+        }
+    }
+    p.decls = decls;
+    p.body = Box::new(partial_path_expr(*p.body, &mut env, &mutable_globals, pure, changed));
+    p
+}
+
+fn estimated_expr_cost(e: &Expr) -> u64 {
+    let add = |a: u64, b: u64| a.saturating_add(b);
+    match &e.kind {
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Var(_) => 1,
+        ExprKind::Let { value, body, .. } => add(add(estimated_expr_cost(value), estimated_expr_cost(body)), 1),
+        ExprKind::Fn { body, .. } => add(1, estimated_expr_cost(body) / 32),
+        ExprKind::App { fun, args } => {
+            let arg_cost = args.iter().fold(0u64, |acc, a| add(acc, estimated_expr_cost(a)));
+            let call_cost = match &fun.kind {
+                ExprKind::Var(n) if n == "$mak.index" => 28, // pointer dereference / address arithmetic
+                ExprKind::Var(_) => 14, // call/dispatch overhead estimate
+                _ => 20, // computed callee / closure dispatch
+            };
+            add(add(arg_cost, estimated_expr_cost(fun) / 4), call_cost)
+        }
+        ExprKind::Case { scrut, arms } => {
+            let branch_sum = arms.iter().fold(0u64, |acc, a| add(acc, estimated_expr_cost(&a.body)));
+            let average_branch = if arms.is_empty() { 0 } else { branch_sum / arms.len() as u64 };
+            add(add(estimated_expr_cost(scrut), average_branch), (arms.len() as u64).saturating_mul(3))
+        }
+        ExprKind::Block { stmts, tail } => {
+            let statements = stmts.iter().fold(0u64, |acc, x| add(acc, estimated_expr_cost(x)));
+            add(add(statements, estimated_expr_cost(tail)), stmts.len() as u64)
+        }
+        ExprKind::Bin { op, l, r } => {
+            let operation = match op {
+                BinOp::Div => 14,
+                BinOp::Rem => 15,
+                BinOp::Mul => 4,
+                BinOp::Shl | BinOp::Shr => 2,
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => 2,
+                BinOp::LAnd | BinOp::LOr => 5,
+                _ => 1,
+            };
+            add(add(add(estimated_expr_cost(l), estimated_expr_cost(r)), operation), 0)
+        }
+        ExprKind::Un { e, .. } | ExprKind::Quote(e) => add(estimated_expr_cost(e), 1),
+    }
+}
+
+fn direct_call_count(e: &Expr, name: &str) -> usize {
+    let mut count = 0usize;
+    walk(e, &mut |node| {
+        if let ExprKind::App { fun, .. } = &node.kind {
+            if matches!(&fun.kind, ExprKind::Var(n) if n == name) {
+                count = count.saturating_add(1);
+            }
+        }
+    });
+    count
+}
+
+/// Lower is better. This is a repeatable static runtime-cost *estimate*, not a
+/// substitute for executing and benchmarking generated C on representative data.
+/// Code size is only a tie-breaker; call, indexing, divide/modulo and branch costs
+/// carry much larger weights, so we don't merely optimize for a tiny AST.
+fn optimization_key(p: &Program) -> (u64, usize, usize) {
+    let mut runtime = estimated_expr_cost(&p.body).saturating_mul(8);
+    let mut fn_bodies: Vec<(&str, &Expr)> = Vec::new();
+    for decl in &p.decls {
+        if let Decl::Let { name, value, .. } = decl {
+            match &value.kind {
+                ExprKind::Fn { body, .. } => fn_bodies.push((name.as_str(), body)),
+                _ => runtime = runtime.saturating_add(estimated_expr_cost(value).saturating_mul(2)),
+            }
+        }
+    }
+    for (name, body) in &fn_bodies {
+        let mut calls = direct_call_count(&p.body, name);
+        for (_, caller_body) in &fn_bodies {
+            calls = calls.saturating_add(direct_call_count(caller_body, name));
+        }
+        // Keep unreachable and recursive definitions visible to the score, but
+        // cap estimated execution multiplicity to avoid overflow/recursion bias.
+        let weight = (calls.min(16) as u64).saturating_add(1);
+        runtime = runtime.saturating_add(estimated_expr_cost(body).saturating_mul(weight));
+    }
+    let shape = measure(p);
+    let secondary = shape.nodes
+        .saturating_add(shape.binders.saturating_mul(2))
+        .saturating_add(shape.fns.saturating_mul(4));
+    (runtime, secondary, shape.nodes)
+}
+
+// Generate recursively-applied one-family passes from the existing expression
+// rewrite primitives. Keeping these as separate passes lets the fixed-point
+// scheduler attribute, validate and revisit each optimization independently.
+macro_rules! define_expr_layer {
+    ($name:ident, $rewrite:ident) => {
+        fn $name(p: Program, pure: &HashSet<String>, changed: &mut bool) -> Program {
+            fn go(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
+                let e = map_child(e, &mut |child| go(child, pure, changed));
+                $rewrite(e, pure, changed)
+            }
+            map_prog(p, &mut |e| go(e, pure, changed))
+        }
+    };
+}
+
+define_expr_layer!(layer_expr_tree, simp_expr);
+define_expr_layer!(layer_unary_simplify, simp_un);
+define_expr_layer!(layer_binary_simplify, simp_bin);
+define_expr_layer!(layer_let_simplify, simp_let);
+define_expr_layer!(layer_application_simplify, simp_app);
+define_expr_layer!(layer_case_simplify, simp_case);
+define_expr_layer!(layer_block_simplify, simp_block);
+define_expr_layer!(layer_arithmetic, mega_arith);
+define_expr_layer!(layer_bitwise, mega_bits);
+define_expr_layer!(layer_boolean_arithmetic, mega_logic);
+define_expr_layer!(layer_comparison, mega_cmp);
+define_expr_layer!(layer_unary_algebra, mega_un);
+define_expr_layer!(layer_let_materialization, mega_let);
+define_expr_layer!(layer_call_materialization, mega_app);
+define_expr_layer!(layer_case_reduction, mega_case);
+define_expr_layer!(layer_block_reduction, mega_block);
+define_expr_layer!(layer_local_cse, mega_cse);
+define_expr_layer!(layer_advanced_unary, adv_un);
+define_expr_layer!(layer_distribution, distribute);
+define_expr_layer!(layer_factorization, factor);
+define_expr_layer!(layer_boolean_algebra, boolean);
+define_expr_layer!(layer_eta_reduction, eta);
+define_expr_layer!(layer_associative_rewrite, canon_assoc);
+
+macro_rules! define_expr_pipeline_layer {
+    ($name:ident, $first:ident, $second:ident) => {
+        fn $name(p: Program, pure: &HashSet<String>, changed: &mut bool) -> Program {
+            fn go(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
+                let e = map_child(e, &mut |child| go(child, pure, changed));
+                let e = $first(e, pure, changed);
+                $second(e, pure, changed)
+            }
+            map_prog(p, &mut |e| go(e, pure, changed))
+        }
+    };
+}
+
+define_expr_pipeline_layer!(pipeline_arith_then_simplify, mega_arith, simp_bin);
+define_expr_pipeline_layer!(pipeline_simplify_then_arith, simp_bin, mega_arith);
+define_expr_pipeline_layer!(pipeline_bits_then_simplify, mega_bits, simp_bin);
+define_expr_pipeline_layer!(pipeline_simplify_then_bits, simp_bin, mega_bits);
+define_expr_pipeline_layer!(pipeline_logic_then_boolean, mega_logic, boolean);
+define_expr_pipeline_layer!(pipeline_boolean_then_logic, boolean, mega_logic);
+define_expr_pipeline_layer!(pipeline_compare_then_simplify, mega_cmp, simp_bin);
+define_expr_pipeline_layer!(pipeline_simplify_then_compare, simp_bin, mega_cmp);
+define_expr_pipeline_layer!(pipeline_let_then_mega_let, simp_let, mega_let);
+define_expr_pipeline_layer!(pipeline_mega_let_then_simplify, mega_let, simp_let);
+define_expr_pipeline_layer!(pipeline_app_then_mega_app, simp_app, mega_app);
+define_expr_pipeline_layer!(pipeline_mega_app_then_simplify, mega_app, simp_app);
+define_expr_pipeline_layer!(pipeline_case_then_mega_case, simp_case, mega_case);
+define_expr_pipeline_layer!(pipeline_mega_case_then_simplify, mega_case, simp_case);
+define_expr_pipeline_layer!(pipeline_block_then_mega_block, simp_block, mega_block);
+define_expr_pipeline_layer!(pipeline_mega_block_then_simplify, mega_block, simp_block);
+define_expr_pipeline_layer!(pipeline_unary_then_mega_unary, simp_un, mega_un);
+define_expr_pipeline_layer!(pipeline_mega_unary_then_simplify, mega_un, simp_un);
+define_expr_pipeline_layer!(pipeline_distribute_then_factor, distribute, factor);
+define_expr_pipeline_layer!(pipeline_factor_then_distribute, factor, distribute);
+define_expr_pipeline_layer!(pipeline_boolean_then_advanced_unary, boolean, adv_un);
+define_expr_pipeline_layer!(pipeline_advanced_unary_then_boolean, adv_un, boolean);
+define_expr_pipeline_layer!(pipeline_eta_then_application, eta, simp_app);
+define_expr_pipeline_layer!(pipeline_application_then_eta, simp_app, eta);
+define_expr_pipeline_layer!(pipeline_assoc_then_arith, canon_assoc, mega_arith);
+define_expr_pipeline_layer!(pipeline_arith_then_assoc, mega_arith, canon_assoc);
+define_expr_pipeline_layer!(pipeline_assoc_then_bits, canon_assoc, mega_bits);
+define_expr_pipeline_layer!(pipeline_bits_then_assoc, mega_bits, canon_assoc);
+define_expr_pipeline_layer!(pipeline_unary_then_boolean, simp_un, boolean);
+define_expr_pipeline_layer!(pipeline_boolean_then_unary, boolean, simp_un);
+define_expr_pipeline_layer!(pipeline_tree_then_advanced_unary, simp_expr, adv_un);
+define_expr_pipeline_layer!(pipeline_advanced_unary_then_tree, adv_un, simp_expr);
+define_expr_pipeline_layer!(pipeline_binary_then_boolean, simp_bin, boolean);
+define_expr_pipeline_layer!(pipeline_boolean_then_binary, boolean, simp_bin);
+define_expr_pipeline_layer!(pipeline_unary_then_negation, simp_un, adv_un);
+define_expr_pipeline_layer!(pipeline_negation_then_unary, adv_un, simp_un);
+define_expr_pipeline_layer!(pipeline_let_then_factor, simp_let, factor);
+define_expr_pipeline_layer!(pipeline_factor_then_let, factor, simp_let);
+define_expr_pipeline_layer!(pipeline_let_then_assoc, simp_let, canon_assoc);
+define_expr_pipeline_layer!(pipeline_assoc_then_let, canon_assoc, simp_let);
+define_expr_pipeline_layer!(pipeline_binary_then_factor, simp_bin, factor);
+define_expr_pipeline_layer!(pipeline_factor_then_binary, factor, simp_bin);
+define_expr_pipeline_layer!(pipeline_arith_then_factor, mega_arith, factor);
+define_expr_pipeline_layer!(pipeline_factor_then_arith, factor, mega_arith);
+define_expr_pipeline_layer!(pipeline_bits_then_boolean, mega_bits, boolean);
+define_expr_pipeline_layer!(pipeline_boolean_then_bits, boolean, mega_bits);
+define_expr_pipeline_layer!(pipeline_logic_then_compare, mega_logic, mega_cmp);
+define_expr_pipeline_layer!(pipeline_compare_then_logic, mega_cmp, mega_logic);
+define_expr_pipeline_layer!(pipeline_compare_then_boolean, mega_cmp, boolean);
+define_expr_pipeline_layer!(pipeline_boolean_then_compare, boolean, mega_cmp);
+define_expr_pipeline_layer!(pipeline_let_then_app, mega_let, simp_app);
+define_expr_pipeline_layer!(pipeline_app_then_let, simp_app, mega_let);
+define_expr_pipeline_layer!(pipeline_case_then_boolean, mega_case, boolean);
+define_expr_pipeline_layer!(pipeline_boolean_then_case, boolean, mega_case);
+define_expr_pipeline_layer!(pipeline_block_then_block_cleanup, mega_block, simp_block);
+define_expr_pipeline_layer!(pipeline_block_cleanup_then_block, simp_block, mega_block);
+define_expr_pipeline_layer!(pipeline_unary_then_binary, adv_un, simp_bin);
+define_expr_pipeline_layer!(pipeline_binary_then_unary, simp_bin, adv_un);
+define_expr_pipeline_layer!(pipeline_assoc_then_distribution, canon_assoc, distribute);
+define_expr_pipeline_layer!(pipeline_distribution_then_assoc, distribute, canon_assoc);
+define_expr_pipeline_layer!(pipeline_eta_then_boolean, eta, boolean);
+define_expr_pipeline_layer!(pipeline_boolean_then_eta, boolean, eta);
+define_expr_pipeline_layer!(pipeline_cse_then_let, mega_cse, simp_let);
+define_expr_pipeline_layer!(pipeline_let_then_cse, simp_let, mega_cse);
+
 pub fn run(p: Program) -> Program {
-    let start = measure(&p);
+    let input_measure = measure(&p);
     eprintln!("→ optimize: normalize");
-    let p_original = p.clone();
-    let p = alpha(p);
-    let norm = measure(&p);
-    let norm_decls = p.decls.len();
+    let original = p.clone();
+    let mut current = alpha(p);
+    // Preserve the normalized, semantically checked program as a safe fallback
+    // if a later optimization invalidates CGen's inferred representations.
+    let normalized_program = current.clone();
+    let normalized_measure = measure(&current);
     eprintln!(
         "  normalized: {} nodes, {} functions, {} binders",
-        norm.nodes, norm.fns, norm.binders
+        normalized_measure.nodes, normalized_measure.fns, normalized_measure.binders
     );
 
-    if !scoped(&p) {
-        eprintln!("✗ optimize: initial scope validation failed; original program kept");
-        eprintln!("  [run-debug] returning the PRE-alpha program (the alpha'd one is broken)");
-        return p_original;
+    if !scoped(&current) || crate::sema::analyze(current.clone()).is_err() {
+        eprintln!("✗ optimize: normalized AST failed scope/semantic validation; original program kept");
+        return original;
     }
 
-    eprintln!("→ optimize: analyze");
-    let analysis = wpo_summary(&p);
-    let pure_fns = analysis
-        .pure
-        .iter()
-        .filter(|name| analysis.functions.contains_key(*name))
-        .count();
+    let analysis = wpo_summary(&current);
     eprintln!(
-        "  whole-program: {} functions, {} SCCs, {} recursive, {} pure, {} call edges",
+        "→ optimize: whole-program analysis: {} functions, {} SCCs, {} recursive, {} pure, {} call edges",
         analysis.functions.len(),
         wpo_sccs(&analysis.graph).len(),
         analysis.recursive.len(),
-        pure_fns,
-        analysis.graph.values().map(HashSet::len).sum::<usize>(),
+        analysis.pure.iter().filter(|n| analysis.functions.contains_key(*n)).count(),
+        analysis.graph.values().map(HashSet::len).sum::<usize>()
     );
 
-    eprintln!("→ optimize: whole-program / LLVM-class AST");
-    let wpo_before = measure(&p);
-    let (wpo_p, wpo_stats) = whole_program_optimize(p);
-    let wpo_after = measure(&wpo_p);
-    print_wpo_stats(&wpo_before, &wpo_after, &wpo_stats, &wpo_p);
-    let mut p = wpo_p;
-    let mut seen = HashSet::<u64>::new();
+    eprintln!("→ optimize: whole-program fixed-point search");
+    let before_wpo = measure(&current);
+    let (wpo_candidate, wpo_stats) = whole_program_optimize(current.clone());
+    let candidate_valid = scoped(&wpo_candidate) && crate::sema::analyze(wpo_candidate.clone()).is_ok();
+    if candidate_valid {
+        current = wpo_candidate;
+    } else {
+        eprintln!("  [WPO] rejected final candidate; normalized AST retained");
+    }
+    let after_wpo = measure(&current);
+    print_wpo_stats(&before_wpo, &after_wpo, &wpo_stats, &current);
+
+    // Each catalog entry is a different optimization family. The catalog is
+    // cycled through LOCAL_LAYERS (=128) times per sweep, so transforms that
+    // unlock each other are revisited repeatedly rather than run only once.
+    type Pass = fn(Program, &HashSet<String>, &mut bool) -> Program;
+    const CATALOG: [(&str, bool, Pass); 111] = [
+        ("partial-eval", false, partial_eval_opt),
+        ("beta", false, beta),
+        ("known-case", false, known_cases),
+        ("tree", false, tree_opt),
+        ("const", false, const_opt),
+        ("global-const", false, global_const_opt),
+        ("global-sccp", false, global_const_opt),
+        ("word-sccp", false, const_opt),
+        ("advanced", false, adv_opt),
+        ("boolean-thread", false, adv_opt),
+        ("mega-arithmetic", false, mega_opt),
+        ("inline", false, inline),
+        ("partial-inline", false, wpo_adaptive_inline),
+        ("param-drop", true, drop_params),
+        ("sink-sroa", false, sink),
+        ("case-flatten", false, flatten_cases),
+        ("closure-strip", false, strip_closure_surface),
+        ("adce", false, dce_changed),
+        ("jump-thread", false, adv_opt),
+        ("instcombine", false, tree_opt),
+        ("cse", false, mega_opt),
+        ("whole-dce", false, dce_changed),
+        ("case-revisit", false, known_cases),
+        ("final-cleanup", false, tree_opt),
+        ("expr-tree", false, layer_expr_tree),
+        ("unary-simplify", false, layer_unary_simplify),
+        ("binary-simplify", false, layer_binary_simplify),
+        ("let-simplify", false, layer_let_simplify),
+        ("application-simplify", false, layer_application_simplify),
+        ("case-simplify", false, layer_case_simplify),
+        ("block-simplify", false, layer_block_simplify),
+        ("arithmetic-layer", false, layer_arithmetic),
+        ("bitwise-layer", false, layer_bitwise),
+        ("boolean-arithmetic", false, layer_boolean_arithmetic),
+        ("comparison-layer", false, layer_comparison),
+        ("unary-algebra", false, layer_unary_algebra),
+        ("let-materialization", false, layer_let_materialization),
+        ("call-materialization", false, layer_call_materialization),
+        ("case-reduction", false, layer_case_reduction),
+        ("block-reduction", false, layer_block_reduction),
+        ("local-cse", false, layer_local_cse),
+        ("advanced-unary", false, layer_advanced_unary),
+        ("distribution", false, layer_distribution),
+        ("factorization", false, layer_factorization),
+        ("boolean-algebra", false, layer_boolean_algebra),
+        ("eta-reduction", false, layer_eta_reduction),
+        ("associative-rewrite", false, layer_associative_rewrite),
+        ("arith-then-simplify", false, pipeline_arith_then_simplify),
+        ("simplify-then-arith", false, pipeline_simplify_then_arith),
+        ("bits-then-simplify", false, pipeline_bits_then_simplify),
+        ("simplify-then-bits", false, pipeline_simplify_then_bits),
+        ("logic-then-boolean", false, pipeline_logic_then_boolean),
+        ("boolean-then-logic", false, pipeline_boolean_then_logic),
+        ("compare-then-simplify", false, pipeline_compare_then_simplify),
+        ("simplify-then-compare", false, pipeline_simplify_then_compare),
+        ("let-then-mega-let", false, pipeline_let_then_mega_let),
+        ("mega-let-then-simplify", false, pipeline_mega_let_then_simplify),
+        ("app-then-mega-app", false, pipeline_app_then_mega_app),
+        ("mega-app-then-simplify", false, pipeline_mega_app_then_simplify),
+        ("case-then-mega-case", false, pipeline_case_then_mega_case),
+        ("mega-case-then-simplify", false, pipeline_mega_case_then_simplify),
+        ("block-then-mega-block", false, pipeline_block_then_mega_block),
+        ("mega-block-then-simplify", false, pipeline_mega_block_then_simplify),
+        ("unary-then-mega-unary", false, pipeline_unary_then_mega_unary),
+        ("mega-unary-then-simplify", false, pipeline_mega_unary_then_simplify),
+        ("distribute-then-factor", false, pipeline_distribute_then_factor),
+        ("factor-then-distribute", false, pipeline_factor_then_distribute),
+        ("boolean-then-advanced-unary", false, pipeline_boolean_then_advanced_unary),
+        ("advanced-unary-then-boolean", false, pipeline_advanced_unary_then_boolean),
+        ("eta-then-application", false, pipeline_eta_then_application),
+        ("application-then-eta", false, pipeline_application_then_eta),
+        ("assoc-then-arith", false, pipeline_assoc_then_arith),
+        ("arith-then-assoc", false, pipeline_arith_then_assoc),
+        ("assoc-then-bits", false, pipeline_assoc_then_bits),
+        ("bits-then-assoc", false, pipeline_bits_then_assoc),
+        ("unary-then-boolean", false, pipeline_unary_then_boolean),
+        ("boolean-then-unary", false, pipeline_boolean_then_unary),
+        ("tree-then-advanced-unary", false, pipeline_tree_then_advanced_unary),
+        ("advanced-unary-then-tree", false, pipeline_advanced_unary_then_tree),
+        ("binary-then-boolean", false, pipeline_binary_then_boolean),
+        ("boolean-then-binary", false, pipeline_boolean_then_binary),
+        ("unary-then-negation", false, pipeline_unary_then_negation),
+        ("negation-then-unary", false, pipeline_negation_then_unary),
+        ("let-then-factor", false, pipeline_let_then_factor),
+        ("factor-then-let", false, pipeline_factor_then_let),
+        ("let-then-assoc", false, pipeline_let_then_assoc),
+        ("assoc-then-let", false, pipeline_assoc_then_let),
+        ("binary-then-factor", false, pipeline_binary_then_factor),
+        ("factor-then-binary", false, pipeline_factor_then_binary),
+        ("arith-then-factor", false, pipeline_arith_then_factor),
+        ("factor-then-arith", false, pipeline_factor_then_arith),
+        ("bits-then-boolean", false, pipeline_bits_then_boolean),
+        ("boolean-then-bits", false, pipeline_boolean_then_bits),
+        ("logic-then-compare", false, pipeline_logic_then_compare),
+        ("compare-then-logic", false, pipeline_compare_then_logic),
+        ("compare-then-boolean", false, pipeline_compare_then_boolean),
+        ("boolean-then-compare", false, pipeline_boolean_then_compare),
+        ("let-then-app", false, pipeline_let_then_app),
+        ("app-then-let", false, pipeline_app_then_let),
+        ("case-then-boolean", false, pipeline_case_then_boolean),
+        ("boolean-then-case", false, pipeline_boolean_then_case),
+        ("block-then-block-cleanup", false, pipeline_block_then_block_cleanup),
+        ("block-cleanup-then-block", false, pipeline_block_cleanup_then_block),
+        ("unary-then-binary", false, pipeline_unary_then_binary),
+        ("binary-then-unary", false, pipeline_binary_then_unary),
+        ("assoc-then-distribution", false, pipeline_assoc_then_distribution),
+        ("distribution-then-assoc", false, pipeline_distribution_then_assoc),
+        ("eta-then-boolean", false, pipeline_eta_then_boolean),
+        ("boolean-then-eta", false, pipeline_boolean_then_eta),
+        ("cse-then-let", false, pipeline_cse_then_let),
+        ("let-then-cse", false, pipeline_let_then_cse),
+    ];
+
     let mut stats = OptStats::default();
     let mut quarantined = HashSet::<String>::new();
-    let mut nodes = wpo_after.nodes;
-    let mut state = fingerprint(&p);
+    let mut seen = HashSet::<u64>::new();
+    let mut state = fingerprint(&current);
     seen.insert(state);
-    let pass_count = 15usize;
+    let mut best = current.clone();
+    let mut best_key = optimization_key(&best);
+    let mut state_budget = 0usize;
+    let trace_layers = std::env::var_os("MAK_OPT_TRACE_LAYERS").is_some();
 
-    eprintln!("→ optimize: simplify");
     eprintln!(
-        "  pipeline: {} global layers, {} local rewrite layers",
-        pass_count, LOCAL_LAYERS
+        "→ optimize: aggressive fixed-point search: {} layers per sweep, {} pass families",
+        LOCAL_LAYERS,
+        CATALOG.len()
     );
+
     loop {
         stats.rounds += 1;
-        opt_debug!(
-            "[LOCAL] SWEEP {} BEGIN: hash={:016x}, nodes={}, fns={}, binders={}",
+        let sweep_start = fingerprint(&current);
+        let mut sweep_changed = false;
+        eprintln!(
+            "  sweep {}: hash={:016x}, estimated-cost={}, nodes={}",
             stats.rounds,
-            fingerprint(&p),
-            measure(&p).nodes,
-            measure(&p).fns,
-            measure(&p).binders
+            sweep_start,
+            optimization_key(&current).0,
+            measure(&current).nodes
         );
-        let summary = wpo_summary(&p);
-        let pure = summary.pure;
-        let mut restarted = false;
 
-        for pass in 0..pass_count {
-            let (label, protect_rec) = match pass {
-                0 => ("beta", false),
-                1 => ("known-case", false),
-                2 => ("tree", false),
-                3 => ("const", false),
-                4 => ("global-const", false),
-                5 => ("param-drop", true),
-                6 => ("inline", false),
-                7 => ("mega", false),
-                8 => ("advanced", false),
-                9 => ("sink", false),
-                10 => ("dce", false),
-                11 => ("global-sccp", false),
-                12 => ("jump-thread", false),
-                13 => ("word-sccp", false),
-                14 => ("whole-dce", false),
-                _ => unreachable!(),
-            };
-
-            if quarantined.contains(label) {
-                opt_debug!(
-                    "[LOCAL] pass={} SKIP: already quarantined after a prior failed validation",
-                    label
-                );
+        for layer in 0..LOCAL_LAYERS {
+            // The pass metadata is refreshed after each accepted transformation;
+            // this is intentionally expensive and avoids stale purity/call facts.
+            let (family, protect_rec, pass) = CATALOG[layer % CATALOG.len()];
+            if quarantined.contains(family) {
                 continue;
             }
-
-            let (candidate, accepted, next_state, next_nodes) = match label {
-                "beta" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    beta,
-                ),
-                "known-case" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    known_cases,
-                ),
-                "tree" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    tree_opt,
-                ),
-                "const" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    const_opt,
-                ),
-                "global-const" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    global_const_opt,
-                ),
-                "param-drop" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    drop_params,
-                ),
-                "inline" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    inline,
-                ),
-                "mega" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    mega_opt,
-                ),
-                "advanced" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    adv_opt,
-                ),
-                "sink" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    sink,
-                ),
-                "dce" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    dce_changed,
-                ),
-                "global-sccp" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    global_const_opt,
-                ),
-                "jump-thread" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    adv_opt,
-                ),
-                "word-sccp" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    const_opt,
-                ),
-                "whole-dce" => guard_pass(
-                    p,
-                    &pure,
-                    &mut stats,
-                    label,
-                    protect_rec,
-                    state,
-                    nodes,
-                    &seen,
-                    &mut quarantined,
-                    dce_changed,
-                ),
-                _ => unreachable!(),
-            };
-
-            p = candidate;
-            if accepted {
-                opt_debug!(
-                    "[LOCAL] pass={} COMMIT: restart optimizer from new state hash={:016x}, nodes={} -> {}; accepted_restarts={}",
-                    label,
+            let summary = wpo_summary(&current);
+            let pure = summary.pure;
+            let before_hash = fingerprint(&current);
+            let before_nodes = measure(&current).nodes;
+            let label = family;
+            if trace_layers {
+                eprintln!(
+                    "    layer {:03}/{:03}: {} (hash={:016x}, nodes={})",
+                    layer + 1,
+                    LOCAL_LAYERS,
+                    family,
+                    before_hash,
+                    before_nodes
+                );
+            }
+            let (candidate, accepted, next_state, next_nodes) = guard_pass(
+                current.clone(),
+                &pure,
+                &mut stats,
+                label,
+                protect_rec,
+                before_hash,
+                before_nodes,
+                &seen,
+                &mut quarantined,
+                pass,
+            );
+            if !accepted {
+                if trace_layers {
+                    eprintln!("      layer {:03}: no safe new state", layer + 1);
+                }
+                continue;
+            }
+            if trace_layers {
+                eprintln!(
+                    "      layer {:03}: accepted hash={:016x}, nodes={} -> {}",
+                    layer + 1,
                     next_state,
-                    nodes,
-                    next_nodes,
-                    stats.restarts + 1
+                    before_nodes,
+                    next_nodes
                 );
-                state = next_state;
-                nodes = next_nodes;
-                stats.restarts += 1;
-                restarted = true;
+            }
+
+            current = candidate;
+            state = next_state;
+            seen.insert(state);
+            state_budget = state_budget.saturating_add(1);
+            sweep_changed = true;
+            stats.restarts = stats.restarts.saturating_add(1);
+
+            let candidate_key = optimization_key(&current);
+            if candidate_key < best_key {
+                let prior = best_key;
+                best = current.clone();
+                best_key = candidate_key;
+                eprintln!(
+                    "    layer {:03} {:<18} BEST: estimated runtime cost {} -> {}; nodes={}",
+                    layer + 1,
+                    family,
+                    prior.0,
+                    best_key.0,
+                    next_nodes
+                );
+            }
+
+            if state_budget >= WPO_STATE_BUDGET {
+                eprintln!(
+                    "  [safety] stopped speculative search after {} unique commits; best verified candidate retained",
+                    state_budget
+                );
+                current = best.clone();
                 break;
-            } else {
-                opt_debug!(
-                    "[LOCAL] pass={} KEEP: original state preserved; next pass may still examine it",
-                    label
-                );
             }
         }
 
-        if !restarted {
-            opt_debug!(
-                "[LOCAL] SWEEP {} END: no pass committed; fixed point at hash={:016x}",
-                stats.rounds,
-                fingerprint(&p)
+        if state_budget >= WPO_STATE_BUDGET {
+            break;
+        }
+
+        let end_hash = fingerprint(&current);
+        if !sweep_changed || end_hash == sweep_start {
+            eprintln!(
+                "  fixed point: no new safe rewrites; hash={:016x}",
+                end_hash
             );
             break;
         }
-        opt_debug!(
-            "[LOCAL] SWEEP {} END: committed pass forced restart; new hash={:016x}",
-            stats.rounds,
-            fingerprint(&p)
-        );
+
+        // Whole-program analysis is repeated whenever a sweep changed the AST.
+        // It can expose global constants, purity, recursion and call edges that
+        // were not visible earlier in the sequence.
+        eprintln!("  whole-program re-analysis after changed sweep {}", stats.rounds);
+        let (global_candidate, _) = whole_program_optimize(current.clone());
+        let global_hash = fingerprint(&global_candidate);
+        if global_hash != end_hash
+            && !seen.contains(&global_hash)
+            && scoped(&global_candidate)
+            && crate::sema::analyze(global_candidate.clone()).is_ok()
+            && crate::cgen::validate_program(&global_candidate)
+        {
+            current = global_candidate;
+            state = global_hash;
+            seen.insert(state);
+            let key = optimization_key(&current);
+            if key < best_key {
+                best = current.clone();
+                best_key = key;
+                eprintln!(
+                    "    whole-program candidate is new BEST: estimated runtime cost={}, nodes={}",
+                    best_key.0,
+                    measure(&best).nodes
+                );
+            }
+        } else if global_hash == end_hash {
+            eprintln!("  whole-program analysis stable");
+        } else if seen.contains(&global_hash) {
+            eprintln!("  whole-program candidate repeats a known state; cycle avoided");
+        }
+
+        // When an exploratory chain ends at a slower (or equal-but-larger)
+        // state, restart the next sweep from the best verified AST. The global
+        // `seen` set still allows novel descendants while blocking cycles.
+        let current_hash = fingerprint(&current);
+        let best_hash = fingerprint(&best);
+        if current_hash != best_hash {
+            eprintln!(
+                "  restart from best-so-far: current={:016x}, best={:016x}, cost={}",
+                current_hash,
+                best_hash,
+                best_key.0
+            );
+            current = best.clone();
+            continue;
+        }
+        if current_hash == sweep_start {
+            break;
+        }
     }
 
     stats.quarantined = quarantined;
     eprintln!("  sweeps: {}", stats.rounds);
-    eprintln!("  restarts: {}", stats.restarts);
-    eprintln!("  fixed point: no further rewrites");
+    eprintln!("  accepted local commits: {}", state_budget);
+    eprintln!("  pass rejections: {}", stats.rejected);
+    eprintln!("  quarantined pass families: {}", stats.quarantined.len());
     print_pass_stats(&stats);
+    let mut layer_totals: Vec<(String, usize, isize)> = stats
+        .passes
+        .iter()
+        .filter(|(_, stat)| stat.hits != 0)
+        .map(|(name, stat)| (name.clone(), stat.hits, stat.delta))
+        .collect();
+    layer_totals.sort_by(|a, b| a.0.cmp(&b.0));
+    if !layer_totals.is_empty() {
+        eprintln!(
+            "  layer-family totals: {}",
+            layer_totals
+                .iter()
+                .map(|(name, hits, delta)| format!("{}={} (node_delta={:+})", name, hits, -*delta))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
+    }
 
-    eprintln!("→ optimize: finalize");
+    // Choose from all verified states by estimated execution cost first and AST
+    // size only as a tie-breaker. Keep `current` only if it truly scores better.
+    let current_key = optimization_key(&current);
+    if current_key < best_key {
+        best = current.clone();
+    }
 
-    let p = match crate::sema::analyze(p.clone()) {
-        Ok(p) => p,
-        Err(errs) => {
-            for e in &errs {
+    // Whole-program semantic analysis is the final compiler gate. Its output is
+    // retained only if it validates; failure never replaces the best candidate.
+    eprintln!("→ optimize: final whole-program analysis");
+    let mut final_program = match crate::sema::analyze(best.clone()) {
+        Ok(analyzed) => analyzed,
+        Err(errors) => {
+            for error in &errors {
                 eprintln!(
                     "  [opt-final] semantic invariant: {} (span {}..{})",
-                    e.msg, e.span.lo, e.span.hi
+                    error.msg, error.span.lo, error.span.hi
                 );
             }
-            return p;
+            best.clone()
         }
     };
-    let final_ok = scoped(&p);
-    let end = measure(&p);
-    opt_debug!(
-        "[VERIFY] final scope={} hash={:016x} nodes={} fns={} binders={} decls={}",
-        final_ok,
-        fingerprint(&p),
-        end.nodes,
-        end.fns,
-        end.binders,
-        p.decls.len()
-    );
-    if final_ok {
-        let delta = end.nodes as isize - norm.nodes as isize;
-        let pct = pct_delta(norm.nodes, end.nodes).abs();
-        if delta <= 0 {
-            eprintln!(
-                "✓ optimize: reduced {} -> {} nodes (-{} / {:.1}%), {} -> {} functions, {} -> {} declarations",
-                norm.nodes,
-                end.nodes,
-                -delta,
-                pct,
-                norm.fns,
-                end.fns,
-                norm_decls,
-                p.decls.len()
-            );
-        } else {
-            eprintln!(
-                "✓ optimize: grew {} -> {} nodes (+{} / {:.1}%), {} -> {} functions, {} -> {} declarations",
-                norm.nodes,
-                end.nodes,
-                delta,
-                pct,
-                norm.fns,
-                end.fns,
-                norm_decls,
-                p.decls.len()
-            );
-        }
-        if start.nodes != norm.nodes {
-            eprintln!("  normalization: {} -> {} nodes", start.nodes, norm.nodes);
-        }
-    } else {
-        eprintln!("✗ optimize: final scope invariant failed; returning current AST");
+
+    if !scoped(&final_program) {
+        eprintln!("✗ optimize: final scope invariant failed; returning verified best-so-far AST");
+        final_program = best.clone();
     }
-    p
+
+    // Semantic/scope checks cannot detect CGen ABI drift. Validate the final
+    // optimized candidate with CGen's whole-program constraint solver *and*
+    // lowered-LIR ABI checker. An optimization is not considered safe merely
+    // because the rewritten AST remains well scoped and semantically analyzable.
+    if !crate::cgen::validate_program(&final_program) {
+        eprintln!("✗ optimize: final CGen constraint/ABI validation failed");
+        if crate::cgen::validate_program(&normalized_program) {
+            eprintln!("  [opt-final] normalized AST passes CGen validation; optimized AST reverted");
+            final_program = normalized_program;
+        } else if crate::cgen::validate_program(&original) {
+            eprintln!("  [opt-final] source AST passes CGen validation; normalization and optimization reverted");
+            final_program = original;
+        } else {
+            // Do not keep the most aggressively rewritten candidate after all
+            // representation checks failed. Return the source AST as the least
+            // transformed artifact; CGen's diagnostics still report any source
+            // program issue rather than silently preserving optimizer damage.
+            eprintln!("  [opt-final] neither normalized nor source AST passes CGen ABI validation; returning source AST without claiming validation success");
+            final_program = original;
+        }
+    }
+
+    let final_measure = measure(&final_program);
+    let final_key = optimization_key(&final_program);
+    let node_delta = final_measure.nodes as isize - normalized_measure.nodes as isize;
+    eprintln!(
+        "✓ optimize: nodes {} -> {} ({:+}), functions {} -> {}, declarations {} -> {}; estimated runtime cost={} (lower is better; benchmark required for actual speed)",
+        normalized_measure.nodes,
+        final_measure.nodes,
+        node_delta,
+        normalized_measure.fns,
+        final_measure.fns,
+        current.decls.len(),
+        final_program.decls.len(),
+        final_key.0
+    );
+    if input_measure.nodes != normalized_measure.nodes {
+        eprintln!("  normalization: {} -> {} nodes", input_measure.nodes, normalized_measure.nodes);
+    }
+    final_program
 }
 
 const HASH_OFFSET: u64 = 0xcbf29ce484222325;
@@ -1985,6 +2578,18 @@ where
         return (original, false, before_hash, before_nodes);
     }
 
+    let lost_external_calls = lost_reachable_external_calls(&original, &candidate);
+    if !lost_external_calls.is_empty() {
+        stats.rejected += 1;
+        quarantined.insert(label.to_string());
+        opt_debug!(
+            "[LOCAL] pass={} REVERT + QUARANTINE: reachable external call(s) disappeared: {:?}; reason=EXTERNAL_EFFECT_LOST",
+            label,
+            lost_external_calls
+        );
+        return (original, false, before_hash, before_nodes);
+    }
+
     let after_hash = fingerprint(&candidate);
     opt_debug_delta!(&format!("[LOCAL] {}", label), &original, &candidate);
 
@@ -2009,6 +2614,23 @@ where
         quarantine(stats, quarantined, label, "SCOPE_INVARIANT");
         return (original, false, before_hash, before_nodes);
     }
+    if let Err(errors) = crate::sema::analyze(candidate.clone()) {
+        quarantine(stats, quarantined, label, "SEMANTIC_INVARIANT");
+        opt_debug!(
+            "[LOCAL] pass={} rejected by semantic validation ({} diagnostic(s))",
+            label,
+            errors.len()
+        );
+        return (original, false, before_hash, before_nodes);
+    }
+
+    // Reject an optimization immediately if whole-program CGen inference or
+    // lowered call/pattern ABI checks fail. This prevents speculative rewrites
+    // from silently turning an ADT result into a scalar ABI.
+    if !crate::cgen::validate_program(&candidate) {
+        quarantine(stats, quarantined, label, "CGEN_ABI_INVARIANT");
+        return (original, false, before_hash, before_nodes);
+    }
 
     let _ = (opt_cost(&original), opt_cost(&candidate));
 
@@ -2027,7 +2649,15 @@ where
     }
 
     if seen.contains(&after_hash) {
-        quarantine(stats, quarantined, label, "ALREADY_SEEN_STATE_CYCLE");
+        // A previously explored output is not evidence that this pass is unsafe;
+        // the same pass may produce a novel result from a different AST. Reject
+        // only this state transition, and keep the family eligible in later sweeps.
+        stats.rejected += 1;
+        opt_debug!(
+            "[LOCAL] pass={} SKIP: candidate hash {:016x} was already explored; family remains enabled",
+            label,
+            after_hash
+        );
         return (original, false, before_hash, before_nodes);
     }
 
@@ -2045,6 +2675,7 @@ where
 }
 
 fn scoped(p: &Program) -> bool {
+    let verbose = std::env::var_os("MAK_OPT_DEBUG").is_some();
     let mut globals = HashSet::new();
     let mut ctors = HashSet::new();
 
@@ -2065,7 +2696,7 @@ fn scoped(p: &Program) -> bool {
         }
     }
 
-    {
+    if verbose {
         let mut gs: Vec<&String> = globals.iter().collect();
         gs.sort();
         eprintln!("  [scoped-debug] globals ({}): {:?}", gs.len(), gs);
@@ -2099,9 +2730,11 @@ fn scoped(p: &Program) -> bool {
         bound: &mut HashSet<String>,
         globals: &HashSet<String>,
         ctors: &HashSet<String>,
+        verbose: bool,
     ) -> bool {
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Quote(_) => true,
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) => true,
+            ExprKind::Quote(inner) => expr_ok(inner, bound, globals, ctors, verbose),
             ExprKind::Var(n) => {
                 // `$mak.index` is emitted by the parser for `base[index]`.
                 // It deliberately has no Decl entry and must survive alpha
@@ -2127,7 +2760,7 @@ fn scoped(p: &Program) -> bool {
                         is_intrinsic,
                         bound.len(),
                     );
-                } else if is_intrinsic {
+                } else if is_intrinsic && verbose {
                     eprintln!(
                         "  [scoped-debug] OK: compiler intrinsic `{}` at span {}..{}",
                         n, e.span.lo, e.span.hi
@@ -2138,12 +2771,12 @@ fn scoped(p: &Program) -> bool {
             }
             ExprKind::Let { name, value, body } => {
                 // A let name is not in scope within its own initializer.
-                if !expr_ok(value, bound, globals, ctors) {
+                if !expr_ok(value, bound, globals, ctors, verbose) {
                     return false;
                 }
 
                 let was = bound.insert(name.clone());
-                let ok = expr_ok(body, bound, globals, ctors);
+                let ok = expr_ok(body, bound, globals, ctors, verbose);
 
                 if !was {
                     bound.remove(name);
@@ -2156,7 +2789,9 @@ fn scoped(p: &Program) -> bool {
                 // validator silently collapse them into one set entry.
                 let mut param_names = HashSet::with_capacity(params.len());
                 if params.iter().any(|p| !param_names.insert(p.clone())) {
-                    eprintln!("  [scoped-debug] FAIL: duplicate function parameter");
+                    if verbose {
+                        eprintln!("  [scoped-debug] FAIL: duplicate function parameter");
+                    }
                     return false;
                 }
 
@@ -2167,52 +2802,52 @@ fn scoped(p: &Program) -> bool {
                     }
                 }
 
-                let ok = expr_ok(body, bound, globals, ctors);
+                let ok = expr_ok(body, bound, globals, ctors, verbose);
                 for n in added {
                     bound.remove(&n);
                 }
                 ok
             }
             ExprKind::App { fun, args } => {
-                expr_ok(fun, bound, globals, ctors)
-                    && args.iter().all(|a| expr_ok(a, bound, globals, ctors))
+                expr_ok(fun, bound, globals, ctors, verbose)
+                    && args.iter().all(|a| expr_ok(a, bound, globals, ctors, verbose))
             }
             ExprKind::Case { scrut, arms } => {
-                if !expr_ok(scrut, bound, globals, ctors) {
+                if !expr_ok(scrut, bound, globals, ctors, verbose) {
                     return false;
                 }
 
                 for arm in arms {
                     let mut arm_bound = bound.clone();
                     pat_binds(&arm.pat, &mut arm_bound);
-                    if !expr_ok(&arm.body, &mut arm_bound, globals, ctors) {
+                    if !expr_ok(&arm.body, &mut arm_bound, globals, ctors, verbose) {
                         return false;
                     }
                 }
                 true
             }
             ExprKind::Block { stmts, tail } => {
-                stmts.iter().all(|s| expr_ok(s, bound, globals, ctors))
-                    && expr_ok(tail, bound, globals, ctors)
+                stmts.iter().all(|s| expr_ok(s, bound, globals, ctors, verbose))
+                    && expr_ok(tail, bound, globals, ctors, verbose)
             }
             ExprKind::Bin { l, r, .. } => {
-                expr_ok(l, bound, globals, ctors) && expr_ok(r, bound, globals, ctors)
+                expr_ok(l, bound, globals, ctors, verbose) && expr_ok(r, bound, globals, ctors, verbose)
             }
-            ExprKind::Un { e, .. } => expr_ok(e, bound, globals, ctors),
+            ExprKind::Un { e, .. } => expr_ok(e, bound, globals, ctors, verbose),
         }
     }
 
     for d in &p.decls {
         if let Decl::Let { value, name, .. } = d {
             let mut bound = HashSet::new();
-            if !expr_ok(value, &mut bound, &globals, &ctors) {
+            if !expr_ok(value, &mut bound, &globals, &ctors, verbose) {
                 eprintln!("  [scoped-debug] declaration `{}` failed scope validation", name);
                 return false;
             }
         }
     }
 
-    expr_ok(&p.body, &mut HashSet::new(), &globals, &ctors)
+    expr_ok(&p.body, &mut HashSet::new(), &globals, &ctors, verbose)
 }
 
 // =============================================================================
@@ -2777,6 +3412,9 @@ fn collect_pure(p: &Program) -> HashSet<String> {
                 if e.pure {
                     pure.insert(e.name.clone());
                 }
+                if e.is_global {
+                    pure.insert(mutable_global_marker(&e.name));
+                }
             }
             Decl::Type { ctors, .. } => {
                 for c in ctors {
@@ -2810,8 +3448,10 @@ fn collect_pure(p: &Program) -> HashSet<String> {
 
 fn pure_body(e: &Expr, pure: &HashSet<String>) -> bool {
     match &e.kind {
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Var(_) => true,
-        ExprKind::Fn { .. } | ExprKind::Quote(_) => true,
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) => true,
+        ExprKind::Var(name) => !is_mutable_global_name(name, pure),
+        ExprKind::Fn { .. } => true,
+        ExprKind::Quote(inner) => pure_body(inner, pure),
         ExprKind::Let { value, body, .. } => pure_body(value, pure) && pure_body(body, pure),
         ExprKind::Bin { l, r, .. } => pure_body(l, pure) && pure_body(r, pure),
         ExprKind::Un { e, .. } => pure_body(e, pure),
@@ -4768,14 +5408,23 @@ fn simp_let(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
         *changed = true;
         return body;
     }
-    if uses == 1 {
+    // Substituting an effectful initializer into the body can reorder its
+    // effects relative to other body expressions. Only inline a one-use value
+    // when it is referentially transparent. Re-materialize cheap literals and
+    // variable references for multiple uses, but keep expensive pure work in
+    // one let so it is not recomputed several times.
+    if uses == 1 && is_pure(&value, pure) {
         let b = subst(body.clone(), &name, &value);
         if count_var(&b, &name) == 0 {
             *changed = true;
             return b;
         }
     }
-    if uses > 1 && is_pure(&value, pure) {
+    let cheap_to_rematerialize = matches!(
+        &value.kind,
+        ExprKind::Var(_) | ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_)
+    );
+    if uses > 1 && is_pure(&value, pure) && cheap_to_rematerialize {
         let b = subst(body.clone(), &name, &value);
         if count_var(&b, &name) == 0 {
             *changed = true;
@@ -4832,7 +5481,7 @@ fn simp_let(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     if matches!(
         &value.kind,
         ExprKind::Var(_) | ExprKind::Int(_) | ExprKind::Float(_)
-    ) && uses > 0
+    ) && uses > 0 && is_pure(&value, pure)
     {
         let b = subst(body.clone(), &name, &value);
         if count_var(&b, &name) == 0 {
@@ -8331,11 +8980,7 @@ fn use_counts(e: &Expr, out: &mut HashMap<String, usize>) {
 fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     f(e);
     match &e.kind {
-        ExprKind::Int(_)
-        | ExprKind::Float(_)
-        | ExprKind::Str(_)
-        | ExprKind::Var(_)
-        | ExprKind::Quote(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Var(_) => {}
         ExprKind::Let { value, body, .. } => {
             walk(value, f);
             walk(body, f);
@@ -8363,7 +9008,7 @@ fn walk(e: &Expr, f: &mut dyn FnMut(&Expr)) {
             walk(l, f);
             walk(r, f);
         }
-        ExprKind::Un { e, .. } => walk(e, f),
+        ExprKind::Un { e, .. } | ExprKind::Quote(e) => walk(e, f),
     }
 }
 
@@ -8482,7 +9127,7 @@ fn subst(e: Expr, name: &str, to: &Expr) -> Expr {
 
             ExprKind::Quote(x) => Expr {
                 span,
-                kind: ExprKind::Quote(x),
+                kind: ExprKind::Quote(Box::new(go(*x, name, to, shadowed))),
             },
 
             other => Expr { span, kind: other },
@@ -8579,5 +9224,76 @@ mod pointer_optimization_regressions {
             !scoped(&program),
             "recognizing the index intrinsic must not permit an undefined base name"
         );
+    }
+
+    #[test]
+    fn partial_evaluator_uses_case_arm_facts() {
+        let expression = Expr {
+            span: NULL_SPAN,
+            kind: ExprKind::Case {
+                scrut: Box::new(Expr {
+                    span: NULL_SPAN,
+                    kind: ExprKind::Var("x".to_string()),
+                }),
+                arms: vec![Arm {
+                    pat: Pat::Int(7),
+                    body: bin(
+                        BinOp::Add,
+                        Expr {
+                            span: NULL_SPAN,
+                            kind: ExprKind::Var("x".to_string()),
+                        },
+                        int(1),
+                        NULL_SPAN,
+                    ),
+                    span: NULL_SPAN,
+                }],
+            },
+        };
+        let mut env = ConstEnv::new();
+        let mut changed = false;
+        let result = partial_path_expr(
+            expression,
+            &mut env,
+            &HashSet::new(),
+            &HashSet::new(),
+            &mut changed,
+        );
+        assert!(changed);
+        let ExprKind::Case { arms, .. } = result.kind else {
+            panic!("case expression should be retained");
+        };
+        assert!(matches!(&arms[0].body.kind, ExprKind::Int(8)));
+    }
+
+    #[test]
+    fn partial_boolean_rewrite_preserves_effectful_left_operand() {
+        let call = Expr {
+            span: NULL_SPAN,
+            kind: ExprKind::App {
+                fun: Box::new(Expr {
+                    span: NULL_SPAN,
+                    kind: ExprKind::Var("side_effect".to_string()),
+                }),
+                args: Vec::new(),
+            },
+        };
+        let condition = bin(BinOp::LAnd, call, int(0), NULL_SPAN);
+        let mut changed = false;
+        let rewritten = partial_reduce_condition(condition, &HashSet::new(), &mut changed);
+        assert!(changed);
+        assert!(matches!(rewritten.kind, ExprKind::Block { stmts, .. } if stmts.len() == 1));
+    }
+
+    #[test]
+    fn mutable_external_global_is_not_considered_pure() {
+        let name = "mutable_global";
+        let mut purity = HashSet::new();
+        purity.insert(mutable_global_marker(name));
+        let expression = Expr {
+            span: NULL_SPAN,
+            kind: ExprKind::Var(name.to_string()),
+        };
+        assert!(!is_pure(&expression, &purity));
     }
 }

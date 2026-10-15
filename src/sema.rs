@@ -32,6 +32,7 @@ fn sema_debug_enabled() -> bool {
 #[inline]
 fn sema_debug(enabled: bool, message: impl std::fmt::Display) {
     if enabled {
+        #[cfg(debug_assertions)]
         eprintln!("[sema] {message}");
     }
 }

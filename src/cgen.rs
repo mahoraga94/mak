@@ -605,9 +605,10 @@ impl MemoryPlan {
     }
 
     fn strategy(&self, kind: MemorySiteKind, fid: Option<usize>, bytes: usize) -> MemoryStrategy {
-        // Runtime resolution is intrinsically a dynamic boundary.  We therefore
-        // use malloc/free there, while proven source-level temporaries never pay
-        // allocator overhead when a stack representation is safe.
+        // Runtime resolution is intrinsically a dynamic boundary. We use heap
+        // storage there. Source-level ADT values go through the arena below until
+        // a per-site escape proof is available; simply being inside a
+        // non-tail-recursive function is not enough to make stack storage safe.
         if matches!(
             kind,
             MemorySiteKind::RuntimeCall
@@ -624,6 +625,23 @@ impl MemoryPlan {
 
         if bytes > Self::ARENA_OBJECT_LIMIT {
             return MemoryStrategy::Heap;
+        }
+
+        // ADT values are passed around as pointers, and their children can be
+        // retained in constructor fields or returned through a caller's output
+        // buffer.  Function-local alloca storage is therefore not safe merely
+        // because the current function is not tail-recursive: a nested ADT may
+        // outlive the frame that created it (e.g. SpecPair containing Spec).
+        // Until escape analysis proves a particular site non-escaping, keep
+        // source-level ADT temporaries in the arena. Runtime/dynamic boundaries
+        // above still use the heap, as do exceptionally large objects.
+        if matches!(
+            kind,
+            MemorySiteKind::Construct
+                | MemorySiteKind::CallResult
+                | MemorySiteKind::CaseResult
+        ) {
+            return MemoryStrategy::Arena;
         }
 
         if let Some(id) = fid {
@@ -1957,6 +1975,12 @@ impl Analyzer {
             }
         }
         self.seed_parameter_shapes();
+        // The fixed-point pass above can re-introduce an ADT guess for a
+        // parameter that is also passed recursively.  Indexing has a stronger
+        // semantic requirement: the base must be a pointer to elements, not
+        // an ADT value.  Re-apply this constraint after the fixed point so it
+        // cannot be overwritten by stale observations from recursive calls.
+        self.force_indexed_parameter_shapes();
         self.dbg("THINK", "Representation inference converged with syntax-derived parameter shapes and bounded propagation.");
         for id in 0..self.functions.len() {
             let body = match &self.functions[id].expr.kind {
@@ -2147,6 +2171,85 @@ impl Analyzer {
             }
         }
         self.reachable_functions.extend(0..n);
+    }
+
+    fn force_indexed_parameter_shapes(&mut self) {
+        fn walk(e: &Expr, param_index: &HashMap<String, usize>, indexed: &mut HashSet<usize>) {
+            match &e.kind {
+                ExprKind::App { fun, args } => {
+                    let (base, flat_args) = Analyzer::flatten_application(fun, args);
+                    if matches!(&base.kind, ExprKind::Var(name) if name == "$mak.index")
+                        && flat_args.len() == 2
+                    {
+                        if let ExprKind::Var(name) = &flat_args[0].kind {
+                            if let Some(index) = param_index.get(name) {
+                                indexed.insert(*index);
+                            }
+                        }
+                    }
+                    walk(fun, param_index, indexed);
+                    for arg in args {
+                        walk(arg, param_index, indexed);
+                    }
+                }
+                ExprKind::Let { value, body, .. } => {
+                    walk(value, param_index, indexed);
+                    walk(body, param_index, indexed);
+                }
+                ExprKind::Fn { body, .. } => walk(body, param_index, indexed),
+                ExprKind::Case { scrut, arms } => {
+                    walk(scrut, param_index, indexed);
+                    for arm in arms {
+                        walk(&arm.body, param_index, indexed);
+                    }
+                }
+                ExprKind::Block { stmts, tail } => {
+                    for stmt in stmts {
+                        walk(stmt, param_index, indexed);
+                    }
+                    walk(tail, param_index, indexed);
+                }
+                ExprKind::Bin { l, r, .. } => {
+                    walk(l, param_index, indexed);
+                    walk(r, param_index, indexed);
+                }
+                ExprKind::Un { e, .. } | ExprKind::Quote(e) => walk(e, param_index, indexed),
+                ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Var(_) => {}
+            }
+        }
+
+        let mut forced = Vec::<(usize, usize)>::new();
+        for (id, function) in self.functions.iter().enumerate() {
+            let body = match &function.expr.kind {
+                ExprKind::Fn { body, .. } => body,
+                _ => continue,
+            };
+            let param_index = function
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, name)| (name.clone(), i))
+                .collect::<HashMap<_, _>>();
+            let mut indexed = HashSet::new();
+            walk(body, &param_index, &mut indexed);
+            for index in indexed {
+                forced.push((id, index));
+            }
+        }
+
+        for (fid, index) in forced {
+            if let Some(rep) = self
+                .functions
+                .get_mut(fid)
+                .and_then(|f| f.param_reps.get_mut(index))
+            {
+                // Keep an already-known string or raw pointer representation;
+                // replace an ADT/scalar guess which cannot support byte indexing.
+                if !matches!(rep, Rep::Ptr | Rep::Str) {
+                    *rep = Rep::Ptr;
+                }
+            }
+        }
     }
 
     fn constructor_result_shape(&self, e: &Expr) -> Option<Rep> {
@@ -2403,6 +2506,13 @@ impl Analyzer {
             ExprKind::Bin { op, l, r } => {
                 let a = self.infer_expr(l, env, current);
                 let b = self.infer_expr(r, env, current);
+                // Explicitly handle Rem as integer-only to prevent float poisoning
+                // from shared helper functions (e.g. rev_digits_go used by both int and float formatters).
+                if matches!(op, BinOp::Rem) {
+                    self.constrain_expr_rep(l, &Rep::I64, env, current);
+                    self.constrain_expr_rep(r, &Rep::I64, env, current);
+                    return Rep::I64;
+                }
                 if matches!(
                     op,
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge
@@ -2489,14 +2599,52 @@ impl Analyzer {
             if flat_args.len() != 2 {
                 return Rep::Unknown;
             }
-            let base_rep = self.infer_expr(flat_args[0], env, current);
-            let _index_rep = self.infer_expr(flat_args[1], env, current);
-            if !is_data_pointer_rep(&base_rep) && !matches!(base_rep, Rep::Unknown) {
+
+            // Indexing is itself evidence that an otherwise-unconstrained
+            // parameter is pointer-like. Do not rely on an artificial `let _ =
+            // strlen p` expression to communicate that fact: pure unused lets
+            // may be removed by the optimizer before representation inference.
+            // Without this constraint, helpers such as `parse_flags fmt i`
+            // are assigned an integer ABI and every `fmt[i]` becomes a runtime
+            // recovery expression instead of a byte load.
+            let mut base_rep = self.infer_expr(flat_args[0], env, current);
+            if matches!(base_rep, Rep::Unknown | Rep::Adt(_)) {
+                // Indexing is stronger evidence than a previous ambiguous ADT
+                // observation: this expression is using the value as an address,
+                // not as a single ADT object. Override the local representation
+                // and, when this is a formal parameter, update the shared
+                // parameter representation too. Otherwise recursive calls can
+                // feed the stale ADT guess back into the fixed-point solver.
+                self.constrain_expr_rep(flat_args[0], &Rep::Ptr, env, current);
+                if let ExprKind::Var(name) = &flat_args[0].kind {
+                    env.insert(name.clone(), Rep::Ptr);
+                    let param_index = self
+                        .functions
+                        .get(current)
+                        .and_then(|function| function.params.iter().position(|p| p == name));
+                    if let Some(index) = param_index {
+                        self.functions[current].param_reps[index] = Rep::Ptr;
+                    }
+                }
+                base_rep = self.infer_expr(flat_args[0], env, current);
+            }
+
+            let mut index_rep = self.infer_expr(flat_args[1], env, current);
+            if matches!(index_rep, Rep::Unknown) {
+                self.constrain_expr_rep(flat_args[1], &Rep::I64, env, current);
+                index_rep = self.infer_expr(flat_args[1], env, current);
+            }
+
+            if !is_data_pointer_rep(&base_rep) {
                 return Rep::Unknown;
             }
+            if !index_rep.is_integer() {
+                return Rep::Unknown;
+            }
+
             return pointer_info_of_expr(flat_args[0], self, None)
                 .map(|info| info.elem_rep)
-                .unwrap_or(Rep::Unknown);
+                .unwrap_or(Rep::U8);
         }
         let mut ars = Vec::with_capacity(flat_args.len());
         for a in &flat_args {
@@ -2886,18 +3034,6 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        // MAK ADT values are represented as pointers to their generated C
-        // structs.  Index an ADT pointer as an array of those structs and keep
-        // the result in the existing ADT pointer representation.
-        if let Rep::Adt(name) = &base_rep {
-            let cty = format!("struct mak_{}", mangle_ident(name));
-            let code = format!(
-                "(&((({} *)(uintptr_t)({}))[ (intptr_t)({})]))",
-                cty, base_code, index_code
-            );
-            return Ok((code, base_rep));
-        }
-
         // A declared T* uses T-sized indexing.  An untyped `ptr` is deliberately
         // byte-addressed; this is portable even though Rep::Ptr itself is opaque.
         let (elem_ctype, elem_rep) = match pointer_info_of_expr(base, self.a, Some(env)) {
@@ -3285,6 +3421,20 @@ impl<'a> Lowerer<'a> {
                     (lr.is_integer() || lr.is_float()) && (rr.is_integer() || rr.is_float());
                 let rep = if matches!(lir_op, BinOpLir::LAnd | BinOpLir::LOr) {
                     Rep::I32
+                } else if matches!(lir_op, BinOpLir::Rem) {
+                    // `%` is integer-only in MAK. Shared helpers can have
+                    // float parameter representations even when this specific
+                    // operation needs an integer remainder, so force the
+                    // operation result (and therefore its operands) to I64.
+                    if !both_numeric {
+                        return Err(format!(
+                            "non-numeric binary expression: {} {} {}",
+                            rep_debug(&lr),
+                            op_debug(*op),
+                            rep_debug(&rr)
+                        ));
+                    }
+                    Rep::I64
                 } else if arithmetic {
                     if !both_numeric {
                         return Err(format!(
@@ -4225,7 +4375,11 @@ impl<'a> Lowerer<'a> {
                 );
                 let both_numeric =
                     (lr.is_integer() || lr.is_float()) && (rr.is_integer() || rr.is_float());
-                let base = if arithmetic && both_numeric {
+                let base = if matches!(op, BinOp::Rem) && both_numeric {
+                    // `%` has integer semantics even if shared-function
+                    // inference widened its operands to float elsewhere.
+                    Rep::I64
+                } else if arithmetic && both_numeric {
                     if lr.is_float() || rr.is_float() {
                         Rep::F64
                     } else {
@@ -7973,7 +8127,16 @@ impl<'a> CEmitter<'a> {
 
     fn emit_tail(&mut self, e: &LirExpr, depth: usize) {
         if let LirExpr::DirectC { code, rep } = e {
-            if rep_is_adt(rep) {
+            // ADT returns use a hidden, by-value output buffer. Route every
+            // direct-C expression through `emit_into` in that context so a
+            // scalar/pointer cast cannot be returned as if it were the ADT
+            // value itself.
+            if rep_is_adt(&self.current_ret) {
+                let out = self.current_out.clone().unwrap_or_else(|| "out".into());
+                let current_ret = self.current_ret.clone();
+                self.emit_into(e, &out, &current_ret, depth);
+                let _ = writeln!(self.out, "{}return;", indent(depth));
+            } else if rep_is_adt(rep) {
                 let _ = writeln!(self.out, "{}*out = *({});", indent(depth), code);
                 let _ = writeln!(self.out, "{}return;", indent(depth));
             } else if matches!(rep, Rep::Unit) {
@@ -8143,19 +8306,36 @@ impl<'a> CEmitter<'a> {
             return;
         }
         if let Rep::Adt(_) = rep {
-            let storage = self.fresh_temp("stackobj");
+            // ADTs are reference-backed and may be retained by another ADT's
+            // fields or escape as the result of a helper.  A local C stack
+            // object is therefore not a safe default for a let-bound value.
+            // Allocate it using the same lifetime-aware policy as other ADT
+            // temporaries, and only initialize it on successful allocation.
+            let storage = self.fresh_temp("letobj");
             let ty = adt_struct_type(rep);
-            let _ = writeln!(self.out, "{}{} {};", indent(depth), ty, storage);
+            let strategy = self.emit_adt_temp_alloc(
+                &storage,
+                rep,
+                depth,
+                MemorySiteKind::Construct,
+                "ADT local allocation failed",
+            );
+            if matches!(strategy, MemoryStrategy::Stack) {
+                self.emit_default_into(&storage, rep, depth);
+                self.emit_into(value, &storage, rep, depth);
+            } else {
+                self.emit_default_into(&storage, rep, depth + 1);
+                self.emit_into(value, &storage, rep, depth + 1);
+                self.emit_adt_temp_close(strategy, depth);
+            }
             let _ = writeln!(
                 self.out,
-                "{}{} * {} = &{};",
+                "{}{} * {} = {};",
                 indent(depth),
                 ty,
                 code,
                 storage
             );
-            self.emit_default_into(&format!("&{}", storage), rep, depth);
-            self.emit_into(value, &format!("&{}", storage), rep, depth);
             return;
         }
         let c = self.emit_value(value, depth);
@@ -9357,7 +9537,27 @@ impl<'a> CEmitter<'a> {
                     }
                     let _ = writeln!(self.out, "{}mak_ir_heap_free((void *){});", indent(depth), rt_tmp);
                 } else if matches!(effective, Rep::Unit) {
-                    let _ = writeln!(self.out, "{}{};", indent(depth), c);
+                    if !c.is_empty() {
+                        let _ = writeln!(self.out, "{}{};", indent(depth), c);
+                    }
+                    if rep_is_adt(dest_rep) {
+                        self.emit_runtime_type_recovery_into(
+                            dest,
+                            dest_rep,
+                            depth,
+                            "unit runtime call used as ADT result",
+                        );
+                    }
+                } else if rep_is_adt(dest_rep) {
+                    if !c.is_empty() {
+                        let _ = writeln!(self.out, "{}(void)({});", indent(depth), c);
+                    }
+                    self.emit_runtime_type_recovery_into(
+                        dest,
+                        dest_rep,
+                        depth,
+                        "non-ADT runtime call used as ADT result",
+                    );
                 } else {
                     let _ = writeln!(self.out, "{}*({}) = {};", indent(depth), dest, c);
                 }
@@ -9404,6 +9604,16 @@ impl<'a> CEmitter<'a> {
                         self.emit_runtime_type_recovery_into(dest, dest_rep, depth, "runtime constructor result used in non-ADT destination");
                     }
                     let _ = writeln!(self.out, "{}mak_ir_heap_free((void *){});", indent(depth), rt_tmp);
+                } else if rep_is_adt(dest_rep) {
+                    if !c.is_empty() {
+                        let _ = writeln!(self.out, "{}(void)({});", indent(depth), c);
+                    }
+                    self.emit_runtime_type_recovery_into(
+                        dest,
+                        dest_rep,
+                        depth,
+                        "non-ADT runtime constructor used as ADT result",
+                    );
                 } else {
                     let _ = writeln!(self.out, "{}*({}) = {};", indent(depth), dest, c);
                 }
@@ -9424,10 +9634,32 @@ impl<'a> CEmitter<'a> {
                         self.emit_default_into(dest, dest_rep, depth + 1);
                         let _ = writeln!(self.out, "{}}}", indent(depth));
                     }
+                    (Rep::Unit, Rep::Adt(_)) => {
+                        if !code.is_empty() {
+                            let _ = writeln!(self.out, "{}{};", indent(depth), code);
+                        }
+                        self.emit_runtime_type_recovery_into(
+                            dest,
+                            dest_rep,
+                            depth,
+                            "unit expression used as ADT result",
+                        );
+                    }
                     (Rep::Unit, _) => {
                         if !code.is_empty() {
                             let _ = writeln!(self.out, "{}{};", indent(depth), code);
                         }
+                    }
+                    (_, Rep::Adt(_)) => {
+                        if !code.is_empty() {
+                            let _ = writeln!(self.out, "{}(void)({});", indent(depth), code);
+                        }
+                        self.emit_runtime_type_recovery_into(
+                            dest,
+                            dest_rep,
+                            depth,
+                            "non-ADT expression used as ADT result",
+                        );
                     }
                     _ => {
                         let _ = writeln!(
@@ -9457,9 +9689,25 @@ impl<'a> CEmitter<'a> {
                 );
             }
             _ => {
+                let r = lir_rep(e);
                 let c = self.emit_value(e, depth);
-                if !c.is_empty() {
-                    let r = lir_rep(e);
+                if rep_is_adt(dest_rep) && !rep_is_adt(&r) {
+                    // ADT function results are written by value through `dest`.
+                    // `cast_code` intentionally produces an ADT pointer for
+                    // argument/pattern contexts, so assigning that pointer
+                    // directly to `*dest` is both ill-typed C and semantically
+                    // wrong. Evaluate the original expression for side effects,
+                    // then recover to the typed default object.
+                    if !c.is_empty() {
+                        let _ = writeln!(self.out, "{}(void)({});", indent(depth), c);
+                    }
+                    self.emit_runtime_type_recovery_into(
+                        dest,
+                        dest_rep,
+                        depth,
+                        "non-ADT expression used as ADT result",
+                    );
+                } else if !c.is_empty() {
                     let _ = writeln!(
                         self.out,
                         "{}*({}) = {};",
@@ -12330,6 +12578,64 @@ mod pointer_regressions {
     }
 
     #[test]
+    fn indexing_infers_pointer_representation_for_unknown_parameters() {
+        // The indexing operation alone must carry the pointer constraint. An
+        // unused pure call (such as `let _ = strlen fmt`) is not a reliable
+        // type hint because optimization may erase it before code generation.
+        let c = generated(b"let read_byte fmt i = fmt[i]; read_byte \"x\" 0");
+        assert!(
+            c.contains("uint8_t *)(uintptr_t)(a0)"),
+            "an unknown indexed parameter should lower to an actual byte load"
+        );
+        assert!(
+            !c.contains("mak_ir_fail_u64(\"invalid index expression\")"),
+            "valid pointer indexing must not lower to runtime recovery"
+        );
+    }
+
+    #[test]
+    fn indexing_does_not_keep_a_stale_adt_representation() {
+        let c = generated(
+            b"type Bytes { Empty; Cons i32 Bytes; }; let chars s i acc = case i < 0 of { 1 -> acc; _ -> chars s (i - 1) (Cons (s[i]) acc) }; chars \"abc\" 2 Empty",
+        );
+        assert!(
+            c.contains("uint8_t *)(uintptr_t)(a0)"),
+            "indexing should compile to a byte load from the pointer parameter"
+        );
+        assert!(
+            !c.contains("string used as ADT"),
+            "a string passed to an indexed parameter must not fall back to a default ADT"
+        );
+    }
+
+    #[test]
+    fn recursive_string_indexing_overrides_stale_adt_parameter_shape() {
+        let c = generated(
+            b"type Bytes { Empty; Cons i32 Bytes; }; let chars s i acc = case i < 0 of { 1 -> acc; _ -> chars s (i - 1) (Cons (s[i]) acc) }; chars \"abc\" 2 Empty",
+        );
+        assert!(
+            c.contains("const void * a0") || c.contains("const char * a0"),
+            "recursive index bases must be emitted as pointers, not ADT pointers"
+        );
+        assert!(!c.contains("string used as ADT"));
+    }
+
+    #[test]
+    fn adt_let_bindings_use_managed_storage() {
+        let c = generated(
+            b"type List { Nil; Cons i64 List; }; let build x = let child = Cons x Nil in Cons x child; build 7",
+        );
+        assert!(
+            c.contains("mak_ir_arena_alloc(sizeof(struct mak__a)"),
+            "ADT let bindings that can escape must use managed storage"
+        );
+        assert!(
+            !c.contains("stackobj_"),
+            "ADT let bindings should not point into a returning function's stack"
+        );
+    }
+
+    #[test]
     fn typed_pointer_addition_uses_element_stride() {
         let c = generated(b"let extern values : [i32] = \"values\" : i32*; values + 2");
         assert!(c.contains("int32_t *)(uintptr_t)"));
@@ -12343,5 +12649,102 @@ mod pointer_regressions {
         );
         assert!(c.contains("((int64_t)(((int32_t *)(uintptr_t)("),
             "typed pointer subtraction should emit C pointer difference");
+    }
+}
+
+#[cfg(test)]
+mod memory_lifetime_regressions {
+    use super::*;
+
+    #[test]
+    fn returned_adt_temporaries_are_not_stack_allocated() {
+        let mut plan = MemoryPlan::default();
+        plan.stack_safe_functions.insert(7);
+        for kind in [
+            MemorySiteKind::Construct,
+            MemorySiteKind::CallResult,
+            MemorySiteKind::CaseResult,
+        ] {
+            assert_eq!(
+                plan.strategy(kind, Some(7), 64),
+                MemoryStrategy::Arena,
+                "ADT temporaries can escape their creating function"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod codegen_regressions {
+    use super::*;
+    use crate::parser::Parser;
+
+    fn generated(source: &[u8]) -> String {
+        let program = Parser::parse(source).expect("regression program should parse");
+        generate(&program)
+    }
+
+    #[test]
+    fn remainder_uses_integer_operands_when_shared_params_are_floats() {
+        // The first expression makes x's shared function representation float;
+        // `%` must still lower with integer semantics at this operation site.
+        let c = generated(
+            b"let rem = fn (x y) => { x + 0.5; x % y }; rem 17.5 5.0",
+        );
+        assert!(
+            c.contains("% (int64_t)("),
+            "remainder operands should be cast to an integer type"
+        );
+        assert!(
+            !c.contains("% (double)("),
+            "C's `%` operator must never receive double operands"
+        );
+    }
+
+    #[test]
+    fn scalar_expression_recovers_to_adt_value_not_adt_pointer_assignment() {
+        let analyzer = Analyzer::new();
+        let mut emitter = CEmitter::new(&analyzer);
+        emitter.emit_into(
+            &LirExpr::Int(1, Rep::I64),
+            "out",
+            &Rep::Adt("sample".into()),
+            1,
+        );
+        assert!(emitter.out.contains("mak_ir_recover(\"non-ADT expression used as ADT result\")"));
+        assert!(emitter.out.contains("*(out) = *(&mak_ir_default_obj_sample);"));
+        assert!(!emitter.out.contains("*(out) = (struct mak_sample *)"));
+    }
+
+    #[test]
+    fn direct_c_scalar_recovers_to_adt_value_not_adt_pointer_assignment() {
+        let analyzer = Analyzer::new();
+        let mut emitter = CEmitter::new(&analyzer);
+        emitter.emit_into(
+            &LirExpr::DirectC {
+                code: "some_integer()".into(),
+                rep: Rep::I64,
+            },
+            "out",
+            &Rep::Adt("sample".into()),
+            1,
+        );
+        assert!(emitter.out.contains("(void)(some_integer());"));
+        assert!(emitter.out.contains("*(out) = *(&mak_ir_default_obj_sample);"));
+        assert!(!emitter.out.contains("*(out) = (struct mak_sample *)"));
+    }
+
+    #[test]
+    fn integer_remainder_emitter_casts_float_representations() {
+        let analyzer = Analyzer::new();
+        let mut emitter = CEmitter::new(&analyzer);
+        let code = emitter.emit_bin(
+            BinOpLir::Rem,
+            &LirExpr::Var("a0".into(), Rep::F64),
+            &LirExpr::Var("a1".into(), Rep::F64),
+            &Rep::I64,
+            1,
+        );
+        assert_eq!(code, "((int64_t)(a0) % (int64_t)(a1))");
     }
 }
