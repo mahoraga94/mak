@@ -7,6 +7,16 @@
 #include <string.h>
 #include <unistd.h>
 
+int64_t mak_ir_i64_from_bits(uint64_t bits) { int64_t out; memcpy(&out, &bits, sizeof out); return out; }
+int64_t mak_ir_i64_neg_wrap(int64_t a) { return mak_ir_i64_from_bits(UINT64_C(0) - (uint64_t)a); }
+int64_t mak_ir_i64_add_wrap(int64_t a, int64_t b) { return mak_ir_i64_from_bits((uint64_t)a + (uint64_t)b); }
+int64_t mak_ir_i64_sub_wrap(int64_t a, int64_t b) { return mak_ir_i64_from_bits((uint64_t)a - (uint64_t)b); }
+int64_t mak_ir_i64_mul_wrap(int64_t a, int64_t b) { return mak_ir_i64_from_bits((uint64_t)a * (uint64_t)b); }
+int64_t mak_ir_i64_div_wrap(int64_t a, int64_t b) { if (a == INT64_MIN && b == -1) return INT64_MIN; return a / b; }
+int64_t mak_ir_i64_rem_wrap(int64_t a, int64_t b) { if (a == INT64_MIN && b == -1) return 0; return a % b; }
+int64_t mak_ir_i64_shl_wrap(int64_t a, int64_t b) { return mak_ir_i64_from_bits((uint64_t)a << ((uint64_t)b & UINT64_C(63))); }
+int64_t mak_ir_i64_shr(int64_t a, int64_t b) { uint64_t n = (uint64_t)b & UINT64_C(63); uint64_t bits; memcpy(&bits, &a, sizeof bits); if (n == 0) return a; return mak_ir_i64_from_bits((bits >> n) | (a < 0 ? (UINT64_MAX << (64 - n)) : UINT64_C(0))); }
+
 enum {
     mak_ir_tag_0 = 1u,
     mak_ir_tag_1 = 2u,
@@ -1202,7 +1212,7 @@ static inline void mak_ir_fn_3(struct mak__a * a0, int64_t a1, struct mak__c *ou
             int64_t scrut_13 = case_14;
             if ((scrut_13 == INT64_C(1))) {
                 struct mak__a * tailarg_30 = mak_local_cc_6;
-                int64_t eval_33 = (a1 * INT64_C(131));
+                int64_t eval_33 = mak_ir_i64_mul_wrap(a1, INT64_C(131));
                 int64_t case_35 = 0;
                 int32_t scrut_36 = mak_local_cb_5 >= (int32_t)(INT64_C(65));
                 if ((scrut_36 == INT64_C(0))) {
@@ -1212,7 +1222,7 @@ static inline void mak_ir_fn_3(struct mak__a * a0, int64_t a1, struct mak__c *ou
                     int64_t case_37 = 0;
                     int32_t scrut_38 = mak_local_cb_5 <= (int32_t)(INT64_C(90));
                     if ((scrut_38 == INT64_C(1))) {
-                        case_37 = ((int64_t)(mak_local_cb_5) + INT64_C(32));
+                        case_37 = mak_ir_i64_add_wrap((int64_t)(mak_local_cb_5), INT64_C(32));
                     }
                     else if (1) {
                         case_37 = (int64_t)(mak_local_cb_5);
@@ -1220,8 +1230,8 @@ static inline void mak_ir_fn_3(struct mak__a * a0, int64_t a1, struct mak__c *ou
                     case_35 = case_37;
                 }
                 int64_t eval_34 = case_35;
-                int64_t eval_32 = (eval_33 + eval_34);
-                int64_t tailarg_31 = (eval_32 % INT64_C(1000000007));
+                int64_t eval_32 = mak_ir_i64_add_wrap(eval_33, eval_34);
+                int64_t tailarg_31 = mak_ir_i64_rem_wrap(eval_32, INT64_C(1000000007));
                 a0 = tailarg_30;
                 a1 = tailarg_31;
                 continue;
@@ -1251,11 +1261,11 @@ static inline double mak_ir_fn_4(int64_t a0) {
     else if (1) {
         int32_t scrut_39 = (int32_t)(a0) > (int32_t)(INT64_C(0));
         if ((scrut_39 == INT64_C(1))) {
-            double eval_40 = mak_ir_fn_4((a0 - INT64_C(1)));
+            double eval_40 = mak_ir_fn_4(mak_ir_i64_sub_wrap(a0, INT64_C(1)));
             return ((double)(10.00000000000000000) * (double)(eval_40));
         }
         else if (1) {
-            double eval_41 = mak_ir_fn_4((a0 + INT64_C(1)));
+            double eval_41 = mak_ir_fn_4(mak_ir_i64_add_wrap(a0, INT64_C(1)));
             return ((double)(0.10000000000000001) * (double)(eval_41));
         }
     }
@@ -1285,9 +1295,9 @@ static inline void mak_ir_fn_5(struct mak__a * a0, int64_t a1, int64_t a2, struc
             int64_t scrut_42 = case_43;
             if ((scrut_42 == INT64_C(1))) {
                 struct mak__a * tailarg_47 = mak_local_cp_8;
-                int64_t eval_50 = (a1 * INT64_C(10));
-                int64_t eval_49 = (eval_50 + (int64_t)(mak_local_co_7));
-                int64_t tailarg_48 = (eval_49 - INT64_C(48));
+                int64_t eval_50 = mak_ir_i64_mul_wrap(a1, INT64_C(10));
+                int64_t eval_49 = mak_ir_i64_add_wrap(eval_50, (int64_t)(mak_local_co_7));
+                int64_t tailarg_48 = mak_ir_i64_sub_wrap(eval_49, INT64_C(48));
                 int64_t tailarg_51 = INT64_C(1);
                 a0 = tailarg_47;
                 a1 = tailarg_48;
@@ -1355,7 +1365,7 @@ static inline void mak_ir_fn_6(struct mak__a * a0, int64_t a1, struct mak__e *ou
                     int64_t mak_local_cu_11 = (scrut_54)->v.v9.f0;
                     struct mak__a * mak_local_cv_12 = (scrut_54)->v.v9.f1;
                     (out)->tag = mak_ir_tag_9;
-                    (out)->v.v9.f0 = (-mak_local_cu_11);
+                    (out)->v.v9.f0 = mak_ir_i64_neg_wrap((int64_t)(mak_local_cu_11));
                     (out)->v.v9.f1 = mak_local_cv_12;
                 }
                 else {
@@ -3456,7 +3466,7 @@ static inline int64_t mak_ir_fn_20(int64_t a0) {
     else if (1) {
         int32_t scrut_331 = (int32_t)(a0) <= (int32_t)(INT64_C(90));
         if ((scrut_331 == INT64_C(1))) {
-            return (a0 + INT64_C(32));
+            return mak_ir_i64_add_wrap(a0, INT64_C(32));
         }
         else if (1) {
             return a0;
@@ -6774,11 +6784,11 @@ static inline double mak_ir_fn_29(int64_t a0, int64_t a1) {
             return ((double)(a1) * (double)(57.29577951308232286));
         }
         case INT64_C(184475947): {
-            return (a1 * a1);
+            return mak_ir_i64_mul_wrap(a1, a1);
         }
         case INT64_C(224581785): {
-            int64_t eval_620 = (a1 * a1);
-            return (eval_620 * a1);
+            int64_t eval_620 = mak_ir_i64_mul_wrap(a1, a1);
+            return mak_ir_i64_mul_wrap(eval_620, a1);
         }
         default: {
             return 0.00000000000000000;

@@ -24,10 +24,8 @@ enum Rep {
     Ptr,
     Adt(String),
     Function(usize),
-    /// A first-class foreign function value.  Unlike `Rep::Ptr`, this keeps the
-    /// exact callable C type and the fixed argument/return representations so
-    /// aliases such as `let f = putchar; f 65` remain directly callable after
-    /// optimization.
+
+
     ExternFunction {
         ctype: String,
         args: Vec<Rep>,
@@ -254,11 +252,11 @@ struct LirFunction {
 
 #[derive(Clone, Debug)]
 struct PointerInfo {
-    /// Representation of one indexed element.
+
     elem_rep: Rep,
-    /// C spelling of that element type (without the trailing `*`).
+
     elem_ctype: String,
-    /// If the element is itself a pointer, its pointed-to shape.
+
     nested: Option<Box<PointerInfo>>,
 }
 
@@ -267,9 +265,8 @@ enum Binding {
     Value {
         code: String,
         rep: Rep,
-        /// Known pointed-to C type and recursively known pointer shape.  `Rep`
-        /// intentionally stays coarse for ABI compatibility; this metadata is
-        /// only used by indexing and pointer offsets.
+
+
         ptr_info: Option<PointerInfo>,
     },
     Function { id: usize },
@@ -284,13 +281,10 @@ struct RecoveryNote {
     message: String,
 }
 
-// =========================================================================
-// Runtime Plan: the feature graph the user asked for
-// =========================================================================
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum RtFeature {
-    // Primitives (leaf features, no dependencies)
+
     Arena,
     Recovery,
     FloatBits,
@@ -300,7 +294,7 @@ enum RtFeature {
     KindCompatible,
     Hash,
 
-    // Dispatcher pieces
+
     FnDescType,
     CtorDescType,
     FnTable,
@@ -456,10 +450,6 @@ impl RtPlan {
 }
 
 
-// ============================================================================
-// Whole-program memory analysis
-// ============================================================================
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemorySiteKind {
     Construct,
@@ -504,10 +494,7 @@ impl MemoryPlan {
         let mut plan = Self::default();
         plan.ast_nodes = memory_ast_nodes(p);
 
-        // The fixed-point state intentionally tracks only properties that can
-        // change while call edges are propagated.  This keeps thousands of
-        // iterations cheap and deterministic instead of doing thousands of
-        // whole expensive AST passes.
+
         let mut dynamic = HashMap::<usize, bool>::new();
         for f in fs {
             dynamic.insert(f.info.id, memory_lir_has_dynamic(&f.body));
@@ -540,11 +527,8 @@ impl MemoryPlan {
         plan.force_heap_unknown = !converged;
 
         for f in fs {
-            // A stack allocation is safe across ordinary recursive calls because
-            // each invocation receives its own frame. Tail recursion lowered to
-            // a loop is the important exception: alloca inside that loop would
-            // monotonically grow the frame, so those functions use pooled or
-            // dynamic storage instead.
+
+
             if !lir_has_self_tail_call(&f.body, f.info.id) {
                 plan.stack_safe_functions.insert(f.info.id);
             }
@@ -559,7 +543,7 @@ impl MemoryPlan {
             }
         }
 
-        // The entry body can be emitted outside a named function.
+
         if !fs.iter().any(|f| matches!(f.info.source_name.as_deref(), Some("main"))) {
             let mut lowerer = Lowerer::new(a);
             let mut env = HashMap::new();
@@ -605,10 +589,8 @@ impl MemoryPlan {
     }
 
     fn strategy(&self, kind: MemorySiteKind, fid: Option<usize>, bytes: usize) -> MemoryStrategy {
-        // Runtime resolution is intrinsically a dynamic boundary. We use heap
-        // storage there. Source-level ADT values go through the arena below until
-        // a per-site escape proof is available; simply being inside a
-        // non-tail-recursive function is not enough to make stack storage safe.
+
+
         if matches!(
             kind,
             MemorySiteKind::RuntimeCall
@@ -627,14 +609,7 @@ impl MemoryPlan {
             return MemoryStrategy::Heap;
         }
 
-        // ADT values are passed around as pointers, and their children can be
-        // retained in constructor fields or returned through a caller's output
-        // buffer.  Function-local alloca storage is therefore not safe merely
-        // because the current function is not tail-recursive: a nested ADT may
-        // outlive the frame that created it (e.g. SpecPair containing Spec).
-        // Until escape analysis proves a particular site non-escaping, keep
-        // source-level ADT temporaries in the arena. Runtime/dynamic boundaries
-        // above still use the heap, as do exceptionally large objects.
+
         if matches!(
             kind,
             MemorySiteKind::Construct
@@ -832,10 +807,6 @@ fn adt_object_layout(a: &Analyzer, name: &str) -> (usize, usize) {
     (total.max(4), payload_align.max(4))
 }
 
-
-// =========================================================================
-// Analyzer
-// =========================================================================
 
 struct Analyzer {
     constructors: Vec<CtorInfo>,
@@ -1975,11 +1946,8 @@ impl Analyzer {
             }
         }
         self.seed_parameter_shapes();
-        // The fixed-point pass above can re-introduce an ADT guess for a
-        // parameter that is also passed recursively.  Indexing has a stronger
-        // semantic requirement: the base must be a pointer to elements, not
-        // an ADT value.  Re-apply this constraint after the fixed point so it
-        // cannot be overwritten by stale observations from recursive calls.
+
+
         self.force_indexed_parameter_shapes();
         self.dbg("THINK", "Representation inference converged with syntax-derived parameter shapes and bounded propagation.");
         for id in 0..self.functions.len() {
@@ -2243,8 +2211,8 @@ impl Analyzer {
                 .get_mut(fid)
                 .and_then(|f| f.param_reps.get_mut(index))
             {
-                // Keep an already-known string or raw pointer representation;
-                // replace an ADT/scalar guess which cannot support byte indexing.
+
+
                 if !matches!(rep, Rep::Ptr | Rep::Str) {
                     *rep = Rep::Ptr;
                 }
@@ -2506,8 +2474,8 @@ impl Analyzer {
             ExprKind::Bin { op, l, r } => {
                 let a = self.infer_expr(l, env, current);
                 let b = self.infer_expr(r, env, current);
-                // Explicitly handle Rem as integer-only to prevent float poisoning
-                // from shared helper functions (e.g. rev_digits_go used by both int and float formatters).
+
+
                 if matches!(op, BinOp::Rem) {
                     self.constrain_expr_rep(l, &Rep::I64, env, current);
                     self.constrain_expr_rep(r, &Rep::I64, env, current);
@@ -2600,21 +2568,11 @@ impl Analyzer {
                 return Rep::Unknown;
             }
 
-            // Indexing is itself evidence that an otherwise-unconstrained
-            // parameter is pointer-like. Do not rely on an artificial `let _ =
-            // strlen p` expression to communicate that fact: pure unused lets
-            // may be removed by the optimizer before representation inference.
-            // Without this constraint, helpers such as `parse_flags fmt i`
-            // are assigned an integer ABI and every `fmt[i]` becomes a runtime
-            // recovery expression instead of a byte load.
+
             let mut base_rep = self.infer_expr(flat_args[0], env, current);
             if matches!(base_rep, Rep::Unknown | Rep::Adt(_)) {
-                // Indexing is stronger evidence than a previous ambiguous ADT
-                // observation: this expression is using the value as an address,
-                // not as a single ADT object. Override the local representation
-                // and, when this is a formal parameter, update the shared
-                // parameter representation too. Otherwise recursive calls can
-                // feed the stale ADT guess back into the fixed-point solver.
+
+
                 self.constrain_expr_rep(flat_args[0], &Rep::Ptr, env, current);
                 if let ExprKind::Var(name) = &flat_args[0].kind {
                     env.insert(name.clone(), Rep::Ptr);
@@ -2859,8 +2817,8 @@ impl Analyzer {
             ExprKind::App { fun, args } => {
                 let (base, flat_args) = Analyzer::flatten_application(fun, args);
                 if matches!(&base.kind, ExprKind::Var(n) if n == "$mak.index") {
-                    // An index reads through a pointer.  Treat it conservatively
-                    // as non-pure because foreign code can mutate that memory.
+
+
                     let _ = flat_args;
                     return false;
                 }
@@ -2891,9 +2849,6 @@ impl Analyzer {
     }
 }
 
-// =========================================================================
-// Lowerer
-// =========================================================================
 
 struct Lowerer<'a> {
     a: &'a Analyzer,
@@ -3034,8 +2989,7 @@ impl<'a> Lowerer<'a> {
             ));
         }
 
-        // A declared T* uses T-sized indexing.  An untyped `ptr` is deliberately
-        // byte-addressed; this is portable even though Rep::Ptr itself is opaque.
+
         let (elem_ctype, elem_rep) = match pointer_info_of_expr(base, self.a, Some(env)) {
             Some(info) => (info.elem_ctype, info.elem_rep),
             None => ("uint8_t".to_string(), Rep::U8),
@@ -3072,7 +3026,7 @@ impl<'a> Lowerer<'a> {
                 if let Some(v) = self.a.global_int_const(n) {
                     return Ok((c_i128(v), Rep::I64));
                 }
-                // FIX: same ordering issue as lower_expr. Externals first.
+
                 if let Some(eid) = self.a.external_by_name.get(n).copied() {
                     let ext = &self.a.externals[eid];
                     match &ext.decl.foreign {
@@ -3080,8 +3034,8 @@ impl<'a> Lowerer<'a> {
                             return Ok((ext.c_name.clone(), foreign_value_rep(&ext.decl.foreign)));
                         }
                         ForeignTy::Fun { .. } => {
-                            // Match lower_expr: foreign functions are valid values
-                            // in C (function designators decay to function pointers).
+
+
                             return Ok((
                                 ext.c_name.clone(),
                                 foreign_value_rep(&ext.decl.foreign),
@@ -3422,10 +3376,8 @@ impl<'a> Lowerer<'a> {
                 let rep = if matches!(lir_op, BinOpLir::LAnd | BinOpLir::LOr) {
                     Rep::I32
                 } else if matches!(lir_op, BinOpLir::Rem) {
-                    // `%` is integer-only in MAK. Shared helpers can have
-                    // float parameter representations even when this specific
-                    // operation needs an integer remainder, so force the
-                    // operation result (and therefore its operands) to I64.
+
+
                     if !both_numeric {
                         return Err(format!(
                             "non-numeric binary expression: {} {} {}",
@@ -3990,8 +3942,8 @@ impl<'a> Lowerer<'a> {
                 if let Some(v) = self.a.global_int_const(n) {
                     return LirExpr::Int(v, Rep::I64);
                 }
-                // FIX: externals must be tested BEFORE global_reps, because
-                // seed_global_reps inserts every external into global_reps.
+
+
                 if let Some(eid) = self.a.external_by_name.get(n).copied() {
                     let ext = &self.a.externals[eid];
                     match ext.decl.foreign {
@@ -4002,9 +3954,8 @@ impl<'a> Lowerer<'a> {
                             );
                         }
                         ForeignTy::Fun { .. } => {
-                            // A foreign function name is a first-class C function
-                            // designator.  Preserve its exact callable ABI instead
-                            // of treating it as an opaque object pointer.
+
+
                             return LirExpr::Var(
                                 ext.c_name.clone(),
                                 foreign_value_rep(&ext.decl.foreign),
@@ -4016,7 +3967,7 @@ impl<'a> Lowerer<'a> {
                     return LirExpr::Var(user_value_name(n), r.clone());
                 }
 
-                // Non-ambiguous constructor reference.
+
                 if let Some(cid) = self.a.resolve_ctor_name(n) {
                     let c = &self.a.constructors[cid];
                     if c.arity == 0 {
@@ -4047,9 +3998,7 @@ impl<'a> Lowerer<'a> {
                     );
                 }
 
-                // Fallback 1: alpha-renaming collapsed same-named constructors
-                // across different types. Disambiguate using the current
-                // function's declared return type.
+
                 let zero_arity: Vec<usize> = self
                     .a
                     .constructors
@@ -4092,7 +4041,7 @@ impl<'a> Lowerer<'a> {
                     }
                 }
 
-                // Fallback 2: try direct AST-C recovery.
+
                 if let Some(recovered) = self.recover_direct_ast(
                     e,
                     env,
@@ -4102,9 +4051,7 @@ impl<'a> Lowerer<'a> {
                     return recovered;
                 }
 
-                // Fallback 3: runtime constructor resolver. Emit a `name:type`
-                // query when we have a type hint so the resolver can pick the
-                // right constructor without a tie.
+
                 if !zero_arity.is_empty() && !self.a.runtime_ctor_candidates(0).is_empty() {
                     let query = match hint_type.as_deref() {
                         Some(t) => format!("{}:{}", n, t),
@@ -4130,7 +4077,7 @@ impl<'a> Lowerer<'a> {
                     };
                 }
 
-                // Fallback 4: runtime function resolver for zero-arg calls.
+
                 if !self.a.runtime_function_candidates(0).is_empty() {
                     let rep = self.a.runtime_function_rep(n, 0, &[]);
                     self.a.dbg(
@@ -4184,8 +4131,8 @@ impl<'a> Lowerer<'a> {
                 let v = self.lower_expr(value, env, current);
                 let rep = lir_rep(&v);
                 let code = self.fresh_local(name);
-                // Compute metadata before mutably inserting into `env`; this
-                // avoids overlapping immutable/mutable borrows of the map.
+
+
                 let ptr_info = pointer_info_of_expr(value, self.a, Some(env));
                 let old = env.insert(
                     name.clone(),
@@ -4350,12 +4297,7 @@ impl<'a> Lowerer<'a> {
                 let lr = lir_rep(&left);
                 let rr = lir_rep(&right);
 
-                // Pointer arithmetic must be recognized in the primary LIR
-                // lowering path, not only by the direct-AST fallback below.
-                // Reusing the direct expression emitter here keeps pointer
-                // scaling/type metadata consistent for `p + n`, `n + p`,
-                // `p - n`, and `end - start` without changing ordinary numeric
-                // binary expressions.
+
                 let left_is_ptr = is_data_pointer_rep(&lr);
                 let right_is_ptr = is_data_pointer_rep(&rr);
                 let left_is_offset = lr.is_integer() || matches!(lr, Rep::Unknown);
@@ -4394,8 +4336,8 @@ impl<'a> Lowerer<'a> {
                 let both_numeric =
                     (lr.is_integer() || lr.is_float()) && (rr.is_integer() || rr.is_float());
                 let base = if matches!(op, BinOp::Rem) && both_numeric {
-                    // `%` has integer semantics even if shared-function
-                    // inference widened its operands to float elsewhere.
+
+
                     Rep::I64
                 } else if arithmetic && both_numeric {
                     if lr.is_float() || rr.is_float() {
@@ -4485,8 +4427,7 @@ impl<'a> Lowerer<'a> {
     ) -> LirExpr {
         let (base_fun, flat_args) = Analyzer::flatten_application(fun, args);
 
-        // Array/pointer indexing is a parser intrinsic, not a user-visible
-        // function.  Keep it out of ordinary call resolution and lowering.
+
         if matches!(&base_fun.kind, ExprKind::Var(n) if n == "$mak.index") {
             if flat_args.len() != 2 {
                 self.a.note_recovery(current, fun, "LIR", format!("index intrinsic expects 2 arguments, got {}", flat_args.len()));
@@ -4502,7 +4443,7 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        // β-reduce an immediate lambda literal.
+
         if let ExprKind::Fn { params, body } = &base_fun.kind {
             if params.len() == flat_args.len() {
                 let mut new_body: Expr = (**body).clone();
@@ -4513,7 +4454,7 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        // --- Case 1: callee is a bare name. All static resolution attempts. ---
+
         if let ExprKind::Var(n) = &base_fun.kind {
             let arity = flat_args.len();
             let mut lowered_args = Vec::with_capacity(arity);
@@ -4650,7 +4591,7 @@ impl<'a> Lowerer<'a> {
                 };
             }
 
-            // Type-hint disambiguation for cross-type same-named constructors.
+
             let named_candidates: Vec<usize> = self
                 .a
                 .constructors
@@ -4715,7 +4656,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
 
-            // Existing runtime resolvers (still preferred over last-resort).
+
             if !self.a.runtime_function_candidates(arity).is_empty() {
                 let rep = self.a.runtime_function_rep(n, arity, &arg_reps);
                 self.a.dbg(
@@ -4751,10 +4692,7 @@ impl<'a> Lowerer<'a> {
                 };
             }
 
-            // Last resort: emit a runtime call for the *name* even when the
-            // dispatcher will not have a matching entry. The resolver will call
-            // mak_ir_recover and return a deterministic default; the compile
-            // succeeds and the program keeps running.
+
             let fallback_rep = current
                 .and_then(|id| self.a.functions.get(id))
                 .map(|f| f.ret_rep.clone())
@@ -4777,11 +4715,7 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        // --- Case 2: callee is a complex expression. ---
-        // Lower the callee as a value, then call it indirectly. If the callee's
-        // representation isn't a function pointer, fall back to a runtime call
-        // with an empty name, which the dispatcher resolves to a deterministic
-        // default at runtime.
+
         let mut lowered_args = Vec::with_capacity(flat_args.len());
         for a in &flat_args {
             lowered_args.push(self.lower_expr(a, env, current));
@@ -4843,9 +4777,7 @@ impl<'a> Lowerer<'a> {
             };
         }
 
-        // No callable representation and no name we can look up: emit a runtime
-        // recovery call with an empty query. The dispatcher returns a
-        // deterministic default after calling mak_ir_recover.
+
         let fallback_rep = current
             .and_then(|id| self.a.functions.get(id))
             .map(|f| f.ret_rep.clone())
@@ -4969,9 +4901,6 @@ fn lower_pattern_rep(a: &Analyzer, pat: &Pat) -> Option<Rep> {
     }
 }
 
-// =========================================================================
-// Optimizer
-// =========================================================================
 
 struct Optimizer<'a> {
     a: &'a Analyzer,
@@ -5719,9 +5648,6 @@ impl<'a> Optimizer<'a> {
     }
 }
 
-// =========================================================================
-// CEmitter
-// =========================================================================
 
 struct CEmitter<'a> {
     a: &'a Analyzer,
@@ -5786,8 +5712,8 @@ impl<'a> CEmitter<'a> {
         }
         headers.insert("#include <stdio.h>".to_string());
         headers.insert("#include <stdlib.h>".to_string());
-        // Integer wrap helpers use memcpy to reinterpret 64-bit bit patterns
-        // without relying on implementation-defined unsigned-to-signed casts.
+
+
         headers.insert("#include <string.h>".to_string());
         if self.a.needs_string
             || !self.a.constructors.is_empty()
@@ -5843,9 +5769,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_integer_wrap_helpers(&mut self) {
-        // MAK defines signed i64 arithmetic to wrap modulo 2^64.  C signed
-        // overflow is undefined, so do arithmetic in uint64_t and reinterpret
-        // the resulting bits with memcpy (not an out-of-range signed cast).
+
+
         let _ = writeln!(self.out, "int64_t mak_ir_i64_from_bits(uint64_t bits) {{ int64_t out; memcpy(&out, &bits, sizeof out); return out; }}");
         let _ = writeln!(self.out, "int64_t mak_ir_i64_neg_wrap(int64_t a) {{ return mak_ir_i64_from_bits(UINT64_C(0) - (uint64_t)a); }}");
         let _ = writeln!(self.out, "int64_t mak_ir_i64_add_wrap(int64_t a, int64_t b) {{ return mak_ir_i64_from_bits((uint64_t)a + (uint64_t)b); }}");
@@ -5889,16 +5814,8 @@ impl<'a> CEmitter<'a> {
                     let _ = writeln!(self.out, "    }} v;");
                 } else {
                     let _ = writeln!(self.out, "    union {{");
-                    // Include EVERY program constructor's field shape in the
-                    // union, not just the constructors of this type.  The
-                    // whole-program optimizer can relocate a Construct/Field/
-                    // Pattern node into code that operates on a different
-                    // ADT, in which case the emitted access `x->v.vN.fK`
-                    // refers to a constructor id N that does not belong to
-                    // this type.  With the per-type list that access site
-                    // fails to compile (`no member named 'vN'`); with the
-                    // universal list every `vN` that any access site can
-                    // mention exists in every ADT's union.s
+
+
                     for c in &self.a.constructors {
                         if c.arity == 0 {
                             continue;
@@ -5940,17 +5857,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_adt_runtime_helper(&mut self) {
-        // ADT values are normally copied only when their static representations
-        // agree.  Optimisation can nevertheless leave a structurally equivalent
-        // intermediate ADT at a boundary (for example NumOut::NNum feeding
-        // ExprOut::EOK).  The runtime must recover that value instead of either
-        // panicking or silently treating its source bytes as the destination type.
-        //
-        // Same-type copies remain a memcpy.  For different ADTs, the generated
-        // helper can safely adapt a constructor when its payload representation
-        // is identical to exactly one destination constructor.  Zero-field
-        // constructors additionally match by the semantic suffix (NBad -> EBad).
-        // Anything else is rejected and the caller installs its normal default.
+
+
         let _ = writeln!(
             self.out,
             "static inline uint32_t mak_ir_adt_type_of_tag(uint32_t tag) {{"
@@ -6149,21 +6057,8 @@ impl<'a> CEmitter<'a> {
     }
 
     fn emit_arena_helper(&mut self) {
-        // Dedicated, deterministic memory subsystem:
-        //   * dynamically grows in independently reclaimable pages
-        //   * individual allocations can be freed and reused through size bins
-        //   * large allocations receive dedicated pages and can be returned to
-        //     the operating system immediately
-        //   * empty normal pages are trimmed automatically
-        //   * freed blocks are briefly quarantined to make UAF/double-free bugs
-        //     much harder to hide
-        //   * every block carries integrity metadata and a tail canary
-        //   * integer overflow, alignment, foreign-pointer and double-free cases
-        //     fail closed when hardening is enabled
-        //   * there is no tracing collector and no background GC
-        //
-        // `MAK_ARENA_BYTES` remains accepted as a compatibility alias for the
-        // maximum committed arena size.
+
+
         let _ = writeln!(self.out, "#ifndef MAK_ARENA_PAGE_BYTES");
         let _ = writeln!(
             self.out,
@@ -7713,9 +7608,8 @@ impl<'a> CEmitter<'a> {
                 "struct mak_rt_fn_desc {{ const char *name; const char *canon; size_t arity; uint8_t ret_kind; const uint8_t *kinds; mak_rt_fn call; }};"
             );
             if rows.is_empty() {
-                // The dispatcher is enabled but no candidates were found.
-                // Emit a single dummy row so the array is well-formed and the
-                // loop body never executes (count is 0).
+
+
                 let _ = writeln!(
                     self.out,
                     "static const struct mak_rt_fn_desc mak_rt_functions[] = {{ {{\"\",\"\",0,0,NULL,(void *)0}} }};"
@@ -7964,10 +7858,8 @@ impl<'a> CEmitter<'a> {
         for e in &self.a.externals {
             match &e.decl.foreign {
                 ForeignTy::Atom(a) => {
-                    // Globals can retain their declared pointer shape because
-                    // this is an object declaration, not a function ABI.  The
-                    // function parameter/return path intentionally remains
-                    // opaque for backward compatibility.
+
+
                     let c_type = foreign_index_ctype(&ForeignTy::Atom(a.clone()));
                     let _ = writeln!(
                         self.out,
@@ -8020,7 +7912,7 @@ impl<'a> CEmitter<'a> {
     fn emit_globals(&mut self, p: &Program) {
         for d in &p.decls {
             if let Decl::Let { name, value, .. } = d {
-                // Determine the representation. Prefer resolved function IDs.
+
                 let r = if let Some(id) = self.a.resolve_function_name(name) {
                     Rep::Function(id)
                 } else {
@@ -8105,9 +7997,8 @@ impl<'a> CEmitter<'a> {
             let mut lowerer = Lowerer::new(self.a);
             let mut env = HashMap::new();
             let body = lowerer.lower_expr(&p.body, &mut env, None);
-            // Function bodies go through the LIR optimizer in the normal
-            // pipeline; optimize the top-level expression too, especially for
-            // wrapping-aware constant folding deferred by the AST optimizer.
+
+
             let optimizer = Optimizer { a: self.a };
             let (body, _) = optimizer.optimize_expr(body);
             self.emit_expr_stmt(&body, 1);
@@ -8123,12 +8014,8 @@ impl<'a> CEmitter<'a> {
         let mut env = HashMap::new();
         for d in &p.decls {
             if let Decl::Let { name, value, .. } = d {
-                // Mirror `emit_globals`: every top-level `let` gets an
-                // initializer.  For function-valued decls the lowered IR is
-                // `FnRef(id)` which emits the C function name (decaying to a
-                // function pointer); for everything else it is the lowered
-                // value.  Keeping the two loops in lock-step prevents the
-                // "use of undeclared identifier 'mak_user_X'" error.
+
+
                 let ir = lowerer.lower_expr(value, &mut env, None);
                 let r = if let Some(id) = self.a.resolve_function_name(name) {
                     Rep::Function(id)
@@ -8170,10 +8057,8 @@ impl<'a> CEmitter<'a> {
 
     fn emit_tail(&mut self, e: &LirExpr, depth: usize) {
         if let LirExpr::DirectC { code, rep } = e {
-            // ADT returns use a hidden, by-value output buffer. Route every
-            // direct-C expression through `emit_into` in that context so a
-            // scalar/pointer cast cannot be returned as if it were the ADT
-            // value itself.
+
+
             if rep_is_adt(&self.current_ret) {
                 let out = self.current_out.clone().unwrap_or_else(|| "out".into());
                 let current_ret = self.current_ret.clone();
@@ -8349,11 +8234,8 @@ impl<'a> CEmitter<'a> {
             return;
         }
         if let Rep::Adt(_) = rep {
-            // ADTs are reference-backed and may be retained by another ADT's
-            // fields or escape as the result of a helper.  A local C stack
-            // object is therefore not a safe default for a let-bound value.
-            // Allocate it using the same lifetime-aware policy as other ADT
-            // temporaries, and only initialize it on successful allocation.
+
+
             let storage = self.fresh_temp("letobj");
             let ty = adt_struct_type(rep);
             let strategy = self.emit_adt_temp_alloc(
@@ -8935,9 +8817,8 @@ impl<'a> CEmitter<'a> {
             vals.push(runtime_value_bits(&c, &ar));
             kinds.push(runtime_kind_for_rep(&ar).to_string());
         }
-        // Encode the expected result type as a suffix on the query string so the
-        // runtime resolver can disambiguate same-named constructors in different
-        // types. `name:type` means "prefer constructors whose type is `type`".
+
+
         let query = match rep {
             Rep::Adt(n) if !name.contains(':') => format!("{}:{}", name, n),
             _ => name.to_string(),
@@ -9447,12 +9328,8 @@ impl<'a> CEmitter<'a> {
                 noreturn,
                 ..
             } if rep_is_adt(rep) => {
-                // A destination pointer is only a valid sret buffer when its
-                // representation exactly matches the call result.  Nested
-                // cases routinely contain calls returning a different ADT
-                // (e.g. NumOut inside an ExprOut parser), so materialize those
-                // calls through emit_value instead of corrupting the outer
-                // destination buffer.
+
+
                 if *rep != *dest_rep {
                     let c = self.emit_value(e, depth);
                     match (rep, dest_rep) {
@@ -9737,12 +9614,8 @@ impl<'a> CEmitter<'a> {
                 let r = lir_rep(e);
                 let c = self.emit_value(e, depth);
                 if rep_is_adt(dest_rep) && !rep_is_adt(&r) {
-                    // ADT function results are written by value through `dest`.
-                    // `cast_code` intentionally produces an ADT pointer for
-                    // argument/pattern contexts, so assigning that pointer
-                    // directly to `*dest` is both ill-typed C and semantically
-                    // wrong. Evaluate the original expression for side effects,
-                    // then recover to the typed default object.
+
+
                     if !c.is_empty() {
                         let _ = writeln!(self.out, "{}(void)({});", indent(depth), c);
                     }
@@ -10925,9 +10798,8 @@ fn foreign_atom_type(a: &ForeignAtom) -> String {
         ForeignAtom::U64 => "uint64_t".into(),
         ForeignAtom::F32 => "float".into(),
         ForeignAtom::F64 => "double".into(),
-        // Keep foreign function parameter/return signatures ABI-compatible
-        // with the previous opaque-pointer representation.  Object declarations
-        // and explicit indexing casts retain their pointer shape separately.
+
+
         ForeignAtom::Ptr | ForeignAtom::PtrTo(_) => "const void *".into(),
         ForeignAtom::Void => "void".into(),
         ForeignAtom::Named(_) => "uintptr_t".into(),
@@ -10972,9 +10844,7 @@ fn extern_function_pointer_decl(r: &Rep, name: &str) -> Option<String> {
         return None;
     };
 
-    // `ctype` is always emitted by `foreign_function_pointer_type` as
-    // `ret (*)(args)`.  A declaration needs the identifier spliced into that
-    // abstract declarator: `ret (*name)(args)`.
+
     let marker = "(*)";
     if let Some(pos) = ctype.find(marker) {
         let mut out = String::with_capacity(ctype.len() + name.len());
@@ -10985,7 +10855,7 @@ fn extern_function_pointer_decl(r: &Rep, name: &str) -> Option<String> {
         out.push_str(&ctype[pos + marker.len()..]);
         Some(out)
     } else {
-        // Defensive fallback for malformed/legacy representations.
+
         Some(format!("{} {}", ctype, name))
     }
 }
@@ -11048,18 +10918,7 @@ fn function_pointer_decl_with_name(id: usize, var_name: &str, fs: &[FunctionInfo
     format!("{} (*{} )({})", ret, var_name, args.join(", "))
 }
 
-/// Emit a `ret (*name)(args)` declarator for a function pointer.
-///
-/// `function_pointer_type` deliberately returns the *type* form
-/// `ret (*)(args)`, which is what every cast site needs.  But a global
-/// storage declaration cannot use a bare type: `static void (*)(void) x;`
-/// is not a declaration, it is a syntax error.  A declaration has to
-/// splice the identifier into the middle of the declarator:
-///
-///     static ret (*x)(args);
-///
-/// This helper produces exactly that, so callers can write
-/// `static {};` with the result and get a well-formed declaration.
+
 fn function_pointer_decl(id: usize, name: &str, fs: &[FunctionInfo]) -> String {
     if id >= fs.len() {
         return format!("void (*{})(void)", name);
@@ -11099,9 +10958,8 @@ fn rep_decl(r: &Rep, name: &str, functions: &[FunctionInfo]) -> String {
 }
 
 fn foreign_index_ctype(t: &ForeignTy) -> String {
-    // Unlike a foreign declaration, this helper deliberately retains every
-    // declared pointer layer.  The C symbol declaration/call ABI remains as it
-    // was; only the explicit casts generated for indexing use the typed shape.
+
+
     match t {
         ForeignTy::Atom(ForeignAtom::PtrTo(inner)) => {
             format!("{} *", foreign_index_ctype(inner))
@@ -11121,8 +10979,7 @@ fn pointer_info_from_foreign(t: &ForeignTy) -> Option<PointerInfo> {
     })
 }
 
-/// Recover pointer element information without changing the ABI-level `Rep`.
-/// Unknown `ptr` values intentionally have no shape and are indexed as bytes.
+
 fn pointer_info_of_expr(
     e: &Expr,
     a: &Analyzer,
@@ -11193,8 +11050,8 @@ fn pointer_element_ctype(
     match rep {
         Rep::Adt(name) => format!("struct mak_{}", mangle_ident(name)),
         Rep::Str => "const char".into(),
-        // Untyped pointers have byte arithmetic because no pointee type is
-        // available to the compiler at this expression.
+
+
         _ => "uint8_t".into(),
     }
 }
@@ -11692,13 +11549,8 @@ fn cast_code(code: &str, from: &Rep, to: &Rep, a: &Analyzer) -> String {
         },
         (Rep::Adt(_), Rep::Unknown) => format!("(uintptr_t)({})", code),
         (Rep::Unknown, y) if y.is_integer() => format!("({})({})", y.ctype(&a.functions), code),
-        // Pointer-like -> float.  Reached when the whole-program optimizer
-        // has spliced an ADT-producing subexpression into a context whose
-        // declared result is a float (e.g. an inlined callee whose return
-        // type disagrees with the caller's).  Without a cast clang rejects
-        // the emitted C with
-        //   returning 'struct mak_<T> *' from a function with incompatible
-        //   result type 'double'
+
+
         (
             Rep::Adt(_)
             | Rep::Ptr
@@ -11996,9 +11848,6 @@ fn un_lir(op: UnOp) -> UnOpLir {
     }
 }
 
-// =========================================================================
-// Entry points
-// =========================================================================
 
 pub fn generate(program: &Program) -> String {
     let mut analyzer = Analyzer::new();
@@ -12669,9 +12518,8 @@ mod pointer_regressions {
 
     #[test]
     fn indexing_infers_pointer_representation_for_unknown_parameters() {
-        // The indexing operation alone must carry the pointer constraint. An
-        // unused pure call (such as `let _ = strlen fmt`) is not a reliable
-        // type hint because optimization may erase it before code generation.
+
+
         let c = generated(b"let read_byte fmt i = fmt[i]; read_byte \"x\" 0");
         assert!(
             c.contains("uint8_t *)(uintptr_t)(a0)"),
@@ -12776,8 +12624,8 @@ mod codegen_regressions {
 
     #[test]
     fn remainder_uses_integer_operands_when_shared_params_are_floats() {
-        // The first expression makes x's shared function representation float;
-        // `%` must still lower with integer semantics at this operation site.
+
+
         let c = generated(
             b"let rem = fn (x y) => { x + 0.5; x % y }; rem 17.5 5.0",
         );

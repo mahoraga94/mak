@@ -1,4 +1,3 @@
-
 use crate::ast::*;
 use crate::lexer::{Kind, Kw, Lexer, P, Span, Tok};
 
@@ -268,7 +267,7 @@ impl<'a> Parser<'a> {
     }
 
     fn decl_bring(&mut self) -> PResult<Decl> {
-        // Consume `bring`. The span is not needed by Decl::Bring.
+
         self.bump();
 
         let mut paths = Vec::new();
@@ -658,9 +657,7 @@ impl<'a> Parser<'a> {
             _ => return Err(self.err_expect("a foreign type atom")),
         };
 
-        // Accept repeated pointer stars (`i32*`, `i32**`, `u8***`).
-        // Preserve each pointer layer so codegen can determine the element
-        // type at every level of chained indexing.
+
         let mut ty = ForeignTy::Atom(atom);
 
         while self.eat_p(P::Star).is_some() {
@@ -674,10 +671,7 @@ impl<'a> Parser<'a> {
         self.expr_bp(0)
     }
 
-    /// Parse prefix operators before entering the binary/application layer.
-    ///
-    /// The operand is parsed with a binding power above `.` and every binary
-    /// operator, while implicit function application remains available.
+
     fn prefix_expr(&mut self) -> PResult<Expr> {
         let t = self.cur();
 
@@ -691,8 +685,7 @@ impl<'a> Parser<'a> {
         if let Some(op) = op {
             self.bump();
 
-            // Keep application inside the unary operand, but stop before
-            // the dot/composition layer and all binary operators.
+
             let e = self.expr_bp(10)?;
             let span = Span {
                 lo: t.span.lo,
@@ -715,15 +708,14 @@ impl<'a> Parser<'a> {
         let mut lhs = self.prefix_expr()?;
 
         loop {
-            // Postfix indexing binds more tightly than implicit application
-            // and every infix operator. Lower indexing to a reserved AST
-            // intrinsic so a new public AST node is not required.
+
+
             if matches!(self.cur().kind, Kind::P(P::LBrack)) {
                 lhs = self.index_suffix(lhs)?;
                 continue;
             }
 
-            // Preserve the existing empty-call syntax: f().
+
             if matches!(self.cur().kind, Kind::P(P::LParen))
                 && matches!(self.peek(1).kind, Kind::P(P::RParen))
             {
@@ -746,10 +738,8 @@ impl<'a> Parser<'a> {
             }
 
             if self.starts_atom() {
-                // Parse indexing on the argument first, so `f xs[i]`
-                // means `f (xs[i])`. Keep the intermediate in a local:
-                // nesting self.atom() inside self.index_suffix() would
-                // borrow self mutably twice in the same expression.
+
+
                 let atom = self.atom()?;
                 let arg = self.index_suffix(atom)?;
 
@@ -852,8 +842,7 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    /// Parse postfix indexing suffixes from an already parsed expression.
-    /// `base[i][j]` becomes `$mak.index($mak.index(base, i), j)`.
+
     fn index_suffix(&mut self, mut base: Expr) -> PResult<Expr> {
         while matches!(self.cur().kind, Kind::P(P::LBrack)) {
             let open = self.bump().span;

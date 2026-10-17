@@ -1,10 +1,8 @@
-
 use crate::ast::*;
 use crate::lexer::Span;
 use std::collections::{HashMap, HashSet};
 
-/// Internal names emitted by the parser for syntax that does not have
-/// its own AST node. These are compiler intrinsics, not user variables.
+
 const BUILTIN_INTRINSICS: &[&str] = &["$mak.index"];
 
 #[inline]
@@ -12,10 +10,7 @@ fn is_builtin_intrinsic(name: &str) -> bool {
     BUILTIN_INTRINSICS.contains(&name)
 }
 
-/// Enable semantic-analysis tracing by setting MAK_DEBUG_SEMA=1.
-///
-/// Tracing is disabled by default. Values such as 0, false, off, and no
-/// leave it disabled.
+
 fn sema_debug_enabled() -> bool {
     std::env::var("MAK_DEBUG_SEMA")
         .map(|value| {
@@ -104,16 +99,6 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
         }
     }
 
-    // =====================================================================
-    // PHASE 1: Reachability
-    //
-    // Remove unused top-level declarations while preserving the declarations
-    // referenced by the main expression and their dependencies.
-    //
-    // IMPORTANT:
-    // Parser-generated intrinsics such as $mak.index do not name declarations.
-    // They must not become roots in the declaration-reachability analysis.
-    // =====================================================================
 
     let mut used = HashSet::new();
     let mut top_level: HashMap<String, &Decl> = HashMap::new();
@@ -139,8 +124,8 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
     fn walk_expr_used(expr: &Expr, used: &mut HashSet<String>) {
         match &expr.kind {
             ExprKind::Var(name) => {
-                // Intrinsics are handled by the compiler and do not correspond
-                // to source-level declarations that can be retained or removed.
+
+
                 if !is_builtin_intrinsic(name) {
                     used.insert(name.clone());
                 }
@@ -201,8 +186,7 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
         sema_debug(debug, format!("initial reachable names: {names:?}"));
     }
 
-    // Follow dependencies of reachable top-level let bindings until no new
-    // names are discovered.
+
     let mut changed = true;
 
     while changed {
@@ -237,8 +221,7 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
                 || ctors.iter().any(|ctor| used.contains(&ctor.name))
         }
 
-        // Keep bring declarations, because they may affect how the source
-        // program is loaded or interpreted.
+
         Decl::Bring(_) => true,
     });
 
@@ -262,9 +245,6 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
         sema_debug(debug, format!("final reachable names: {names:?}"));
     }
 
-    // =====================================================================
-    // PHASE 2: Build the set of globally available source-level names.
-    // =====================================================================
 
     let mut globals = HashSet::new();
 
@@ -291,12 +271,6 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
         sema_debug(debug, format!("global names: {names:?}"));
     }
 
-    // =====================================================================
-    // PHASE 3: Scope checking
-    //
-    // Report truly undefined variables. Recognize compiler intrinsics as
-    // built-ins, without making arbitrary unknown names valid.
-    // =====================================================================
 
     fn check_expr(
         expr: &Expr,
@@ -361,7 +335,7 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
             }
 
             ExprKind::Let { name, value, body } => {
-                // A local let value cannot see the name being introduced.
+
                 check_expr(value, scope, globals, errors, debug);
 
                 scope.last_mut().unwrap().insert(name.clone());
@@ -411,8 +385,7 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
                 for stmt in stmts {
                     check_expr(stmt, scope, globals, errors, debug);
 
-                    // Block-local let declarations become visible to following
-                    // statements, not to their own initializers.
+
                     if let ExprKind::Let { name, .. } = &stmt.kind {
                         scope.last_mut().unwrap().insert(name.clone());
                     }
@@ -452,8 +425,7 @@ pub fn analyze(mut p: Program) -> Result<Program, Vec<SemaErr>> {
         }
     }
 
-    // Check top-level let expressions. External declarations contain type
-    // metadata rather than a MAK expression body, so they need no scope walk.
+
     for decl in &p.decls {
         if let Decl::Let { value, .. } = decl {
             let mut scope = vec![HashSet::new()];
