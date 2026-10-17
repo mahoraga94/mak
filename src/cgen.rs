@@ -3491,6 +3491,21 @@ impl<'a> Lowerer<'a> {
                 };
                 let lhs = cast_code(&lc, &lr, &rep, self.a);
                 let rhs = cast_code(&rc, &rr, &rep, self.a);
+                if matches!(&rep, Rep::I64) {
+                    let helper = match lir_op {
+                        BinOpLir::Add => Some("mak_ir_i64_add_wrap"),
+                        BinOpLir::Sub => Some("mak_ir_i64_sub_wrap"),
+                        BinOpLir::Mul => Some("mak_ir_i64_mul_wrap"),
+                        BinOpLir::Div => Some("mak_ir_i64_div_wrap"),
+                        BinOpLir::Rem => Some("mak_ir_i64_rem_wrap"),
+                        BinOpLir::Shl => Some("mak_ir_i64_shl_wrap"),
+                        BinOpLir::Shr => Some("mak_ir_i64_shr"),
+                        _ => None,
+                    };
+                    if let Some(helper) = helper {
+                        return Ok((format!("{}({}, {})", helper, lhs, rhs), rep));
+                    }
+                }
                 if matches!(lir_op, BinOpLir::Eq | BinOpLir::Ne)
                     && matches!(lr, Rep::Str)
                     && matches!(rr, Rep::Str)
@@ -3530,6 +3545,9 @@ impl<'a> Lowerer<'a> {
             ExprKind::Un { op, e } => {
                 let (c, r) = self.direct_ast_expr(e, env, current)?;
                 let (code, rep) = match op {
+                    UnOp::Neg if matches!(&r, Rep::I64) => {
+                        (format!("mak_ir_i64_neg_wrap((int64_t)({}))", c), r)
+                    }
                     UnOp::Neg => (format!("(-{})", c), r),
                     UnOp::Not => (format!("(!({}))", c), Rep::I32),
                     UnOp::BitNot => (format!("(~({}))", c), r),
@@ -5768,6 +5786,9 @@ impl<'a> CEmitter<'a> {
         }
         headers.insert("#include <stdio.h>".to_string());
         headers.insert("#include <stdlib.h>".to_string());
+        // Integer wrap helpers use memcpy to reinterpret 64-bit bit patterns
+        // without relying on implementation-defined unsigned-to-signed casts.
+        headers.insert("#include <string.h>".to_string());
         if self.a.needs_string
             || !self.a.constructors.is_empty()
             || self.plan.on(RtFeature::FoldEq)
@@ -5792,6 +5813,7 @@ impl<'a> CEmitter<'a> {
         }
         self.out.push('\n');
 
+        self.emit_integer_wrap_helpers();
         self.emit_types();
         if self.plan.on(RtFeature::Arena) {
             self.emit_arena_helper();
@@ -5818,6 +5840,22 @@ impl<'a> CEmitter<'a> {
         self.out.push('\n');
         self.emit_main(p, fs, entry);
         std::mem::take(&mut self.out)
+    }
+
+    fn emit_integer_wrap_helpers(&mut self) {
+        // MAK defines signed i64 arithmetic to wrap modulo 2^64.  C signed
+        // overflow is undefined, so do arithmetic in uint64_t and reinterpret
+        // the resulting bits with memcpy (not an out-of-range signed cast).
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_from_bits(uint64_t bits) {{ int64_t out; memcpy(&out, &bits, sizeof out); return out; }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_neg_wrap(int64_t a) {{ return mak_ir_i64_from_bits(UINT64_C(0) - (uint64_t)a); }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_add_wrap(int64_t a, int64_t b) {{ return mak_ir_i64_from_bits((uint64_t)a + (uint64_t)b); }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_sub_wrap(int64_t a, int64_t b) {{ return mak_ir_i64_from_bits((uint64_t)a - (uint64_t)b); }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_mul_wrap(int64_t a, int64_t b) {{ return mak_ir_i64_from_bits((uint64_t)a * (uint64_t)b); }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_div_wrap(int64_t a, int64_t b) {{ if (a == INT64_MIN && b == -1) return INT64_MIN; return a / b; }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_rem_wrap(int64_t a, int64_t b) {{ if (a == INT64_MIN && b == -1) return 0; return a % b; }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_shl_wrap(int64_t a, int64_t b) {{ return mak_ir_i64_from_bits((uint64_t)a << ((uint64_t)b & UINT64_C(63))); }}");
+        let _ = writeln!(self.out, "int64_t mak_ir_i64_shr(int64_t a, int64_t b) {{ uint64_t n = (uint64_t)b & UINT64_C(63); uint64_t bits; memcpy(&bits, &a, sizeof bits); if (n == 0) return a; return mak_ir_i64_from_bits((bits >> n) | (a < 0 ? (UINT64_MAX << (64 - n)) : UINT64_C(0))); }}");
+        self.out.push('\n');
     }
 
     fn emit_types(&mut self) {
@@ -8067,6 +8105,11 @@ impl<'a> CEmitter<'a> {
             let mut lowerer = Lowerer::new(self.a);
             let mut env = HashMap::new();
             let body = lowerer.lower_expr(&p.body, &mut env, None);
+            // Function bodies go through the LIR optimizer in the normal
+            // pipeline; optimize the top-level expression too, especially for
+            // wrapping-aware constant folding deferred by the AST optimizer.
+            let optimizer = Optimizer { a: self.a };
+            let (body, _) = optimizer.optimize_expr(body);
             self.emit_expr_stmt(&body, 1);
         }
         if self.plan.on(RtFeature::Arena) {
@@ -9148,9 +9191,11 @@ impl<'a> CEmitter<'a> {
                 rep,
             } => self.emit_bin(*op, left, right, rep, depth),
             LirExpr::Un { op, expr, rep } => {
-                let _ = rep;
                 let x = self.materialize_if_needed(expr, depth);
                 match op {
+                    UnOpLir::Neg if matches!(&rep, Rep::I64) => {
+                        format!("mak_ir_i64_neg_wrap((int64_t)({}))", x)
+                    }
                     UnOpLir::Neg => format!("(-{})", x),
                     UnOpLir::Not => format!("(!({}))", x),
                     UnOpLir::BitNot => format!("(~({}))", x),
@@ -9788,6 +9833,21 @@ impl<'a> CEmitter<'a> {
                 format!("({} != 0)", cmp)
             };
         }
+        if matches!(rep, Rep::I64) {
+            let helper = match op {
+                BinOpLir::Add => Some("mak_ir_i64_add_wrap"),
+                BinOpLir::Sub => Some("mak_ir_i64_sub_wrap"),
+                BinOpLir::Mul => Some("mak_ir_i64_mul_wrap"),
+                BinOpLir::Div => Some("mak_ir_i64_div_wrap"),
+                BinOpLir::Rem => Some("mak_ir_i64_rem_wrap"),
+                BinOpLir::Shl => Some("mak_ir_i64_shl_wrap"),
+                BinOpLir::Shr => Some("mak_ir_i64_shr"),
+                _ => None,
+            };
+            if let Some(helper) = helper {
+                return format!("{}({}, {})", helper, ls, rs);
+            }
+        }
         let opstr = match op {
             BinOpLir::Add => "+",
             BinOpLir::Sub => "-",
@@ -10304,36 +10364,59 @@ fn lir_size(e: &LirExpr) -> usize {
 
 fn fold_bin(op: BinOpLir, l: &LirExpr, r: &LirExpr, rep: Rep) -> Option<LirExpr> {
     match (l, r) {
+        (LirExpr::Int(a, _), LirExpr::Int(b, _)) if matches!(&rep, Rep::I64) => {
+            let a = (*a as u64) as i64;
+            let b = (*b as u64) as i64;
+            let v = match op {
+                BinOpLir::Add => a.wrapping_add(b) as i128,
+                BinOpLir::Sub => a.wrapping_sub(b) as i128,
+                BinOpLir::Mul => a.wrapping_mul(b) as i128,
+                BinOpLir::Div => {
+                    if b == 0 { return None; }
+                    if a == i64::MIN && b == -1 { i64::MIN as i128 } else { (a / b) as i128 }
+                }
+                BinOpLir::Rem => {
+                    if b == 0 { return None; }
+                    if a == i64::MIN && b == -1 { 0 } else { (a % b) as i128 }
+                }
+                BinOpLir::And => ((a as u64) & (b as u64)) as i64 as i128,
+                BinOpLir::Or => ((a as u64) | (b as u64)) as i64 as i128,
+                BinOpLir::Xor => ((a as u64) ^ (b as u64)) as i64 as i128,
+                BinOpLir::Shl => a.wrapping_shl((b as u32) & 63) as i128,
+                BinOpLir::Shr => a.wrapping_shr((b as u32) & 63) as i128,
+                BinOpLir::Eq => (a == b) as i128,
+                BinOpLir::Ne => (a != b) as i128,
+                BinOpLir::Lt => (a < b) as i128,
+                BinOpLir::Gt => (a > b) as i128,
+                BinOpLir::Le => (a <= b) as i128,
+                BinOpLir::Ge => (a >= b) as i128,
+                BinOpLir::LAnd => ((a != 0) && (b != 0)) as i128,
+                BinOpLir::LOr => ((a != 0) || (b != 0)) as i128,
+            };
+            Some(LirExpr::Int(v, rep))
+        }
         (LirExpr::Int(a, _), LirExpr::Int(b, _)) => {
             let v = match op {
                 BinOpLir::Add => a.checked_add(*b)?,
                 BinOpLir::Sub => a.checked_sub(*b)?,
                 BinOpLir::Mul => a.checked_mul(*b)?,
                 BinOpLir::Div => {
-                    if *b == 0 {
-                        return None;
-                    }
+                    if *b == 0 { return None; }
                     a.checked_div(*b)?
                 }
                 BinOpLir::Rem => {
-                    if *b == 0 {
-                        return None;
-                    }
+                    if *b == 0 { return None; }
                     a.checked_rem(*b)?
                 }
                 BinOpLir::And => a & b,
                 BinOpLir::Or => a | b,
                 BinOpLir::Xor => a ^ b,
                 BinOpLir::Shl => {
-                    if *b < 0 || *b > 127 {
-                        return None;
-                    }
+                    if *b < 0 || *b > 127 { return None; }
                     (*a).checked_shl(*b as u32)?
                 }
                 BinOpLir::Shr => {
-                    if *b < 0 || *b > 127 {
-                        return None;
-                    }
+                    if *b < 0 || *b > 127 { return None; }
                     (*a).checked_shr(*b as u32)?
                 }
                 BinOpLir::Eq => (*a == *b) as i128,
@@ -10368,6 +10451,10 @@ fn fold_un(op: UnOpLir, x: &LirExpr, rep: Rep) -> Option<LirExpr> {
     match x {
         LirExpr::Int(v, _) => {
             let n = match op {
+                UnOpLir::Neg if matches!(&rep, Rep::I64) => {
+                    (0u64.wrapping_sub(*v as u64) as i64) as i128
+                }
+                UnOpLir::BitNot if matches!(&rep, Rep::I64) => ((!(*v as u64)) as i64) as i128,
                 UnOpLir::Neg => v.checked_neg()?,
                 UnOpLir::Not => (*v == 0) as i128,
                 UnOpLir::BitNot => !*v,
@@ -11645,6 +11732,9 @@ fn c_uint_case(v: u64) -> String {
 }
 
 fn c_i128(v: i128) -> String {
+    if v == i64::MIN as i128 {
+        return "INT64_MIN".into();
+    }
     if v >= i64::MIN as i128 && v <= i64::MAX as i128 {
         format!("INT64_C({})", v)
     } else if v >= 0 {
@@ -12692,8 +12782,8 @@ mod codegen_regressions {
             b"let rem = fn (x y) => { x + 0.5; x % y }; rem 17.5 5.0",
         );
         assert!(
-            c.contains("% (int64_t)("),
-            "remainder operands should be cast to an integer type"
+            c.contains("mak_ir_i64_rem_wrap((int64_t)("),
+            "remainder should use the signed i64 helper with integer-cast operands"
         );
         assert!(
             !c.contains("% (double)("),
@@ -12735,6 +12825,24 @@ mod codegen_regressions {
     }
 
     #[test]
+    fn signed_i64_overflow_uses_defined_wrapping_helpers() {
+        let analyzer = Analyzer::new();
+        let mut emitter = CEmitter::new(&analyzer);
+        let code = emitter.emit_bin(
+            BinOpLir::Add,
+            &LirExpr::Var("a".into(), Rep::I64),
+            &LirExpr::Var("b".into(), Rep::I64),
+            &Rep::I64,
+            1,
+        );
+        assert_eq!(code, "mak_ir_i64_add_wrap(a, b)");
+
+        let c = generated(b"9223372036854775807 + 1");
+        assert!(c.contains("mak_ir_i64_add_wrap"));
+        assert!(!c.contains("(INT64_C(9223372036854775807) + INT64_C(1))"));
+    }
+
+    #[test]
     fn integer_remainder_emitter_casts_float_representations() {
         let analyzer = Analyzer::new();
         let mut emitter = CEmitter::new(&analyzer);
@@ -12745,6 +12853,6 @@ mod codegen_regressions {
             &Rep::I64,
             1,
         );
-        assert_eq!(code, "((int64_t)(a0) % (int64_t)(a1))");
+        assert_eq!(code, "mak_ir_i64_rem_wrap((int64_t)(a0), (int64_t)(a1))");
     }
 }

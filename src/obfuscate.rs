@@ -2,6 +2,7 @@ use crate::ast::*;
 use crate::lexer::Span;
 use std::collections::{HashMap, HashSet};
 
+
 /// Parser-generated names for syntax that has no dedicated AST variant.
 /// These are compiler intrinsics, not user-level references. Keep this list
 /// in sync with `sema.rs` and `parser.rs`.
@@ -3862,10 +3863,13 @@ fn recursive_fns(p: &Program) -> HashSet<String> {
         false
     }
 
-    let mut recursive = HashSet::new();
-    for name in names {
-        let mut seen = HashSet::new();
-        if reaches(&name, &name, &graph, &mut seen) {
+    // Spell out the owned types here to keep inference independent of the
+    // recursive helper's borrowed `str` parameters.
+    let mut recursive: HashSet<String> = HashSet::new();
+    for name in names.into_iter() {
+        let mut seen: HashSet<String> = HashSet::new();
+        let name_ref: &str = name.as_str();
+        if reaches(name_ref, name_ref, &graph, &mut seen) {
             recursive.insert(name);
         }
     }
@@ -4139,8 +4143,13 @@ fn simp_un(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     let inner = *inner;
 
     if let ExprKind::Int(n) = &inner.kind {
-        *changed = true;
-        return int(eval_un(op, *n).unwrap_or(*n));
+        // Only materialize a constant when its representation is preserved.
+        // In particular, -1 cannot be represented by ExprKind::Int(u64):
+        // encoding it as u64::MAX makes the lowerer infer Rep::U64.
+        if let Some(value) = eval_un(op, *n) {
+            *changed = true;
+            return int(value);
+        }
     }
 
     match op {
@@ -4322,7 +4331,7 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     let r = *r;
     let li = as_int(&l);
     let ri = as_int(&r);
-    use BinOp::*;
+    use crate::BinOp::*;
 
     if let (Some(a), Some(b)) = (li, ri) {
         if let Some(v) = eval_bin(op, a, b) {
@@ -4348,8 +4357,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(Add, (**x).clone(), int(a.wrapping_add(b)), sp);
+                    if ast_fold_add(a, b).is_some() {
+                        *changed = true;
+                        return bin(Add, (**x).clone(), int(a.wrapping_add(b)), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4359,8 +4370,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(Add, (**x).clone(), int(b.wrapping_sub(a)), sp);
+                    if ast_fold_sub(b, a).is_some() {
+                        *changed = true;
+                        return bin(Add, (**x).clone(), int(b.wrapping_sub(a)), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4436,13 +4449,17 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
                     && as_int(a).is_some()
                     && as_int(b).is_some()
                 {
-                    *changed = true;
-                    return bin(
-                        Add,
-                        bin(Add, (**x).clone(), (**y).clone(), sp),
-                        int(as_int(a).unwrap().wrapping_add(as_int(b).unwrap())),
-                        sp,
-                    );
+                    let ca = as_int(a).unwrap();
+                    let cb = as_int(b).unwrap();
+                    if let Some(c) = ast_fold_add(ca, cb) {
+                        *changed = true;
+                        return bin(
+                            Add,
+                            bin(Add, (**x).clone(), (**y).clone(), sp),
+                            int(c),
+                            sp,
+                        );
+                    }
                 }
             }
             if same(&l, &r) && is_pure(&l, pure) && is_int_expr(&l) {
@@ -4462,8 +4479,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(Add, (**x).clone(), int(a.wrapping_sub(b)), sp);
+                    if ast_fold_sub(a, b).is_some() {
+                        *changed = true;
+                        return bin(Add, (**x).clone(), int(a.wrapping_sub(b)), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4473,8 +4492,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(Sub, (**x).clone(), int(a.wrapping_add(b)), sp);
+                    if ast_fold_add(a, b).is_some() {
+                        *changed = true;
+                        return bin(Sub, (**x).clone(), int(a.wrapping_add(b)), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4685,8 +4706,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(Mul, (**x).clone(), int(a.wrapping_mul(b)), sp);
+                    if ast_fold_mul(a, b).is_some() {
+                        *changed = true;
+                        return bin(Mul, (**x).clone(), int(a.wrapping_mul(b)), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4696,8 +4719,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &r.kind
             {
                 if let (Some(a), Some(b)) = (li, as_int(a)) {
-                    *changed = true;
-                    return bin(Mul, int(a.wrapping_mul(b)), (**x).clone(), sp);
+                    if ast_fold_mul(a, b).is_some() {
+                        *changed = true;
+                        return bin(Mul, int(a.wrapping_mul(b)), (**x).clone(), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4729,13 +4754,15 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(c)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(
-                        Add,
-                        bin(Mul, (**x).clone(), int(c), sp),
-                        int(a.wrapping_mul(c)),
-                        sp,
-                    );
+                    if ast_fold_mul(a, c).is_some() {
+                        *changed = true;
+                        return bin(
+                            Add,
+                            bin(Mul, (**x).clone(), int(c), sp),
+                            int(a.wrapping_mul(c)),
+                            sp,
+                        );
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4745,13 +4772,15 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(c)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(
-                        Sub,
-                        bin(Mul, (**x).clone(), int(c), sp),
-                        int(a.wrapping_mul(c)),
-                        sp,
-                    );
+                    if ast_fold_mul(a, c).is_some() {
+                        *changed = true;
+                        return bin(
+                            Sub,
+                            bin(Mul, (**x).clone(), int(c), sp),
+                            int(a.wrapping_mul(c)),
+                            sp,
+                        );
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4761,13 +4790,15 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &r.kind
             {
                 if let (Some(c), Some(a)) = (li, as_int(a)) {
-                    *changed = true;
-                    return bin(
-                        Add,
-                        bin(Mul, int(c), (**x).clone(), sp),
-                        int(c.wrapping_mul(a)),
-                        sp,
-                    );
+                    if ast_fold_mul(c, a).is_some() {
+                        *changed = true;
+                        return bin(
+                            Add,
+                            bin(Mul, int(c), (**x).clone(), sp),
+                            int(c.wrapping_mul(a)),
+                            sp,
+                        );
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -4777,13 +4808,15 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &r.kind
             {
                 if let (Some(c), Some(a)) = (li, as_int(a)) {
-                    *changed = true;
-                    return bin(
-                        Sub,
-                        bin(Mul, int(c), (**x).clone(), sp),
-                        int(c.wrapping_mul(a)),
-                        sp,
-                    );
+                    if ast_fold_mul(c, a).is_some() {
+                        *changed = true;
+                        return bin(
+                            Sub,
+                            bin(Mul, int(c), (**x).clone(), sp),
+                            int(c.wrapping_mul(a)),
+                            sp,
+                        );
+                    }
                 }
             }
             if li.is_some() && ri.is_none() && is_pure(&l, pure) && is_pure(&r, pure) {
@@ -4792,13 +4825,9 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             }
         }
         Div => {
-            if let Some(c) = ri {
-                if c.is_power_of_two() && c > 1 {
-                    let sh = c.trailing_zeros() as u64;
-                    *changed = true;
-                    return bin(Shr, l, int(sh), sp);
-                }
-            }
+            // Do not rewrite signed integer division by powers of two into a
+            // right shift: division truncates toward zero, while signed right
+            // shift typically rounds negative values toward minus infinity.
             if ri == Some(1) {
                 *changed = true;
                 return l;
@@ -4809,12 +4838,8 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             }
         }
         Rem => {
-            if let Some(c) = ri {
-                if c.is_power_of_two() && c > 1 && is_pure(&l, pure) {
-                    *changed = true;
-                    return bin(And, l, int(c - 1), sp);
-                }
-            }
+            // `% power_of_two` is not generally equivalent to `& (n - 1)`
+            // for negative signed operands. Keep the typed operation intact.
             if ri == Some(1) && is_pure(&l, pure) {
                 *changed = true;
                 return int(0);
@@ -4852,8 +4877,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(And, (**x).clone(), int(a & b), sp);
+                    if let Some(value) = ast_fold_bitwise(And, a, b) {
+                        *changed = true;
+                        return bin(And, (**x).clone(), int(value), sp);
+                    }
                 }
             }
             if let ExprKind::Bin { op: Or, l: x, r: y } = &r.kind {
@@ -4894,8 +4921,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             {
                 if same(x1, x2) && is_pure(x1, pure) {
                     if let (Some(a), Some(b)) = (as_int(a), as_int(b)) {
-                        *changed = true;
-                        return bin(And, (**x1).clone(), int(a & b), sp);
+                        if let Some(value) = ast_fold_bitwise(And, a, b) {
+                            *changed = true;
+                            return bin(And, (**x1).clone(), int(value), sp);
+                        }
                     }
                 }
             }
@@ -4914,8 +4943,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             {
                 if same(x1, x2) && is_pure(x1, pure) {
                     if let (Some(a), Some(b)) = (as_int(a), as_int(b)) {
-                        *changed = true;
-                        return bin(Or, (**x1).clone(), int(a & b), sp);
+                        if let Some(value) = ast_fold_bitwise(And, a, b) {
+                            *changed = true;
+                            return bin(Or, (**x1).clone(), int(value), sp);
+                        }
                     }
                 }
             }
@@ -4998,8 +5029,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             }
             if let ExprKind::Bin { op: Or, l: x, r: a } = &l.kind {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(Or, (**x).clone(), int(a | b), sp);
+                    if let Some(value) = ast_fold_bitwise(Or, a, b) {
+                        *changed = true;
+                        return bin(Or, (**x).clone(), int(value), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -5039,8 +5072,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             {
                 if same(x1, x2) && is_pure(x1, pure) {
                     if let (Some(a), Some(b)) = (as_int(a), as_int(b)) {
-                        *changed = true;
-                        return bin(And, (**x1).clone(), int(a | b), sp);
+                        if let Some(value) = ast_fold_bitwise(Or, a, b) {
+                            *changed = true;
+                            return bin(And, (**x1).clone(), int(value), sp);
+                        }
                     }
                 }
             }
@@ -5077,8 +5112,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             {
                 if same(x1, x2) && is_pure(x1, pure) {
                     if let (Some(a), Some(b)) = (as_int(a), as_int(b)) {
-                        *changed = true;
-                        return bin(Or, (**x1).clone(), int(a | b), sp);
+                        if let Some(value) = ast_fold_bitwise(Or, a, b) {
+                            *changed = true;
+                            return bin(Or, (**x1).clone(), int(value), sp);
+                        }
                     }
                 }
             }
@@ -5145,8 +5182,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(a), ri) {
-                    *changed = true;
-                    return bin(Xor, (**x).clone(), int(a ^ b), sp);
+                    if let Some(value) = ast_fold_bitwise(Xor, a, b) {
+                        *changed = true;
+                        return bin(Xor, (**x).clone(), int(value), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -5186,8 +5225,10 @@ fn simp_bin(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             {
                 if same(x1, x2) && is_pure(x1, pure) {
                     if let (Some(a), Some(b)) = (as_int(a), as_int(b)) {
-                        *changed = true;
-                        return int(a ^ b);
+                        if let Some(value) = ast_fold_bitwise(Xor, a, b) {
+                            *changed = true;
+                            return int(value);
+                        }
                     }
                 }
             }
@@ -5974,9 +6015,20 @@ fn canon_assoc(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     if constants.len() < 2 {
         return e;
     }
+    // Keep AST-level reassociation within the representation the AST can
+    // express. Typed LIR can handle U64 constants after type inference.
+    if constants.iter().any(|v| *v > AST_INT_FOLD_MAX) {
+        return e;
+    }
     let folded = match op {
-        BinOp::Add => constants.into_iter().fold(0u64, |a, b| a.wrapping_add(b)),
-        BinOp::Mul => constants.into_iter().fold(1u64, |a, b| a.wrapping_mul(b)),
+        BinOp::Add => match constants.into_iter().try_fold(0u64, ast_fold_add) {
+            Some(v) => v,
+            None => return e,
+        },
+        BinOp::Mul => match constants.into_iter().try_fold(1u64, ast_fold_mul) {
+            Some(v) => v,
+            None => return e,
+        },
         BinOp::And => constants.into_iter().fold(u64::MAX, |a, b| a & b),
         BinOp::Or => constants.into_iter().fold(0u64, |a, b| a | b),
         BinOp::Xor => constants.into_iter().fold(0u64, |a, b| a ^ b),
@@ -6616,7 +6668,7 @@ fn mega_arith(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     let r = (**r).clone();
     let li = as_int(&l);
     let ri = as_int(&r);
-    use BinOp::*;
+    use crate::BinOp::*;
     match op {
         Add => {
             if let ExprKind::Un {
@@ -6667,8 +6719,10 @@ fn mega_arith(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             {
                 if let Some(a) = as_int(y) {
                     if let Some(b) = ri {
-                        *changed = true;
-                        return bin(Add, (**x).clone(), int(a.wrapping_add(b)), sp);
+                        if ast_fold_add(a, b).is_some() {
+                            *changed = true;
+                            return bin(Add, (**x).clone(), int(a.wrapping_add(b)), sp);
+                        }
                     }
                 }
             }
@@ -6680,8 +6734,10 @@ fn mega_arith(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             {
                 if let Some(a) = as_int(y) {
                     if let Some(b) = li {
-                        *changed = true;
-                        return bin(Add, (**x).clone(), int(a.wrapping_add(b)), sp);
+                        if ast_fold_add(a, b).is_some() {
+                            *changed = true;
+                            return bin(Add, (**x).clone(), int(a.wrapping_add(b)), sp);
+                        }
                     }
                 }
             }
@@ -6772,8 +6828,10 @@ fn mega_arith(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(y), ri) {
-                    *changed = true;
-                    return bin(Mul, (**x).clone(), int(a.wrapping_mul(b)), sp);
+                    if ast_fold_mul(a, b).is_some() {
+                        *changed = true;
+                        return bin(Mul, (**x).clone(), int(a.wrapping_mul(b)), sp);
+                    }
                 }
             }
             if let ExprKind::Bin {
@@ -6783,8 +6841,10 @@ fn mega_arith(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &r.kind
             {
                 if let (Some(a), Some(b)) = (as_int(y), li) {
-                    *changed = true;
-                    return bin(Mul, (**x).clone(), int(a.wrapping_mul(b)), sp);
+                    if ast_fold_mul(a, b).is_some() {
+                        *changed = true;
+                        return bin(Mul, (**x).clone(), int(a.wrapping_mul(b)), sp);
+                    }
                 }
             }
         }
@@ -6800,9 +6860,11 @@ fn mega_arith(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
             } = &l.kind
             {
                 if let (Some(a), Some(b)) = (as_int(c1), ri) {
-                    if a != 0 && b != 0 && a.checked_mul(b).is_some() {
-                        *changed = true;
-                        return bin(Div, (**x).clone(), int(a.wrapping_mul(b)), sp);
+                    if a != 0 && b != 0 {
+                        if let Some(product) = ast_fold_mul(a, b) {
+                            *changed = true;
+                            return bin(Div, (**x).clone(), int(product), sp);
+                        }
                     }
                 }
             }
@@ -6840,7 +6902,7 @@ fn mega_bits(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     let r = (**r).clone();
     let li = as_int(&l);
     let ri = as_int(&r);
-    use BinOp::*;
+    use crate::BinOp::*;
     match op {
         And => {
             if ri == Some(0) {
@@ -6917,8 +6979,10 @@ fn mega_bits(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
                 }
             }
             if let (Some(a), Some(b)) = (li, ri) {
-                *changed = true;
-                return int(a & b);
+                if let Some(value) = ast_fold_bitwise(And, a, b) {
+                    *changed = true;
+                    return int(value);
+                }
             }
         }
         Or => {
@@ -6965,8 +7029,10 @@ fn mega_bits(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
                 }
             }
             if let (Some(a), Some(b)) = (li, ri) {
-                *changed = true;
-                return int(a | b);
+                if let Some(value) = ast_fold_bitwise(Or, a, b) {
+                    *changed = true;
+                    return int(value);
+                }
             }
         }
         Xor => {
@@ -7064,8 +7130,10 @@ fn mega_bits(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
                 }
             }
             if let (Some(a), Some(b)) = (li, ri) {
-                *changed = true;
-                return int(a ^ b);
+                if a <= AST_INT_FOLD_MAX && b <= AST_INT_FOLD_MAX {
+                    *changed = true;
+                    return int(a ^ b);
+                }
             }
         }
         Shl | Shr => {
@@ -7087,9 +7155,9 @@ fn mega_bits(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
                 }
             }
             if let (Some(a), Some(b)) = (li, ri) {
-                if b & 63 < 64 {
+                if let Some(value) = eval_bin(*op, a, b) {
                     *changed = true;
-                    return int(eval_bin(*op, a, b).unwrap_or(a));
+                    return int(value);
                 }
             }
         }
@@ -7107,7 +7175,7 @@ fn mega_logic(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     let r = (**r).clone();
     let li = as_int(&l);
     let ri = as_int(&r);
-    use BinOp::*;
+    use crate::BinOp::*;
     match op {
         LAnd => {
             if li == Some(0) {
@@ -7167,12 +7235,14 @@ fn mega_cmp(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     let r = (**r).clone();
     let li = as_int(&l);
     let ri = as_int(&r);
-    use BinOp::*;
+    use crate::BinOp::*;
     match op {
         Eq | Ne | Lt | Gt | Le | Ge => {
             if let (Some(a), Some(b)) = (li, ri) {
-                *changed = true;
-                return int(eval_bin(*op, a, b).unwrap_or(0));
+                if let Some(value) = eval_bin(*op, a, b) {
+                    *changed = true;
+                    return int(value);
+                }
             }
             if same(&l, &r) && is_pure(&l, pure) {
                 *changed = true;
@@ -8735,6 +8805,56 @@ fn int(n: u64) -> Expr {
     }
 }
 
+// AST integer literals store only a u64 bit pattern; they do not carry a
+// signedness/representation tag. Consequently, AST-level arithmetic folding
+// must not encode a negative signed result as a large u64 literal. Typed LIR
+// optimization runs later and can safely fold operations once their Rep is
+// known. Until then, only fold arithmetic whose operands and result are
+// representable as non-negative i64 values.
+const AST_INT_FOLD_MAX: u64 = i64::MAX as u64;
+
+#[inline]
+fn ast_nonnegative_int(n: Option<u64>) -> Option<u64> {
+    n.filter(|v| *v <= AST_INT_FOLD_MAX)
+}
+
+#[inline]
+fn ast_fold_add(a: u64, b: u64) -> Option<u64> {
+    if a > AST_INT_FOLD_MAX || b > AST_INT_FOLD_MAX {
+        return None;
+    }
+    ast_nonnegative_int(a.checked_add(b))
+}
+
+#[inline]
+fn ast_fold_sub(a: u64, b: u64) -> Option<u64> {
+    if a > AST_INT_FOLD_MAX || b > AST_INT_FOLD_MAX {
+        return None;
+    }
+    ast_nonnegative_int(a.checked_sub(b))
+}
+
+#[inline]
+fn ast_fold_mul(a: u64, b: u64) -> Option<u64> {
+    if a > AST_INT_FOLD_MAX || b > AST_INT_FOLD_MAX {
+        return None;
+    }
+    ast_nonnegative_int(a.checked_mul(b))
+}
+
+#[inline]
+fn ast_fold_bitwise(op: BinOp, a: u64, b: u64) -> Option<u64> {
+    if a > AST_INT_FOLD_MAX || b > AST_INT_FOLD_MAX {
+        return None;
+    }
+    match op {
+        BinOp::And => Some(a & b),
+        BinOp::Or => Some(a | b),
+        BinOp::Xor => Some(a ^ b),
+        _ => None,
+    }
+}
+
 fn as_int(e: &Expr) -> Option<u64> {
     match &e.kind {
         ExprKind::Int(n) => Some(*n),
@@ -8784,47 +8904,56 @@ fn is_int_expr(e: &Expr) -> bool {
 }
 
 fn eval_bin(op: BinOp, a: u64, b: u64) -> Option<u64> {
-    use BinOp::*;
-    Some(match op {
-        Add => a.wrapping_add(b),
-        Sub => a.wrapping_sub(b),
-        Mul => a.wrapping_mul(b),
+    use crate::BinOp::*;
+
+    // Comparisons and truth tests preserve their meaning for all literal
+    // values. Arithmetic/bitwise operations are folded here only when the
+    // AST representation can express the result as a positive signed value.
+    // Larger/U64 operations are deferred to typed LIR optimization.
+    match op {
+        Eq => Some((a == b) as u64),
+        Ne => Some((a != b) as u64),
+        Lt => Some((a < b) as u64),
+        Gt => Some((a > b) as u64),
+        Le => Some((a <= b) as u64),
+        Ge => Some((a >= b) as u64),
+        LAnd => Some(((a != 0) && (b != 0)) as u64),
+        LOr => Some(((a != 0) || (b != 0)) as u64),
+        _ if a > AST_INT_FOLD_MAX || b > AST_INT_FOLD_MAX => None,
+        Add => ast_fold_add(a, b),
+        Sub => ast_fold_sub(a, b),
+        Mul => ast_fold_mul(a, b),
         Div => {
-            if b == 0 {
-                return None;
-            } else {
-                a / b
-            }
+            if b == 0 { None } else { Some(a / b) }
         }
         Rem => {
-            if b == 0 {
-                return None;
-            } else {
-                a % b
-            }
+            if b == 0 { None } else { Some(a % b) }
         }
-        And => a & b,
-        Or => a | b,
-        Xor => a ^ b,
-        Shl => a << (b & 63),
-        Shr => a >> (b & 63),
-        Eq => (a == b) as u64,
-        Ne => (a != b) as u64,
-        Lt => (a < b) as u64,
-        Gt => (a > b) as u64,
-        Le => (a <= b) as u64,
-        Ge => (a >= b) as u64,
-        LAnd => ((a != 0) && (b != 0)) as u64,
-        LOr => ((a != 0) || (b != 0)) as u64,
-    })
+        And => Some(a & b),
+        Or => Some(a | b),
+        Xor => Some(a ^ b),
+        Shl => {
+            let shift = (b & 63) as u32;
+            if shift >= 63 || a > (AST_INT_FOLD_MAX >> shift) {
+                None
+            } else {
+                Some(a << shift)
+            }
+        },
+        Shr => Some(a >> (b & 63)),
+    }
 }
 
 fn eval_un(op: UnOp, n: u64) -> Option<u64> {
-    Some(match op {
-        UnOp::Neg => n.wrapping_neg(),
-        UnOp::Not => (n == 0) as u64,
-        UnOp::BitNot => !n,
-    })
+    match op {
+        // Negating a nonzero unsigned AST literal produces a two's-complement
+        // bit pattern, not a signed AST constant. Preserve the unary node.
+        UnOp::Neg => (n == 0).then_some(0),
+        UnOp::Not => Some((n == 0) as u64),
+        // Bitwise-not commonly sets the sign bit. Let typed LIR folding handle
+        // it after the integer representation is known.
+        UnOp::BitNot => None,
+    }
 }
 
 fn size(e: &Expr) -> usize {
@@ -9286,6 +9415,119 @@ mod pointer_optimization_regressions {
     }
 
     #[test]
+    fn unary_negation_does_not_turn_signed_negative_into_u64_literal() {
+        let mut changed = false;
+        let expr = parse_expr(b"-1");
+        let folded = simp_un(expr, &HashSet::new(), &mut changed);
+        assert!(
+            matches!(folded.kind, ExprKind::Un { op: UnOp::Neg, .. }),
+            "-1 must remain a unary signed operation in the untyped AST"
+        );
+        assert!(!changed, "unsafe signedness-changing fold must be skipped");
+        assert_eq!(eval_un(UnOp::Neg, 1), None);
+    }
+
+    #[test]
+    fn subtraction_underflow_is_not_folded_into_unsigned_bit_pattern() {
+        assert_eq!(eval_bin(BinOp::Sub, 0, 1), None);
+        assert_eq!(eval_bin(BinOp::Sub, 1, 1), Some(0));
+
+        let mut changed = false;
+        let expr = parse_expr(b"0-1");
+        let folded = simp_bin(expr, &HashSet::new(), &mut changed);
+        assert!(
+            matches!(folded.kind, ExprKind::Bin { op: BinOp::Sub, .. }),
+            "0-1 must not become Int(u64::MAX)"
+        );
+        assert!(!changed);
+    }
+
+    #[test]
+    fn minus_one_minus_one_keeps_negative_semantics_until_typed_lowering() {
+        let mut changed = false;
+        let expr = parse_expr(b"-1-1");
+        let folded = simp_bin(expr, &HashSet::new(), &mut changed);
+        let ExprKind::Bin { op: BinOp::Sub, l, r } = folded.kind else {
+            panic!("-1-1 must remain an arithmetic expression until typed lowering");
+        };
+        assert!(matches!(l.kind, ExprKind::Un { op: UnOp::Neg, .. }));
+        assert!(matches!(r.kind, ExprKind::Int(1)));
+    }
+
+    #[test]
+    fn negated_folded_sum_stays_signed() {
+        let mut changed = false;
+        let expr = parse_expr(b"-(1+1)");
+        let ExprKind::Un { op: UnOp::Neg, e } = expr.kind else {
+            panic!("expected parsed unary minus");
+        };
+        let folded_inner = simp_bin(*e, &HashSet::new(), &mut changed);
+        assert!(matches!(&folded_inner.kind, ExprKind::Int(2)));
+        let negated = Expr {
+            span: NULL_SPAN,
+            kind: ExprKind::Un { op: UnOp::Neg, e: Box::new(folded_inner) },
+        };
+        let result = simp_un(negated, &HashSet::new(), &mut changed);
+        assert!(matches!(result.kind, ExprKind::Un { op: UnOp::Neg, .. }));
+    }
+
+    #[test]
+    fn signed_division_and_remainder_are_not_rewritten_as_shift_or_mask() {
+        let pure = HashSet::new();
+        let mut changed = false;
+
+        let div = simp_bin(parse_expr(b"-3/2"), &pure, &mut changed);
+        assert!(matches!(div.kind, ExprKind::Bin { op: BinOp::Div, .. }));
+
+        changed = false;
+        let rem = simp_bin(parse_expr(b"-3%2"), &pure, &mut changed);
+        assert!(matches!(rem.kind, ExprKind::Bin { op: BinOp::Rem, .. }));
+    }
+
+    #[test]
+    fn double_negation_still_simplifies_without_unsigned_wraparound() {
+        let expr = parse_expr(b"--1");
+        let mut changed = false;
+        let result = mega_un(expr, &HashSet::new(), &mut changed);
+        assert!(changed);
+        assert!(matches!(result.kind, ExprKind::Int(1)));
+    }
+
+    #[test]
+    fn optimizer_pass_does_not_materialize_negative_results_as_large_u64() {
+        for source in [
+            &b"-1"[..],
+            &b"0-1"[..],
+            &b"-1-1"[..],
+            &b"-(1+1)"[..],
+            &b"--1"[..],
+        ] {
+            let program = Parser::parse(source).expect("regression program should parse");
+            let mut changed = false;
+            let optimized = mega_opt(program, &HashSet::new(), &mut changed);
+            let mut generated_unsigned_negative = false;
+            walk(&optimized.body, &mut |expr| {
+                if let ExprKind::Int(value) = &expr.kind {
+                    if *value > AST_INT_FOLD_MAX {
+                        generated_unsigned_negative = true;
+                    }
+                }
+            });
+            assert!(
+                !generated_unsigned_negative,
+                "optimizer must not invent a high-bit u64 literal for signed expression {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn overflowing_ast_arithmetic_is_deferred_to_typed_lir() {
+        assert_eq!(ast_fold_add(i64::MAX as u64, 1), None);
+        assert_eq!(ast_fold_mul(i64::MAX as u64, 2), None);
+        assert_eq!(ast_fold_sub(0, 1), None);
+    }
+
+    #[test]
     fn mutable_external_global_is_not_considered_pure() {
         let name = "mutable_global";
         let mut purity = HashSet::new();
@@ -9297,3 +9539,4 @@ mod pointer_optimization_regressions {
         assert!(!is_pure(&expression, &purity));
     }
 }
+
