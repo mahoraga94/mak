@@ -463,7 +463,6 @@ enum MemorySiteKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemoryStrategy {
-    Stack,
     Arena,
     Heap,
 }
@@ -481,7 +480,7 @@ struct MemoryPlan {
     estimated_stack_bytes: usize,
     estimated_arena_bytes: usize,
     estimated_heap_bytes: usize,
-    stack_safe_functions: HashSet<usize>,
+    stack_local_lets: HashMap<(Option<usize>, String), Rep>,
     force_heap_unknown: bool,
 }
 
@@ -527,11 +526,12 @@ impl MemoryPlan {
         plan.force_heap_unknown = !converged;
 
         for f in fs {
-
-
-            if !lir_has_self_tail_call(&f.body, f.info.id) {
-                plan.stack_safe_functions.insert(f.info.id);
-            }
+            memory_collect_stack_local_lets(
+                &f.body,
+                Some(f.info.id),
+                a,
+                &mut plan.stack_local_lets,
+            );
         }
 
         for f in fs {
@@ -550,11 +550,22 @@ impl MemoryPlan {
             let entry = find_structural_entry(p, &a.function_by_source);
             if entry.is_none() {
                 let body = lowerer.lower_expr(&p.body, &mut env, None);
+                memory_collect_stack_local_lets(&body, None, a, &mut plan.stack_local_lets);
                 plan.lir_nodes += memory_lir_nodes(&body);
                 let mut sites = Vec::<(MemorySiteKind, Rep, Option<usize>)>::new();
                 memory_collect_alloc_sites(&body, None, &mut sites);
                 for (kind, rep, fid) in sites {
                     plan.account_site(a, kind, &rep, fid);
+                }
+            }
+        }
+
+        if !plan.force_heap_unknown {
+            plan.stack_sites = plan.stack_local_lets.len();
+            for rep in plan.stack_local_lets.values() {
+                if let Rep::Adt(name) = rep {
+                    let (bytes, _) = adt_object_layout(a, name);
+                    plan.estimated_stack_bytes = plan.estimated_stack_bytes.saturating_add(bytes);
                 }
             }
         }
@@ -573,10 +584,6 @@ impl MemoryPlan {
         let strategy = self.strategy(kind, fid, bytes);
         self.allocation_sites += 1;
         match strategy {
-            MemoryStrategy::Stack => {
-                self.stack_sites += 1;
-                self.estimated_stack_bytes = self.estimated_stack_bytes.saturating_add(bytes);
-            }
             MemoryStrategy::Arena => {
                 self.arena_sites += 1;
                 self.estimated_arena_bytes = self.estimated_arena_bytes.saturating_add(bytes);
@@ -619,12 +626,7 @@ impl MemoryPlan {
             return MemoryStrategy::Arena;
         }
 
-        if let Some(id) = fid {
-            if self.stack_safe_functions.contains(&id) && bytes <= Self::STACK_OBJECT_LIMIT {
-                return MemoryStrategy::Stack;
-            }
-        }
-
+        let _ = fid;
         MemoryStrategy::Arena
     }
 
@@ -763,6 +765,105 @@ fn memory_collect_alloc_sites(e: &LirExpr, fid: Option<usize>, out: &mut Vec<(Me
         LirExpr::Un { expr, .. } => memory_collect_alloc_sites(expr, fid, out),
         LirExpr::RawAst(_, rep, _) => { if rep_is_adt(rep) { out.push((MemorySiteKind::DirectAst, rep.clone(), fid)); } }
         LirExpr::Unit | LirExpr::Int(..) | LirExpr::Float(..) | LirExpr::Str(_) | LirExpr::Var(..) | LirExpr::FnRef(_) | LirExpr::DirectC { .. } | LirExpr::Fallback => {}
+    }
+}
+
+fn memory_local_let_uses_are_non_escaping(e: &LirExpr, code: &str) -> bool {
+    fn walk(e: &LirExpr, code: &str, read_only: bool) -> bool {
+        match e {
+            LirExpr::Var(name, _) => name != code || read_only,
+            LirExpr::Field { base, .. } => walk(base, code, true),
+            LirExpr::Case { scrut, arms, .. } => {
+                walk(scrut, code, true)
+                    && arms.iter().all(|arm| {
+                        !matches!(&arm.pat, LirPat::Bind { .. })
+                            && walk(&arm.body, code, false)
+                    })
+            }
+            LirExpr::Call { target, args, .. } => {
+                let target_ok = match target {
+                    CallTarget::Indirect(x) => walk(x, code, false),
+                    CallTarget::Function(_) | CallTarget::External(_) => true,
+                };
+                target_ok && args.iter().all(|x| walk(x, code, false))
+            }
+            LirExpr::Construct { args, .. }
+            | LirExpr::RuntimeCall { args, .. }
+            | LirExpr::RuntimeConstruct { args, .. } => {
+                args.iter().all(|x| walk(x, code, false))
+            }
+            LirExpr::Let { value, body, .. } => {
+                walk(value, code, false) && walk(body, code, false)
+            }
+            LirExpr::Block { stmts, tail } => {
+                stmts.iter().all(|x| walk(x, code, false)) && walk(tail, code, false)
+            }
+            LirExpr::Bin { left, right, .. } => {
+                walk(left, code, false) && walk(right, code, false)
+            }
+            LirExpr::Un { expr, .. } => walk(expr, code, false),
+            LirExpr::RawAst(..) | LirExpr::DirectC { .. } | LirExpr::Fallback => false,
+            LirExpr::Unit
+            | LirExpr::Int(..)
+            | LirExpr::Float(..)
+            | LirExpr::Str(_)
+            | LirExpr::FnRef(_) => true,
+        }
+    }
+    walk(e, code, false)
+}
+
+fn memory_collect_stack_local_lets(
+    e: &LirExpr,
+    fid: Option<usize>,
+    a: &Analyzer,
+    out: &mut HashMap<(Option<usize>, String), Rep>,
+) {
+    match e {
+        LirExpr::Let { code, rep, value, body } => {
+            if let Rep::Adt(_) = rep {
+                if memory_local_let_uses_are_non_escaping(body, code) {
+                    let bytes = match rep {
+                        Rep::Adt(name) => adt_object_layout(a, name).0,
+                        _ => usize::MAX,
+                    };
+                    if bytes <= MemoryPlan::STACK_OBJECT_LIMIT {
+                        out.insert((fid, code.clone()), rep.clone());
+                    }
+                }
+            }
+            memory_collect_stack_local_lets(value, fid, a, out);
+            memory_collect_stack_local_lets(body, fid, a, out);
+        }
+        LirExpr::Call { target, args, .. } => {
+            if let CallTarget::Indirect(x) = target {
+                memory_collect_stack_local_lets(x, fid, a, out);
+            }
+            for x in args { memory_collect_stack_local_lets(x, fid, a, out); }
+        }
+        LirExpr::Construct { args, .. }
+        | LirExpr::RuntimeCall { args, .. }
+        | LirExpr::RuntimeConstruct { args, .. } => {
+            for x in args { memory_collect_stack_local_lets(x, fid, a, out); }
+        }
+        LirExpr::Field { base, .. } | LirExpr::Un { expr: base, .. } => {
+            memory_collect_stack_local_lets(base, fid, a, out);
+        }
+        LirExpr::Block { stmts, tail } => {
+            for x in stmts { memory_collect_stack_local_lets(x, fid, a, out); }
+            memory_collect_stack_local_lets(tail, fid, a, out);
+        }
+        LirExpr::Case { scrut, arms, .. } => {
+            memory_collect_stack_local_lets(scrut, fid, a, out);
+            for arm in arms { memory_collect_stack_local_lets(&arm.body, fid, a, out); }
+        }
+        LirExpr::Bin { left, right, .. } => {
+            memory_collect_stack_local_lets(left, fid, a, out);
+            memory_collect_stack_local_lets(right, fid, a, out);
+        }
+        LirExpr::Unit | LirExpr::Int(..) | LirExpr::Float(..) | LirExpr::Str(_)
+        | LirExpr::Var(..) | LirExpr::FnRef(_) | LirExpr::RawAst(..)
+        | LirExpr::DirectC { .. } | LirExpr::Fallback => {}
     }
 }
 
@@ -5816,7 +5917,10 @@ impl<'a> CEmitter<'a> {
                     let _ = writeln!(self.out, "    union {{");
 
 
-                    for c in &self.a.constructors {
+                    // A union belongs to exactly one ADT. Including constructors
+                    // from unrelated types silently inflates layouts and can make
+                    // checked copies/allocations unnecessarily expensive.
+                    for c in &ctors {
                         if c.arity == 0 {
                             continue;
                         }
@@ -7737,7 +7841,7 @@ impl<'a> CEmitter<'a> {
             );
             let _ = writeln!(
                 self.out,
-                "    const struct mak_rt_ctor_desc *best=NULL; int best_score=-1,ties=0; for(size_t i=0;i<mak_rt_ctor_count;i++) {{ const struct mak_rt_ctor_desc *d=&mak_rt_ctors[i]; if(d->arity!=n) continue; int score=0; if(!strcmp(query,d->name))score+=1000; else if(mak_rt_fold_eq(query,d->name))score+=800; else if(mak_rt_canon_eq(query,d->name))score+=650; if(type_hint && !strcmp(type_hint,d->type)) score+=500; for(size_t j=0;j<n;j++) if(mak_rt_kind_compatible(kinds[j],d->kinds[j])) score+=(kinds[j]==d->kinds[j]?20:3); if(score>best_score) {{best=d;best_score=score;ties=0;}} else if(score==best_score) ++ties; }}"
+                "    const struct mak_rt_ctor_desc *best=NULL; int best_score=-1,ties=0; for(size_t i=0;i<mak_rt_ctor_count;i++) {{ const struct mak_rt_ctor_desc *d=&mak_rt_ctors[i]; if(d->arity!=n) continue; if(type_hint && strcmp(type_hint,d->type)!=0) continue; int score=0; if(!strcmp(query,d->name))score+=1000; else if(mak_rt_fold_eq(query,d->name))score+=800; else if(mak_rt_canon_eq(query,d->name))score+=650; for(size_t j=0;j<n;j++) if(mak_rt_kind_compatible(kinds[j],d->kinds[j])) score+=(kinds[j]==d->kinds[j]?20:3); if(score>best_score) {{best=d;best_score=score;ties=0;}} else if(score==best_score) ++ties; }}"
             );
             let _ = writeln!(
                 self.out,
@@ -7745,7 +7849,7 @@ impl<'a> CEmitter<'a> {
             );
             let _ = writeln!(
                 self.out,
-                "    if(ties>1) {{ mak_ir_recover(\"runtime constructor tie\"); }}"
+                "    if(ties>1) {{ mak_ir_recover(\"ambiguous runtime constructor\"); return (uintptr_t)0; }}"
             );
             let _ = writeln!(
                 self.out,
@@ -8238,29 +8342,42 @@ impl<'a> CEmitter<'a> {
 
             let storage = self.fresh_temp("letobj");
             let ty = adt_struct_type(rep);
-            let strategy = self.emit_adt_temp_alloc(
-                &storage,
-                rep,
-                depth,
-                MemorySiteKind::Construct,
-                "ADT local allocation failed",
-            );
-            if matches!(strategy, MemoryStrategy::Stack) {
-                self.emit_default_into(&storage, rep, depth);
-                self.emit_into(value, &storage, rep, depth);
+            let stack_safe = self
+                .memory
+                .stack_local_lets
+                .contains_key(&(self.current_function, code.to_string()))
+                && !self.memory.force_heap_unknown
+                && match rep {
+                    Rep::Adt(name) => adt_object_layout(self.a, name).0 <= MemoryPlan::STACK_OBJECT_LIMIT,
+                    _ => false,
+                };
+            if stack_safe {
+                let _ = writeln!(self.out, "{}{} {};", indent(depth), ty, storage);
+                let storage_ref = format!("&{}", storage);
+                self.emit_default_into(&storage_ref, rep, depth);
+                self.emit_into(value, &storage_ref, rep, depth);
+                let _ = writeln!(
+                    self.out,
+                    "{}{} * {} = &{};",
+                    indent(depth), ty, code, storage
+                );
             } else {
+                let strategy = self.emit_adt_temp_alloc(
+                    &storage,
+                    rep,
+                    depth,
+                    MemorySiteKind::Construct,
+                    "ADT local allocation failed",
+                );
                 self.emit_default_into(&storage, rep, depth + 1);
                 self.emit_into(value, &storage, rep, depth + 1);
                 self.emit_adt_temp_close(strategy, depth);
+                let _ = writeln!(
+                    self.out,
+                    "{}{} * {} = {};",
+                    indent(depth), ty, code, storage
+                );
             }
-            let _ = writeln!(
-                self.out,
-                "{}{} * {} = {};",
-                indent(depth),
-                ty,
-                code,
-                storage
-            );
             return;
         }
         let c = self.emit_value(value, depth);
@@ -8852,13 +8969,6 @@ impl<'a> CEmitter<'a> {
         };
         let ty = adt_struct_type(rep);
         match strategy {
-            MemoryStrategy::Stack => {
-                let _ = writeln!(
-                    self.out,
-                    "{}{} *{} = ({} *)__builtin_alloca(sizeof({}));",
-                    indent(depth), ty, storage, ty, ty
-                );
-            }
             MemoryStrategy::Heap => {
                 let _ = writeln!(
                     self.out,
@@ -8874,28 +8984,24 @@ impl<'a> CEmitter<'a> {
                 );
             }
         }
-        if !matches!(strategy, MemoryStrategy::Stack) {
-            let fallback = default_value_expr(rep, self.a);
-            let _ = writeln!(self.out, "{}if (!{}) {{", indent(depth), storage);
-            let _ = writeln!(
-                self.out,
-                "{}mak_ir_recover(\"{}\");",
-                indent(depth + 1), reason
-            );
-            let _ = writeln!(
-                self.out,
-                "{}{} = {};",
-                indent(depth + 1), storage, fallback
-            );
-            let _ = writeln!(self.out, "{} }} else {{", indent(depth));
-        }
+        let fallback = default_value_expr(rep, self.a);
+        let _ = writeln!(self.out, "{}if (!{}) {{", indent(depth), storage);
+        let _ = writeln!(
+            self.out,
+            "{}mak_ir_recover(\"{}\");",
+            indent(depth + 1), reason
+        );
+        let _ = writeln!(
+            self.out,
+            "{}{} = {};",
+            indent(depth + 1), storage, fallback
+        );
+        let _ = writeln!(self.out, "{} }} else {{", indent(depth));
         strategy
     }
 
-    fn emit_adt_temp_close(&mut self, strategy: MemoryStrategy, depth: usize) {
-        if !matches!(strategy, MemoryStrategy::Stack) {
-            let _ = writeln!(self.out, "{}}}", indent(depth));
-        }
+    fn emit_adt_temp_close(&mut self, _strategy: MemoryStrategy, depth: usize) {
+        let _ = writeln!(self.out, "{}}}", indent(depth));
     }
 
     fn emit_value(&mut self, e: &LirExpr, depth: usize) -> String {
@@ -9525,7 +9631,11 @@ impl<'a> CEmitter<'a> {
                     } else {
                         self.emit_runtime_type_recovery_into(dest, dest_rep, depth, "runtime constructor result used in non-ADT destination");
                     }
-                    let _ = writeln!(self.out, "{}mak_ir_heap_free((void *){});", indent(depth), rt_tmp);
+                    // Nullary constructor wrappers return addresses of static
+                    // singleton objects; only payload constructors allocate here.
+                    if !args.is_empty() {
+                        let _ = writeln!(self.out, "{}mak_ir_heap_free((void *){});", indent(depth), rt_tmp);
+                    }
                 } else if rep_is_adt(dest_rep) {
                     if !c.is_empty() {
                         let _ = writeln!(self.out, "{}(void)({});", indent(depth), c);
@@ -12595,9 +12705,8 @@ mod memory_lifetime_regressions {
     use super::*;
 
     #[test]
-    fn returned_adt_temporaries_are_not_stack_allocated() {
-        let mut plan = MemoryPlan::default();
-        plan.stack_safe_functions.insert(7);
+    fn returned_adt_temporaries_remain_managed() {
+        let plan = MemoryPlan::default();
         for kind in [
             MemorySiteKind::Construct,
             MemorySiteKind::CallResult,
@@ -12606,9 +12715,36 @@ mod memory_lifetime_regressions {
             assert_eq!(
                 plan.strategy(kind, Some(7), 64),
                 MemoryStrategy::Arena,
-                "ADT temporaries can escape their creating function"
+                "expression results may escape their creating function"
             );
         }
+    }
+
+    #[test]
+    fn local_adt_field_reads_are_non_escaping() {
+        let field = LirExpr::Field {
+            base: Box::new(LirExpr::Var("local".into(), Rep::Adt("Pair".into()))),
+            ctor: 0,
+            index: 0,
+            rep: Rep::I64,
+        };
+        assert!(memory_local_let_uses_are_non_escaping(&field, "local"));
+    }
+
+    #[test]
+    fn returning_a_local_adt_pointer_is_an_escape() {
+        let returned = LirExpr::Var("local".into(), Rep::Adt("Pair".into()));
+        assert!(!memory_local_let_uses_are_non_escaping(&returned, "local"));
+    }
+
+    #[test]
+    fn embedding_a_local_adt_in_another_value_is_an_escape() {
+        let parent = LirExpr::Construct {
+            ctor: 1,
+            args: vec![LirExpr::Var("local".into(), Rep::Adt("Pair".into()))],
+            rep: Rep::Adt("Tree".into()),
+        };
+        assert!(!memory_local_let_uses_are_non_escaping(&parent, "local"));
     }
 }
 

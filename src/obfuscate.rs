@@ -5985,11 +5985,27 @@ fn simp_block(e: Expr, pure: &HashSet<String>, changed: &mut bool) -> Expr {
     }
 
     let mut dedup = Vec::with_capacity(out.len());
+    // Structural equality is recursive. Bucket candidates by AST size first so
+    // long blocks don't compare every pure statement against every prior one.
+    // Equal expressions necessarily have equal size; collisions still use `same`
+    // as the authority, so this is only an acceleration and not a semantic change.
+    let mut candidates_by_size = HashMap::<usize, Vec<usize>>::new();
     for s in out {
-        if is_pure(&s, pure) && dedup.iter().any(|x| same(x, &s)) {
+        let s_size = size(&s);
+        let duplicate = if is_pure(&s, pure) {
+            candidates_by_size
+                .get(&s_size)
+                .map(|indices| indices.iter().any(|&i| same(&dedup[i], &s)))
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if duplicate {
             *changed = true;
         } else {
+            let index = dedup.len();
             dedup.push(s);
+            candidates_by_size.entry(s_size).or_default().push(index);
         }
     }
 

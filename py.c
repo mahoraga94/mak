@@ -39,25 +39,6 @@ struct mak__a {
             int32_t f0;
             struct mak__a * f1;
         } v1;
-        struct {
-            struct mak__a * f0;
-        } v3;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v5;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v7;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v9;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v10;
     } v;
 };
 
@@ -67,28 +48,8 @@ struct mak__b {
     uint32_t tag;
     union {
         struct {
-            int32_t f0;
-            struct mak__a * f1;
-        } v1;
-        struct {
             struct mak__a * f0;
         } v3;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v5;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v7;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v9;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v10;
     } v;
 };
 
@@ -98,28 +59,9 @@ struct mak__c {
     uint32_t tag;
     union {
         struct {
-            int32_t f0;
-            struct mak__a * f1;
-        } v1;
-        struct {
-            struct mak__a * f0;
-        } v3;
-        struct {
             int64_t f0;
             struct mak__a * f1;
         } v5;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v7;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v9;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v10;
     } v;
 };
 
@@ -129,28 +71,9 @@ struct mak__d {
     uint32_t tag;
     union {
         struct {
-            int32_t f0;
-            struct mak__a * f1;
-        } v1;
-        struct {
-            struct mak__a * f0;
-        } v3;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v5;
-        struct {
             double f0;
             struct mak__a * f1;
         } v7;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v9;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v10;
     } v;
 };
 
@@ -160,28 +83,9 @@ struct mak__e {
     uint32_t tag;
     union {
         struct {
-            int32_t f0;
-            struct mak__a * f1;
-        } v1;
-        struct {
-            struct mak__a * f0;
-        } v3;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v5;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v7;
-        struct {
             int64_t f0;
             struct mak__a * f1;
         } v9;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v10;
     } v;
 };
 
@@ -190,25 +94,6 @@ static struct mak__e mak_ir_default_obj__e = { mak_ir_tag_8 };
 struct mak__f {
     uint32_t tag;
     union {
-        struct {
-            int32_t f0;
-            struct mak__a * f1;
-        } v1;
-        struct {
-            struct mak__a * f0;
-        } v3;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v5;
-        struct {
-            double f0;
-            struct mak__a * f1;
-        } v7;
-        struct {
-            int64_t f0;
-            struct mak__a * f1;
-        } v9;
         struct {
             double f0;
             struct mak__a * f1;
@@ -989,9 +874,9 @@ static uintptr_t mak_rt_call_ctor(const char *query, const uint64_t *args, const
     if(colon) { size_t len=(size_t)(colon-query); if(len>=sizeof name_buf) len=sizeof name_buf-1; memcpy(name_buf,query,len); name_buf[len]=0; type_hint=colon+1; query=name_buf; }
     static _Thread_local const struct mak_rt_ctor_desc *cache[128]; static _Thread_local uint64_t keys[128]; static _Thread_local uint32_t sig[128]; uint64_t h=mak_rt_hash(query)^((uint64_t)n*0x9e3779b97f4a7c15ULL); for(size_t j=0;j<n;j++) h=(h*1099511628211ULL)^kinds[j]; size_t slot=(size_t)h&127u; const struct mak_rt_ctor_desc *hit=cache[slot];
     if(hit && keys[slot]==h && sig[slot]==(uint32_t)n && hit->arity==n && (strcmp(query,hit->name)==0 || mak_rt_fold_eq(query,hit->name) || mak_rt_canon_eq(query,hit->name))) { int ok=1; for(size_t j=0;j<n && ok;j++) if(!mak_rt_kind_compatible(kinds[j],hit->kinds[j])) ok=0; if(ok && (!type_hint || strcmp(type_hint,hit->type)==0)) return hit->make(args,kinds,n); }
-    const struct mak_rt_ctor_desc *best=NULL; int best_score=-1,ties=0; for(size_t i=0;i<mak_rt_ctor_count;i++) { const struct mak_rt_ctor_desc *d=&mak_rt_ctors[i]; if(d->arity!=n) continue; int score=0; if(!strcmp(query,d->name))score+=1000; else if(mak_rt_fold_eq(query,d->name))score+=800; else if(mak_rt_canon_eq(query,d->name))score+=650; if(type_hint && !strcmp(type_hint,d->type)) score+=500; for(size_t j=0;j<n;j++) if(mak_rt_kind_compatible(kinds[j],d->kinds[j])) score+=(kinds[j]==d->kinds[j]?20:3); if(score>best_score) {best=d;best_score=score;ties=0;} else if(score==best_score) ++ties; }
+    const struct mak_rt_ctor_desc *best=NULL; int best_score=-1,ties=0; for(size_t i=0;i<mak_rt_ctor_count;i++) { const struct mak_rt_ctor_desc *d=&mak_rt_ctors[i]; if(d->arity!=n) continue; if(type_hint && strcmp(type_hint,d->type)!=0) continue; int score=0; if(!strcmp(query,d->name))score+=1000; else if(mak_rt_fold_eq(query,d->name))score+=800; else if(mak_rt_canon_eq(query,d->name))score+=650; for(size_t j=0;j<n;j++) if(mak_rt_kind_compatible(kinds[j],d->kinds[j])) score+=(kinds[j]==d->kinds[j]?20:3); if(score>best_score) {best=d;best_score=score;ties=0;} else if(score==best_score) ++ties; }
     if(!best) { mak_ir_recover("unresolved runtime constructor"); return (uintptr_t)0; }
-    if(ties>1) { mak_ir_recover("runtime constructor tie"); }
+    if(ties>1) { mak_ir_recover("ambiguous runtime constructor"); return (uintptr_t)0; }
     cache[slot]=best; keys[slot]=h; sig[slot]=(uint32_t)n; return best->make(args,kinds,n); }
 static void (*mak_user_a)(struct mak__a *, struct mak__a *, struct mak__a *);
 static void (*mak_user_b)(struct mak__a *, struct mak__b *);
@@ -2125,7 +2010,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                     if (!mak_ir_adt_copy_checked((void *)(arena_case_149), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_166)) ) {
                                         *(arena_case_149) = *(&mak_ir_default_obj__f);
                                     }
-                                    mak_ir_heap_free((void *)rt_heap_obj_166);
                                 }
                             }
                             else if ((scrut_150 != NULL && (scrut_150)->tag == mak_ir_tag_0)) {
@@ -2133,7 +2017,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_149), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_167)) ) {
                                     *(arena_case_149) = *(&mak_ir_default_obj__f);
                                 }
-                                mak_ir_heap_free((void *)rt_heap_obj_167);
                             }
                             else {
                                 *(arena_case_149) = *(&mak_ir_default_obj__f);
@@ -2185,7 +2068,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_171), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_174)) ) {
                                     *(arena_case_171) = *(&mak_ir_default_obj__f);
                                 }
-                                mak_ir_heap_free((void *)rt_heap_obj_174);
                             }
                             else if ((scrut_172 != NULL && (scrut_172)->tag == mak_ir_tag_1)) {
                                 int32_t mak_local_dk_56 = (scrut_172)->v.v1.f0;
@@ -2230,7 +2112,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                         if (!mak_ir_adt_copy_checked((void *)(arena_case_171), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_183)) ) {
                                             *(arena_case_171) = *(&mak_ir_default_obj__f);
                                         }
-                                        mak_ir_heap_free((void *)rt_heap_obj_183);
                                     }
                                     else if ((scrut_180 != NULL && (scrut_180)->tag == mak_ir_tag_7)) {
                                         double mak_local_dm_58 = (scrut_180)->v.v7.f0;
@@ -2266,7 +2147,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                                         if (!mak_ir_adt_copy_checked((void *)(arena_case_171), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_187)) ) {
                                                             *(arena_case_171) = *(&mak_ir_default_obj__f);
                                                         }
-                                                        mak_ir_heap_free((void *)rt_heap_obj_187);
                                                     }
                                                     else if ((scrut_185 != NULL && (scrut_185)->tag == mak_ir_tag_9)) {
                                                         int64_t mak_local_ds_63 = (scrut_185)->v.v9.f0;
@@ -2304,7 +2184,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                                         if (!mak_ir_adt_copy_checked((void *)(arena_case_171), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_192)) ) {
                                                             *(arena_case_171) = *(&mak_ir_default_obj__f);
                                                         }
-                                                        mak_ir_heap_free((void *)rt_heap_obj_192);
                                                     }
                                                     else if ((scrut_190 != NULL && (scrut_190)->tag == mak_ir_tag_9)) {
                                                         int64_t mak_local_du_65 = (scrut_190)->v.v9.f0;
@@ -2402,7 +2281,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_171), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_203)) ) {
                                                     *(arena_case_171) = *(&mak_ir_default_obj__f);
                                                 }
-                                                mak_ir_heap_free((void *)rt_heap_obj_203);
                                             }
                                         }
                                         else if (1) {
@@ -2410,7 +2288,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                             if (!mak_ir_adt_copy_checked((void *)(arena_case_171), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_204)) ) {
                                                 *(arena_case_171) = *(&mak_ir_default_obj__f);
                                             }
-                                            mak_ir_heap_free((void *)rt_heap_obj_204);
                                         }
                                     }
                                     else if (1) {
@@ -2418,7 +2295,6 @@ static inline void mak_ir_fn_11(struct mak__a * a0, struct mak__f *out) {
                                         if (!mak_ir_adt_copy_checked((void *)(arena_case_171), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_205)) ) {
                                             *(arena_case_171) = *(&mak_ir_default_obj__f);
                                         }
-                                        mak_ir_heap_free((void *)rt_heap_obj_205);
                                     }
                                 }
                             }
@@ -3666,7 +3542,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_352), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_369)) ) {
                                     *(arena_case_352) = *(&mak_ir_default_obj__f);
                                 }
-                                mak_ir_heap_free((void *)rt_heap_obj_369);
                             }
                         }
                         else if ((scrut_353 != NULL && (scrut_353)->tag == mak_ir_tag_0)) {
@@ -3674,7 +3549,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                             if (!mak_ir_adt_copy_checked((void *)(arena_case_352), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_370)) ) {
                                 *(arena_case_352) = *(&mak_ir_default_obj__f);
                             }
-                            mak_ir_heap_free((void *)rt_heap_obj_370);
                         }
                         else {
                             *(arena_case_352) = *(&mak_ir_default_obj__f);
@@ -3726,7 +3600,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                             if (!mak_ir_adt_copy_checked((void *)(arena_case_374), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_377)) ) {
                                 *(arena_case_374) = *(&mak_ir_default_obj__f);
                             }
-                            mak_ir_heap_free((void *)rt_heap_obj_377);
                         }
                         else if ((scrut_375 != NULL && (scrut_375)->tag == mak_ir_tag_1)) {
                             int32_t mak_local_dk_151 = (scrut_375)->v.v1.f0;
@@ -3771,7 +3644,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                                     if (!mak_ir_adt_copy_checked((void *)(arena_case_374), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_386)) ) {
                                         *(arena_case_374) = *(&mak_ir_default_obj__f);
                                     }
-                                    mak_ir_heap_free((void *)rt_heap_obj_386);
                                 }
                                 else if ((scrut_383 != NULL && (scrut_383)->tag == mak_ir_tag_7)) {
                                     double mak_local_dm_153 = (scrut_383)->v.v7.f0;
@@ -3807,7 +3679,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                                                     if (!mak_ir_adt_copy_checked((void *)(arena_case_374), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_390)) ) {
                                                         *(arena_case_374) = *(&mak_ir_default_obj__f);
                                                     }
-                                                    mak_ir_heap_free((void *)rt_heap_obj_390);
                                                 }
                                                 else if ((scrut_388 != NULL && (scrut_388)->tag == mak_ir_tag_9)) {
                                                     int64_t mak_local_ds_158 = (scrut_388)->v.v9.f0;
@@ -3845,7 +3716,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                                                     if (!mak_ir_adt_copy_checked((void *)(arena_case_374), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_395)) ) {
                                                         *(arena_case_374) = *(&mak_ir_default_obj__f);
                                                     }
-                                                    mak_ir_heap_free((void *)rt_heap_obj_395);
                                                 }
                                                 else if ((scrut_393 != NULL && (scrut_393)->tag == mak_ir_tag_9)) {
                                                     int64_t mak_local_du_160 = (scrut_393)->v.v9.f0;
@@ -3943,7 +3813,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                                             if (!mak_ir_adt_copy_checked((void *)(arena_case_374), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_406)) ) {
                                                 *(arena_case_374) = *(&mak_ir_default_obj__f);
                                             }
-                                            mak_ir_heap_free((void *)rt_heap_obj_406);
                                         }
                                     }
                                     else if (1) {
@@ -3951,7 +3820,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                                         if (!mak_ir_adt_copy_checked((void *)(arena_case_374), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_407)) ) {
                                             *(arena_case_374) = *(&mak_ir_default_obj__f);
                                         }
-                                        mak_ir_heap_free((void *)rt_heap_obj_407);
                                     }
                                 }
                                 else if (1) {
@@ -3959,7 +3827,6 @@ static inline void mak_ir_fn_21(const char * a0, struct mak__f *out) {
                                     if (!mak_ir_adt_copy_checked((void *)(arena_case_374), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_408)) ) {
                                         *(arena_case_374) = *(&mak_ir_default_obj__f);
                                     }
-                                    mak_ir_heap_free((void *)rt_heap_obj_408);
                                 }
                             }
                         }
@@ -4190,7 +4057,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                             if (!mak_ir_adt_copy_checked((void *)(arena_case_427), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_444)) ) {
                                 *(arena_case_427) = *(&mak_ir_default_obj__f);
                             }
-                            mak_ir_heap_free((void *)rt_heap_obj_444);
                         }
                     }
                     else if ((scrut_428 != NULL && (scrut_428)->tag == mak_ir_tag_0)) {
@@ -4198,7 +4064,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                         if (!mak_ir_adt_copy_checked((void *)(arena_case_427), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_445)) ) {
                             *(arena_case_427) = *(&mak_ir_default_obj__f);
                         }
-                        mak_ir_heap_free((void *)rt_heap_obj_445);
                     }
                     else {
                         *(arena_case_427) = *(&mak_ir_default_obj__f);
@@ -4250,7 +4115,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                         if (!mak_ir_adt_copy_checked((void *)(arena_case_449), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_452)) ) {
                             *(arena_case_449) = *(&mak_ir_default_obj__f);
                         }
-                        mak_ir_heap_free((void *)rt_heap_obj_452);
                     }
                     else if ((scrut_450 != NULL && (scrut_450)->tag == mak_ir_tag_1)) {
                         int32_t mak_local_dk_195 = (scrut_450)->v.v1.f0;
@@ -4295,7 +4159,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_449), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_461)) ) {
                                     *(arena_case_449) = *(&mak_ir_default_obj__f);
                                 }
-                                mak_ir_heap_free((void *)rt_heap_obj_461);
                             }
                             else if ((scrut_458 != NULL && (scrut_458)->tag == mak_ir_tag_7)) {
                                 double mak_local_dm_197 = (scrut_458)->v.v7.f0;
@@ -4331,7 +4194,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_449), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_465)) ) {
                                                     *(arena_case_449) = *(&mak_ir_default_obj__f);
                                                 }
-                                                mak_ir_heap_free((void *)rt_heap_obj_465);
                                             }
                                             else if ((scrut_463 != NULL && (scrut_463)->tag == mak_ir_tag_9)) {
                                                 int64_t mak_local_ds_202 = (scrut_463)->v.v9.f0;
@@ -4369,7 +4231,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_449), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_470)) ) {
                                                     *(arena_case_449) = *(&mak_ir_default_obj__f);
                                                 }
-                                                mak_ir_heap_free((void *)rt_heap_obj_470);
                                             }
                                             else if ((scrut_468 != NULL && (scrut_468)->tag == mak_ir_tag_9)) {
                                                 int64_t mak_local_du_204 = (scrut_468)->v.v9.f0;
@@ -4467,7 +4328,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                                         if (!mak_ir_adt_copy_checked((void *)(arena_case_449), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_481)) ) {
                                             *(arena_case_449) = *(&mak_ir_default_obj__f);
                                         }
-                                        mak_ir_heap_free((void *)rt_heap_obj_481);
                                     }
                                 }
                                 else if (1) {
@@ -4475,7 +4335,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                                     if (!mak_ir_adt_copy_checked((void *)(arena_case_449), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_482)) ) {
                                         *(arena_case_449) = *(&mak_ir_default_obj__f);
                                     }
-                                    mak_ir_heap_free((void *)rt_heap_obj_482);
                                 }
                             }
                             else if (1) {
@@ -4483,7 +4342,6 @@ static inline void mak_ir_fn_22(struct mak__a * a0, struct mak__f *out) {
                                 if (!mak_ir_adt_copy_checked((void *)(arena_case_449), sizeof(struct mak__f), UINT32_C(1225484184), (const void *)(rt_heap_obj_483)) ) {
                                     *(arena_case_449) = *(&mak_ir_default_obj__f);
                                 }
-                                mak_ir_heap_free((void *)rt_heap_obj_483);
                             }
                         }
                     }
