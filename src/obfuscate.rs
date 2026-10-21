@@ -3382,7 +3382,10 @@ fn alpha(p: Program) -> Program {
         ) -> Pat {
             match p {
                 Pat::Wild => Pat::Wild,
-                Pat::Bind(_) => Pat::Bind(it.next().cloned().unwrap()),
+                // Keep malformed or partially transformed patterns from
+                // panicking the optimizer.  The surrounding scope/semantic
+                // validators reject an inconsistent candidate before commit.
+                Pat::Bind(original) => Pat::Bind(it.next().cloned().unwrap_or(original)),
                 Pat::Int(v) => Pat::Int(v),
                 Pat::Str(b) => Pat::Str(b),
                 Pat::Ctor { name, args } => Pat::Ctor {

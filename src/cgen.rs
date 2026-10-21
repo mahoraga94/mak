@@ -337,6 +337,7 @@ impl RtPlan {
         fn walk(e: &LirExpr, p: &mut RtPlan, a: &Analyzer) {
             match e {
                 LirExpr::RuntimeCall { args, .. } => {
+                    p.enable(RtFeature::FnDispatcher);
                     let arity = args.len();
                     for id in a.runtime_function_candidates(arity) {
                         p.runtime_fn_ids.insert(id);
@@ -346,6 +347,7 @@ impl RtPlan {
                     }
                 }
                 LirExpr::RuntimeConstruct { args, .. } => {
+                    p.enable(RtFeature::CtorDispatcher);
                     let arity = args.len();
                     for id in a.runtime_ctor_candidates(arity) {
                         p.runtime_ctor_ids.insert(id);
@@ -4294,29 +4296,25 @@ impl<'a> Lowerer<'a> {
                     ) {
                         return recovered;
                     }
-                    let (base, _) = Analyzer::flatten_application(fun, args);
-                    let name = match &base.kind {
-                        ExprKind::Var(n) => n.clone(),
-                        _ => "<complex>".into(),
-                    };
-                    let rep = current
-                        .and_then(|id| self.a.functions.get(id))
-                        .map(|f| f.ret_rep.clone())
-                        .filter(|r| !matches!(r, Rep::Unknown))
-                        .unwrap_or(Rep::I64);
+
+                    // Do not turn a failed application into a guessed runtime call.
+                    // A runtime name such as "<complex>" cannot identify the actual
+                    // function value and can silently change program semantics. Keeping
+                    // Fallback makes the validation gate reject an invalid candidate.
+                    self.a.note_recovery(
+                        current,
+                        e,
+                        "APPLICATION_FALLBACK",
+                        "application could not be represented safely after direct-C recovery",
+                    );
                     self.a.dbg(
-                        "RUNTIME",
+                        "ERROR",
                         format!(
-                            "{} application '{}' could not be statically lowered; using runtime recovery",
-                            current_label(current),
-                            name
+                            "{} application could not be lowered safely; preserving Fallback for validation",
+                            current_label(current)
                         ),
                     );
-                    return LirExpr::RuntimeCall {
-                        name: "__mak_unresolved_application".into(),
-                        args: Vec::new(),
-                        rep,
-                    };
+                    return LirExpr::Fallback;
                 }
                 lowered
             }
@@ -4879,26 +4877,30 @@ impl<'a> Lowerer<'a> {
         }
 
 
-        let fallback_rep = current
-            .and_then(|id| self.a.functions.get(id))
-            .map(|f| f.ret_rep.clone())
-            .filter(|r| !matches!(r, Rep::Unknown))
-            .unwrap_or(Rep::I64);
-        self.a.dbg(
-            "RUNTIME",
+        // Never panic while lowering an AST supplied by an optimizer candidate.
+        // A candidate can be structurally well-formed yet still place a non-callable
+        // expression in function position. Preserve that failure as LIR::Fallback:
+        // validate_program() will reject the candidate, allowing the optimizer to
+        // roll back to the preceding program instead of aborting the compiler.
+        self.a.note_recovery(
+            current,
+            fun,
+            "NON_CALLABLE_APPLICATION",
             format!(
-                "{} <complex> application of non-callable {} (rep={}) -> runtime recovery (rep={})",
-                current_label(current),
-                lir_kind_debug(&callee),
-                rep_debug(&callee_rep),
-                rep_debug(&fallback_rep)
+                "attempted to apply a non-callable expression with representation {}",
+                rep_debug(&callee_rep)
             ),
         );
-        LirExpr::RuntimeCall {
-            name: String::new(),
-            args: lowered_args,
-            rep: fallback_rep,
-        }
+        self.a.dbg(
+            "ERROR",
+            format!(
+                "{} non-callable application: callee={} representation={}; preserving Fallback so validation can reject this program",
+                current_label(current),
+                expr_debug(fun),
+                rep_debug(&callee_rep)
+            ),
+        );
+        LirExpr::Fallback
     }
     fn lower_pattern(
         &mut self,
@@ -9025,6 +9027,38 @@ impl<'a> CEmitter<'a> {
                 noreturn,
                 ..
             } => {
+                // A captured lambda's generated C function has extra leading
+                // capture parameters.  A bare FnRef/Function value contains no
+                // storage for those captures, so it must never be invoked as a
+                // normal indirect function pointer.  Abort with a useful
+                // diagnostic instead of emitting an ABI-invalid call.
+                let missing_capture_env = match target {
+                    CallTarget::Indirect(callee) => match lir_rep(callee) {
+                        Rep::Function(id) => self
+                            .a
+                            .functions
+                            .get(id)
+                            .filter(|function| !function.captures.is_empty())
+                            .map(|_| id),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(id) = missing_capture_env {
+                    let _ = writeln!(
+                        self.out,
+                        "{}fprintf(stderr, \"[MAK] cannot call capturing closure f{}: its environment is not represented\\n\");",
+                        indent(depth),
+                        id
+                    );
+                    let _ = writeln!(self.out, "{}abort();", indent(depth));
+                    return if matches!(rep, Rep::Unit) {
+                        String::new()
+                    } else {
+                        default_value_expr(rep, self.a)
+                    };
+                }
+
                 if rep_is_adt(rep) {
                     let storage = self.fresh_temp("arena_call");
                     let call_kind = match target {
@@ -9983,6 +10017,29 @@ impl<'a> CEmitter<'a> {
     }
 
     fn function_decl(&self, f: &LirFunction) -> String {
+        // A C function returning a function pointer needs a declarator with
+        // the function name inside the pointer parentheses.  The ordinary
+        // "return-type name(args)" form is invalid for Rep::Function.
+        if let Rep::Function(returned_id) = &f.info.ret_rep {
+            let mut params = Vec::with_capacity(
+                f.info.capture_reps.len() + f.info.param_reps.len(),
+            );
+            for (i, r) in f.info.capture_reps.iter().enumerate() {
+                params.push(rep_decl(r, &format!("c{}", i), &self.a.functions));
+            }
+            for (i, r) in f.info.param_reps.iter().enumerate() {
+                params.push(rep_decl(r, &format!("a{}", i), &self.a.functions));
+            }
+            let params = if params.is_empty() {
+                "void".to_string()
+            } else {
+                params.join(", ")
+            };
+            let returned_type = function_pointer_type(*returned_id, &self.a.functions);
+            let named_declarator = format!("(*{}({}))", f.info.c_name, params);
+            return format!("inline {}", returned_type.replacen("(*)", &named_declarator, 1));
+        }
+
         let aggregate = rep_is_adt(&f.info.ret_rep);
         let ret_ty = if aggregate {
             "void".into()
@@ -12588,6 +12645,7 @@ pub(crate) fn validate_program(program: &Program) -> bool {
     let mut a = Analyzer::new();
     a.register(program);
     a.solve();
+
     if a.functions
         .iter()
         .any(|f| matches!(f.ret_rep, Rep::Unknown))
@@ -12600,9 +12658,32 @@ pub(crate) fn validate_program(program: &Program) -> bool {
     {
         return false;
     }
+
+    // Validate every declared/discovered function first. A failed application is
+    // represented by LirExpr::Fallback rather than panicking, so this is a safe
+    // predicate that callers (notably the whole-program optimizer) can use to
+    // discard a candidate.
     let mut lowerer = Lowerer::new(&a);
     let lir = lowerer.lower_all();
-    !lir.iter().any(|f| lir_contains_fallback(&f.body))
+    if lir.iter().any(|f| lir_contains_fallback(&f.body)) {
+        return false;
+    }
+
+    // Important: the old validator checked only function bodies. The final
+    // expression is separately lowered by CEmitter::emit_main(), and could
+    // therefore contain a bad application that escaped the optimizer's CGen
+    // validation gate. Validate it here as well unless it is the structural
+    // zero-argument entry function (which was included above).
+    if find_structural_entry(program, &a.function_by_source).is_none() {
+        let mut entry_lowerer = Lowerer::new(&a);
+        let mut env = HashMap::new();
+        let entry_body = entry_lowerer.lower_expr(&program.body, &mut env, None);
+        if lir_contains_fallback(&entry_body) {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
@@ -12756,6 +12837,18 @@ mod codegen_regressions {
     fn generated(source: &[u8]) -> String {
         let program = Parser::parse(source).expect("regression program should parse");
         generate(&program)
+    }
+
+    #[test]
+    fn validator_rejects_non_callable_top_level_application_without_panicking() {
+        let program = Parser::parse(
+            b"type Box { Box i64; }; (case Box 1 of { Box x -> Box x }) 2",
+        )
+        .expect("regression program should parse");
+        assert!(
+            !validate_program(&program),
+            "a non-callable case result in the entry expression must reject the candidate"
+        );
     }
 
     #[test]
